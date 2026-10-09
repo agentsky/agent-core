@@ -81,7 +81,7 @@ one move:
 
 | Crate | Kind | Notes |
 | --- | --- | --- |
-| `core-types` | lib | IDs, keys, `InboundEvent`, `Surface` trait, `Caps`, agentctl wire types. No I/O. |
+| `core-types` | lib | IDs, keys, `InboundEvent`, `Surface` trait, `Caps`, agentctl wire types, `Cidr`. No I/O. |
 | `store` | lib | sqlx on SQLite. **Owns encryption at rest** (moved from `auth`, see below). |
 | `auth` | lib | PKCE, token exchange, refresh, profile and plan lookup. |
 | `render` | lib | Markdown to Slack mrkdwn and Rocket.Chat, splitting, directives. |
@@ -1670,21 +1670,43 @@ Design: [Credential proxy](design.md#credential-proxy) (rule 3).
 
 Deliverables:
 
-- An HTTP `CONNECT` forward proxy on the same proxy listener. Sandboxes get
-  `HTTPS_PROXY` and `HTTP_PROXY` set to `http://cred-proxy.internal:8080`, and
-  `NO_PROXY=cred-proxy.internal,agentctl.internal`.
+- An HTTP `CONNECT` forward proxy on the same proxy listener
+  (`cred_proxy::EgressProxy`, served through `CredProxy::with_egress`).
+  Sandboxes get `HTTPS_PROXY` and `HTTP_PROXY` set to
+  `http://cred-proxy.internal:8080`, and
+  `NO_PROXY=cred-proxy.internal,agentctl.internal`, in both upper and lower
+  case (`cred_proxy::EGRESS_ENV`); curl, and so git, reads only the
+  lowercase `http_proxy`.
 - A host allowlist from `[proxy] allow = [...]`, with a per-agent extension
-  point (T25 adds skill-declared hosts):
-  - Exact hosts and `*.suffix` patterns.
+  point (the `EgressExtension` trait; T25 adds skill-declared hosts):
+  - Exact hosts and `*.suffix` patterns, compared lowercase without a
+    trailing dot. IP addresses are neither rules nor `CONNECT` targets, and
+    `api.anthropic.com` is not a rule.
   - Port 443 only, unless a rule names another port.
   - Tunnels bytes without TLS interception.
+- The target is the request line's authority-form `host:port` over HTTP/1;
+  `Host` is ignored.
 - Always denied, whatever the allowlist says:
   - `api.anthropic.com` (so side traffic fails loudly, per the design).
-  - Link-local and cloud metadata addresses (`169.254.0.0/16`, `fd00:ec2::254`).
-  - Private ranges.
-  - Denial is checked after DNS resolution, so a DNS rebind can't reach them.
-- A denied `CONNECT` returns 403 with a one-line reason, and is logged with the
-  session.
+  - Link-local and cloud metadata addresses (`169.254.0.0/16`,
+    `fd00:ec2::254`, `fd20:ce::254`, `fd00:c1::a9fe:a9fe`,
+    `168.63.129.16`), loopback, agentd's own addresses and the sandbox
+    subnet, and reserved, documentation, multicast and non-global IPv6
+    ranges
+    ([impl-notes](impl-notes.md#addresses-are-checked-after-resolution-and-the-tunnel-goes-to-them)).
+  - Private ranges, whichever rule allowed the host.
+  - Denial is checked after DNS resolution, so a DNS rebind can't reach them,
+    and the tunnel connects to the checked addresses, never the name.
+- Limits, so one sandbox can't exhaust the proxy
+  ([impl-notes](impl-notes.md#tunnels-and-lookups-are-capped)): open tunnels
+  per session and in all (`[proxy] max_session_tunnels`, default 32, and
+  `max_tunnels`, default 256), taken before the host is looked up and
+  refused with 429 or 503 when full; concurrent host lookups; a timeout on
+  the `EgressExtension`; and a tunnel lifetime (1 hour) besides the idle
+  timeout (5 minutes). A session's tunnels close once it has no live
+  placeholder left, so `Registry::revoke_session` cuts them.
+- A denied `CONNECT` returns 403 (429 or 503 at a limit) with a one-line
+  reason, and is logged with the session.
 - Absolute-form requests (`GET http://host/…`, what `HTTP_PROXY` produces for
   plain HTTP) get 403. They must never fall through to the Anthropic reverse
   proxy; T18's proxy already refuses them, and T19 keeps that. Plain HTTP
@@ -1695,6 +1717,9 @@ Acceptance:
 - Tests for an allowed tunnel, a denied host, denial of `api.anthropic.com`,
   a rebind to `169.254.169.254` denied, a non-443 port denied, and an
   absolute-form request refused without reaching the upstream.
+- Tests for each limit: a full session or proxy refused, a lookup cap that
+  counts lookups the timeout gave up on, a silent extension refused, a
+  tunnel closed at its lifetime, and a revoked session's tunnels closed.
 - A Docker test (ignored by default) that a sandbox can `git clone` from an
   allowed host and not from another.
 
@@ -1990,14 +2015,19 @@ Deliverables:
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, and `turn_finished` calls
   `Registry::unpoint`. It sets the egress proxy variables from
-  T19, and issues agentctl tokens and records their turns with T15
+  T19 (`cred_proxy::EGRESS_ENV`), and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
   turn's outbox, and `revoke_process_token`). It builds `App` with a
   `SurfaceLookup` for `agentctl history`, and resolves the short message ids
   it shows the model where agentctl takes a message id
   ([impl-notes](impl-notes.md#message-ids-are-platform-ids-until-t23)).
 - agentd serves T18's `CredProxy` on `Routers.proxy`, with the `Registry`
-  shared with its `TurnHooks`. A `[proxy] upstream` key, default
+  shared with its `TurnHooks`, and with
+  `CredProxy::with_egress(config.egress_proxy()?)`, so the same listener
+  answers `CONNECT` (T19). The `Registry::revoke_session` that
+  `process_stopping` calls also closes the session's egress tunnels: the
+  egress proxy watches each tunnel's session through the shared `Registry`,
+  so no other call is needed. A `[proxy] upstream` key, default
   `https://api.anthropic.com`, sets the upstream, and
   `config/agentd.example.toml` documents it.
 - `crates/agentd/src/pipeline/`:
@@ -2145,7 +2175,8 @@ Deliverables:
 - `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
 - Skills may declare extra egress hosts in front matter (`allowed-hosts:`). The
   owner confirms them when adding, and they extend T19's allowlist for that
-  agent's sandboxes.
+  agent's sandboxes, through an `EgressExtension` that maps the session to
+  its agent's confirmed hosts.
 
 Acceptance: tests for add from a local Git fixture repo, add from an uploaded
 file, validation failures, rm, mounting (the path is visible in a
@@ -2729,6 +2760,13 @@ Not scheduled. Each needs a decision before it becomes a task.
   credential while turn N+1 runs, whoever its requester is. Only killing
   the processes a turn leaves behind in the container when it ends removes
   that.
+- **Private hosts in the egress allowlist.** T19 denies private addresses
+  whatever rule allowed the host, so a Git server on an office network is
+  out of reach. A per-rule grant, a configured host with the private
+  subnets it may resolve to, could open one, provided the subnets stay
+  clear of agentd's networks, the egress network's other services and the
+  Docker gateway. It must never apply to `EgressExtension` rules, which
+  any agent's owner can add through a skill (T25), nor to wildcards.
 - **Postgres.** The store is SQLite for single-host deployments. Moving to
   Postgres is `sqlx` feature work plus migration dialect review.
 - **Transcript mirroring** to the store for multi-host deployments.

@@ -2582,6 +2582,306 @@ necessarily the one the code belongs to. agentd can't delete the message (the `b
   DM login, exchange included, and finds neither the code nor the pasted
   text, so reqwest, hyper and sqlx don't log request bodies either.
 
+## T14: Agent lifecycle on Rocket.Chat
+
+No Rocket.Chat server was run for this task; the tests use `testkit`'s fake
+server, and the server behavior below comes from the notes of T11 and T12.
+
+### A paused agent's bot keeps listening
+
+**Issue.** "Pause (events ignored)" could be read as stopping the paused
+agent's connection, or as dropping what it delivers. Rocket.Chat
+deduplication is global: whichever connection records a message first
+delivers it for every bot in the room. A paused bot that dropped what it
+recorded would lose messages for the other agents there, and a paused bot
+that stopped listening would leave `!agent resume` unheard in a room it
+alone shares with agentd.
+
+**Solution.** A paused agent's connection keeps running and feeding the
+command intake. "Ignored" is decided where messages go after the intake:
+before T23, [`Acknowledge`](#before-turns-a-bot-reacts-instead-of-replying)
+skips paused agents; from T23 the router refuses them, as T22 already does.
+Only `delete` stops a connection.
+
+### A creation can stop halfway
+
+**Issue.** Creating an agent is several steps on two systems: the store,
+then `users.create`, the bot's login and token, the avatar, then the store
+again. A failure or a crash in between would leave an agent without a bot,
+or a bot user nobody records, with the agent's name taken for good.
+
+**Solution.** `create_agent` stores the agent with a binding in state
+`creating` in one transaction; the unique index on `(owner_id, name)` only
+covers agents that aren't deleted, so the name is reserved from then on.
+Before each `users.create` the binding notes the username it asks for
+(`set_binding_bot_username`), and the bot user is recorded on the binding
+(`set_binding_bot_user`) as soon as `users.create` returns, whatever the
+binding's state by then: a creation abandoned meanwhile leaves a disabled
+binding with a bot user, which owes retirement like a deleted agent's and
+gets its leased, backed-off retries, rather than one best-effort
+deactivation. `activate_binding` stores the token and makes the binding
+`active` only while it is still `creating`. Any failure abandons the
+creation (`abandon_creation`): the binding is disabled, the agent deleted
+and the name freed, and a recorded bot user is deactivated. If recording
+the bot user fails in the store, it is deactivated at once, before the
+error is reported. A creation still `creating` after `CREATION_LEASE` (ten
+minutes, far longer than its REST calls with their 30-second timeouts can
+take) is abandoned by the next supervisor pass, which covers a crash. If
+that races a slow creation, the creation's own `activate_binding` fails and
+it gives up.
+
+A crash, or a store failure, between `users.create` answering and the bot
+user being recorded leaves a bot user no binding records. A disabled
+binding that noted a username but records no bot user therefore owes
+retirement too, and its retirement first looks the noted username up with
+`users.info`: if that user's email is the binding's
+(`agent-<binding id>@agent-core.invalid`), it is recorded and deactivated
+in the same attempt; if the email is another's, or missing, the username
+is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
+Rocket.Chat doesn't answer is an attempt that failed, deferred with the
+retirement's backoff, so a creation that died because Rocket.Chat was
+unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
+answers an unknown username with HTTP 400 and the error `User not found.`,
+without an error code, and older servers with `error-user-not-found` or
+`error-invalid-user`; `user_by_username` reads those answers as no user, so
+the username of a creation that never got as far as `users.create` is
+forgotten at the first lookup, like another's email, while a transport
+error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
+`view-full-other-user-info`, without which `users.info` leaves the emails
+out. A bot user still missed has no token and no password anyone knows, so
+it can't be used, but it keeps its username until an admin removes it.
+Review asked for both quiet paths to be visible: a found user with no
+email at all is logged as a warning (binding and username only) before the
+username is forgotten, since that is what every user looks like to a
+manager without `view-full-other-user-info`, and a lookup that fails is a
+warning like a failed deactivation, bounded by the retirement's backoff,
+instead of a debug line that hid a long outage until "giving up".
+
+### Deactivating a deleted agent's bot is owed until it happens
+
+**Issue.** `delete` deactivates the bot user with the manager's
+`users.setActiveStatus`, which can fail: the manager lacks
+`edit-other-user-active-status`, Rocket.Chat is down, the rate limiter.
+Forgetting the failure would leave an active bot user whose personal access
+token still works.
+
+**Solution.** `delete_agent` disables the agent's bindings and forgets their
+tokens in the same transaction that marks the agent deleted. A disabled
+binding with a bot user and no `retired_at` owes its retirement, in columns
+modeled on the relink notices': a claim counts an attempt and holds a
+ten-minute lease (`retire_attempts`, `retire_next_attempt_at`), success sets
+`retired_at`, and a failure defers the next attempt by a backoff from a
+minute doubling to six hours, for 20 attempts (about three days). `delete`
+tries once at once and says whether it worked; the supervisor retries every
+pass. A bot user Rocket.Chat no longer knows counts as retired, but only
+when it says so with `error-invalid-user` or `error-user-not-found`: a bare
+HTTP 404, such as a reverse proxy's, defers the attempt like any other
+failure. `delete` reports the deletion even when looking up or retiring the
+bindings afterwards fails in the store; that failure is logged and left to
+the supervisor.
+
+### Connections follow the store
+
+**Issue.** agentd has to start a connection when an agent is created, stop
+it when the agent is deleted, and restore every connection at startup. With
+more than one instance (a blue-green deploy), an agent created on one
+instance would be heard only there until a restart.
+
+**Solution.** The `Supervisor` owns the connections and derives them from
+the store: each pass starts one for every `active` binding of an active or
+paused agent and stops the rest. A pass runs at startup, whenever a
+command pokes it (`create`, `delete`), and every minute, so another
+instance's changes are picked up within a minute. After the connections,
+so slow REST calls don't delay them, it abandons stale creations and
+retires what is owed. A binding whose row doesn't read (a token that no
+longer decrypts) is logged and skipped, and the other bots keep listening. The command handlers never hold a
+`CommandFeed`, only the poke: the intake runs until every feed is dropped,
+and it owns the handlers, so a feed held there would keep it running
+forever. The supervisor drops its feed when agentd stops, after stopping its
+connections. A connection that ends on its own (a revoked token, a
+deactivated bot) or panics is logged and started again by a later pass: the
+supervisor maps each connection task's id to its binding, so a panic, which
+returns no value, still frees the binding. A connection that keeps ending
+waits longer each time, kept in memory per binding: the next pass after its
+first end, then one interval, doubling up to 32 intervals (32 minutes), and
+one that ran that long starts over. A broken bot so logs an error about
+twice an hour, not every minute, until it is fixed or deleted.
+
+### Retiring a bot and stopping its connection happen in either order
+
+**Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
+failed under CPU load, always at "the pass retired the bot": 1 of 200
+runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
+server to count no connections, then read the binding once. A pass stops a
+connection by signalling its task, which closes the socket on its own while
+the pass goes on to `abandon_stale` and `retire_pending`, so the socket can
+close before `mark_retired` runs.
+Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
+The order can also flip: a delete that lands between a pass's `reconcile`
+and its `retire_pending` is retired by that pass and disconnected by the
+next, and the `delete` command retires the bot before it pokes.
+
+**Solution.** The supervisor stays as it is. Both steps follow from the
+disabled binding, every pass does both, and a delete pokes after disabling
+it, so the end state is the same in either order within a pass: the bot
+user deactivated, `retired_at` set, and no connection. The test now waits
+for that whole end state through a shared `eventually` helper, and passed
+200 of 200 runs with 8 busy loops, 200 of 200 with 16, and 10 of 10 with
+the 300 ms added.
+
+`a_bot_made_after_its_creation_was_abandoned_owes_retirement` had the same
+shape: a 100 ms sleep stood in for "`create_bot` has recorded the username
+and sent `users.create`", and a 300 ms response delay for "the abandonment
+lands before the response". Adding 150 ms before the username is recorded
+failed it 10 of 10 runs. Its `users.create` response is now held until the
+test has abandoned the creation, so the abandonment always lands while the
+request is in flight; it passes 10 of 10 with the 150 ms added.
+
+The hold is `testkit::Held`, described in T04's notes with the auth tests
+that use it, the expired-token test's wait for its callers included.
+
+### Before turns, a bot reacts instead of replying
+
+**Issue.** The plan allows a fixed acknowledgement before T23, and the live
+check needs to see which bot a mention reaches. A reply is a
+`chat.postMessage`, which makes the bot join a public channel it isn't in
+(see T11's notes). Rocket.Chat deduplication is global, so a mention of an
+agent that isn't in the room can be delivered by another bot's connection,
+and replying would pull the mentioned bot into the channel. T23 has the
+same problem for real replies.
+
+**Solution.** Until T23, every connection passes the messages that aren't
+commands to `Acknowledge`, which makes each active agent a person's message
+mentions, and in a one-to-one DM the agent whose bot received it, react
+with `:eyes:` as its own bot. `chat.react` doesn't join the room. Messages
+from bots, the manager bot and managed agents are ignored whatever the
+surface flags say. T23 replaces `Acknowledge` with the pipeline, and should
+check that a mentioned agent is in the room before posting there.
+
+### Bot usernames
+
+**Issue.** The plan names the bot `<name>`, or `<owner>-<name>` when taken,
+but not what happens when both are taken, what email Rocket.Chat's required
+field gets, or how an owner's username is found; members are stored with
+their user id as display name.
+
+**Solution.**
+
+- The username is `<name>`, then `<owner>.<name>`, where `<owner>` is the
+  owner's username from `users.info`. If both are taken, the agent isn't
+  created and the owner is asked for another name. The separator is a dot
+  because agent names can't contain one (they are `a-z`, `0-9` and `-`),
+  while Rocket.Chat usernames can: with `-`, alice could name an agent
+  `bob-helper` and take the username bob's `helper` would fall back to.
+  Now no agent name, and no other owner's fallback, can be
+  `bob.helper`. `all` and `here` go
+  straight to the prefixed form, since Rocket.Chat reads `@all` and `@here`
+  as broadcasts and nobody could mention such a bot.
+- The display name is the agent's name. The email is
+  `agent-<binding id>@agent-core.invalid`: unique, unverified (T11), and in
+  a domain that can't receive mail.
+- `agent_bindings.bot_username` records the username, which the plan's
+  columns didn't have, so `list` and the create reply can show `@username`
+  without a lookup.
+- `create` stores the owner's username as their display name, which `list`
+  shows as the owner.
+- A deleted agent's bot user stays, deactivated, and keeps its username
+  for good: creating an agent of the same name again gets the prefixed
+  username, and once that one is deleted too, the name can't be created
+  again by that owner until an admin removes the old bot users.
+- So does the bot user of a creation that failed after `users.create`, for
+  example because the `bot` role lacks `create-personal-access-tokens`: it
+  is deactivated, not deleted, so a retry after the failure gets the
+  prefixed username. Deleting it would need `delete-user` on the manager's
+  role, a broader grant than the username is worth.
+
+### Agent names are the owner's
+
+**Issue.** Names are unique per owner, so `persona helper …` from a member
+who isn't the owner can't name the owner's `helper` at all.
+
+**Solution.** Every owner-only command looks the agent up among the
+sender's own agents, so a non-owner gets "You have no agent named `helper`.
+Only an agent's owner can change it." The name is free again once the agent
+is deleted, since deleted agents keep their row for the volumes, sessions
+and message refs that name them. `visibility` is `public` or `private`;
+`list` shows private agents only to their owner, and nothing sets `private`
+yet.
+
+### A bot sets its own avatar
+
+**Issue.** Setting another user's avatar needs `edit-other-user-avatar`
+(T11's table), one more permission for the manager's roles.
+
+**Solution.** The new bot sets `rocketchat.avatar_url` as its own avatar
+with its token, which Rocket.Chat allows while `Accounts_AllowUserAvatarChange`
+is on (the default). A failure is logged and the agent is created anyway.
+The Compose README's permission table drops `edit-other-user-avatar`, and
+`edit-other-user-info`, since agentd renames no bot.
+
+### The text of an upload
+
+**Issue.** A `persona.md` upload's command is the message's text. Depending
+on the client and version, Rocket.Chat puts the text typed with an upload
+in `msg` or in the file attachment's `description` (`sendFileMessage`
+builds the attachment from the upload's description and takes `msg` from
+the confirm body).
+
+**Solution.** `surface-rocketchat` takes the attachment's `description` as
+the text of a file message whose `msg` is empty. Which one a real 7.x
+client fills is for the live check. The file is downloaded from
+`<base>/file-upload/<id>/<name>` with the manager's `X-User-Id` and
+`X-Auth-Token` headers (Rocket.Chat's `requestCanAccessFiles` accepts them),
+never with the token in the URL, and refused past 64 KB by its
+`Content-Length` or while it is read, as `SurfaceError::TooLarge`, a
+variant added so callers don't match on error text.
+
+With the Amazon S3 or Google Cloud Storage file store, Rocket.Chat answers
+the download with a 302 to a presigned URL in the bucket (the default,
+`FileUpload_S3_Proxy_Uploads` off). reqwest follows redirects and drops
+`Authorization` and `Cookie` on a cross-origin hop, but not custom headers,
+so the manager's `X-User-Id` and `X-Auth-Token` would reach the object
+store. `RestClient` now follows redirects only within the origin it called
+(scheme, host and port; `http` to `https` on the same host counts as
+another origin), up to 10, and stops at any other, for every REST call, so
+the headers never leave the server. `download` then fetches a cross-origin
+`Location` once, with a separate client that sends no Rocket.Chat header
+and follows no redirect, and applies the same size limit: the presigned URL
+authorizes itself. A file message's text falls back to the attachment's
+`description` only when the message has files and an empty `msg`, so a
+message without files, such as one quoting another, keeps its own text. Only a file attached in the manager
+bot's DM is read: a persona uploaded to a room would be public anyway, but
+the manager may not be able to read files there.
+
+### A member's agents are capped
+
+**Issue.** Each agent is a Rocket.Chat user with a token and a realtime
+connection agentd keeps open, and nothing stopped one member from creating
+hundreds of them.
+
+**Solution.** `[agents] max_per_owner` (default 10, at least 1) caps the
+agents that aren't deleted per member. `create_agent` counts them inside
+its `BEGIN IMMEDIATE` transaction, so concurrent creations can't both slip
+under the cap, and returns `LimitReached`; `create` then tells the member
+the limit and to delete one first. Deleted agents don't count, but their
+bot users stay, deactivated.
+
+### The manager's permissions on the Community Edition
+
+**Issue.** T16 found that custom roles need an Enterprise license. T14 adds
+nothing to the permissions T11 derived: `create-user`, `edit-other-user-active-status`
+for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
+`view-full-other-user-info` and `api-bypass-rate-limit`, plus
+`create-personal-access-tokens` on the `bot` role.
+
+**Solution.** [T11's live check](#the-live-check-against-7139) settled it.
+On the Community Edition the manager holds the built-in `bot` and `app`
+roles, and the admin adds these permissions to `app`, whose only other
+holders are Apps-Engine app users, which can't log in; `app` and `bot`
+already have `api-bypass-rate-limit`. Granting them to `user` or `bot`
+would grant them to every member or every agent. The Compose README walks
+through it, and the manager is never an admin.
+
 ## T15: agentctl
 
 ### The token needs the turn's thread and message
@@ -3617,6 +3917,198 @@ whatever the sandbox wants written into agentd's logs. "forwarded a
 request" names the session, method and status only, and the log test sends
 a secret-bearing path and query and finds neither in the log.
 
+## T19: Credential proxy egress allowlist
+
+### The target comes from the request line, in one spelling
+
+**Issue.** A `CONNECT` names its target twice, in the request line and in
+`Host`, and the plan's rules (`api.anthropic.com` always denied, exact and
+`*.suffix` hosts) compare names. `API.Anthropic.COM.:443` is the same host
+as `api.anthropic.com:443` to every resolver, and forms such as `127.1`,
+`2130706433` or `0x7f.1` are addresses to `getaddrinfo` though they parse
+as no `IpAddr`.
+
+**Solution.** Only the request line counts, and it must be authority form,
+`host:port`, over HTTP/1: `Host` is ignored, and user info, a scheme, a
+path, a missing or zero port, and `CONNECT` over HTTP/2 are refused. The
+host is lowercased and loses one trailing dot before any comparison, and
+must be a DNS name of letters, digits and `-` with at least two labels, the
+last starting with a letter. That refuses every numeric form, and IP
+literals (bracketed IPv6 or dotted IPv4) are refused outright: a tunnel
+always goes to a named host that a rule allows. Rules go through the same
+function, so a rule and a request can't disagree on spelling.
+
+### Addresses are checked after resolution, and the tunnel goes to them
+
+**Issue.** The plan checks denial after DNS resolution so a rebind can't
+reach a denied address. Checking the name's addresses and then connecting
+by name would resolve twice, and a rebinding server answers the second
+lookup differently.
+
+**Solution.** The egress proxy resolves once, refuses the host if any
+address in the answer is unreachable (a mixed answer is what a rebinding
+attack looks like, and no legitimate public host answers with a metadata
+or private address), and then connects to those checked addresses, in
+order, never to the name. The system resolver is given the name with a
+trailing dot, so search domains don't apply: under Kubernetes' `ndots:5`,
+`github.com` would be tried as `github.com.<namespace>.svc.cluster.local`
+first. Resolution has a 5-second timeout and all connection attempts share
+the 10-second `CONNECT_TIMEOUT`, so a long answer of silent addresses can't
+hold a request.
+
+Never reachable, whatever resolves there and whichever rule allowed the
+host: agentd's own listener addresses and the sandbox subnet (agentd passes
+them from its configuration), the private ranges (`10.0.0.0/8`,
+`172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), loopback, link-local
+(`169.254.0.0/16`, the metadata address among them), the other clouds'
+metadata and platform addresses (AWS's `fd00:ec2::254`, GCP's
+`fd20:ce::254`, Oracle's `fd00:c1::a9fe:a9fe` and Azure's WireServer
+`168.63.129.16`, the last in public address space), `0.0.0.0/8`,
+`100.64.0.0/10` (Alibaba's metadata address `100.100.100.200` is in it),
+`192.0.0.0/24` (Oracle's `192.0.0.192`), documentation, benchmarking,
+multicast, reserved and broadcast ranges. For
+IPv6 only global unicast (`2000::/3`) is reachable, minus `2001::/23`
+(Teredo among it), `2002::/16` (6to4), `2001:db8::/32` and `3fff::/20`:
+that also refuses IPv4-compatible, NAT64 (`64:ff9b::/96`) and other forms
+that embed an IPv4 address, which would otherwise carry a private or
+metadata address past the IPv4 checks. IPv4-mapped addresses are checked as
+the IPv4 address they hold.
+
+### `Cidr` moved to core-types
+
+**Issue.** The egress policy needs subnets for agentd's own networks, and
+agentd's `net::Cidr` was the only implementation. cred-proxy can't depend
+on agentd.
+
+**Solution.** `Cidr` moved unchanged, with its tests, to
+`core_types::net`, which does no I/O. agentd imports it from there.
+
+### The CLI honors `NO_PROXY`, and needs it
+
+**Issue.** With `HTTP_PROXY` set, a client sends plain-HTTP requests to the
+proxy in absolute form, and the proxy refuses those with 403. If the CLI
+sent its `ANTHROPIC_BASE_URL` traffic that way, every turn would fail.
+
+**Solution.** `cred_proxy::EGRESS_ENV` sets `NO_PROXY` to
+`cred-proxy.internal,agentctl.internal`, as the plan says, and every
+variable in both cases: curl, and so git, reads only the lowercase
+`http_proxy`, and tools differ on the others. Against two local capture
+servers, the npm build of Claude Code 2.1.285 (the native build wasn't
+available here) sent `POST /v1/messages?beta=true` straight to the base URL
+when `NO_PROXY` named its host, and `POST http://localhost:…/v1/messages`
+to the proxy when it didn't. T23's live check should confirm it on the
+native build in the sandbox image.
+
+### Tunnels leave agentd's drain
+
+**Issue.** hyper hands an upgraded connection to the handler and stops
+tracking it, so a tunnel isn't part of agentd's graceful shutdown or its
+drain timeout, and nothing else would end one that stays open.
+
+**Solution.** A tunnel ends when either side closes, after 5 minutes with
+no byte in either direction, after an hour in any case, when its session
+has no live placeholder left, or when the `EgressProxy` is dropped, which
+happens once the listener and its connections are gone. Tunnel tasks hold
+only `watch` receivers, not the proxy.
+
+The session's receiver comes from the `Registry`, which drops the sender
+once the session's last placeholder is revoked, however that happens:
+`revoke`, `revoke_session`, or a mint for another session at the same
+address. T23's `process_stopping` already calls `revoke_session`, so a
+stopping container's tunnels close with no other call; an explicit
+`EgressProxy::close_session` would have needed T23 to keep a handle on a
+proxy that `CredProxy` owns. The receiver is taken with the session lookup,
+under the registry's lock, and checked again before the 200, so a session
+revoked while its `CONNECT` was being checked gets no tunnel.
+
+### Tunnels and lookups are capped
+
+**Issue.** Nothing bounded what one sandbox could hold: a review probe kept
+300 tunnels open from one session. Host lookups were worse. The system
+resolver (`getaddrinfo`, through `tokio::net::lookup_host`) blocks a thread
+of tokio's blocking pool, and the 5-second timeout only dropped the future:
+the lookup kept its thread, so a resolver that hangs let a sandbox fill the
+pool with lookups nobody waited for.
+
+**Solution.** `EgressLimits`, given to `EgressProxy::with_limits`:
+
+- A tunnel place is taken per `CONNECT` before the extension is asked or
+  the host looked up, and given back when its tunnel closes, or when the
+  `CONNECT` is refused and any lookup it started has returned: 32 per
+  session (429 past it) and 256 in all (503). agentd's
+  `[proxy] max_session_tunnels` and `max_tunnels` set them.
+- Lookups run under a semaphore of 32 places, and one session's under a
+  semaphore of its own with a quarter of that (at least one place). Each
+  runs in a task of its own that holds both places and the `CONNECT`'s
+  tunnel place until the resolver returns, even after the timeout refused
+  the `CONNECT`, and hands the tunnel place back when the lookup finishes
+  in time. A second review found that with the tunnel place dropped at
+  the 502 and a session allowed all 32 lookup places, a sandbox capped at
+  one tunnel held three lookup places, and a session capped at 32 could
+  hold them all and leave every other session with 503: now hung lookups
+  count against their own session's tunnels, and no session can hold more
+  than its share. Waiting for places counts toward the 5-second timeout;
+  a `CONNECT` that gets no session place is refused with 429, and one
+  that gets no proxy place with 503. The workspace has no asynchronous
+  resolver, and the semaphores need none.
+- The `EgressExtension` gets 2 seconds; past that the `CONNECT` is refused
+  with 503, since a lookup that can't answer denies.
+- A tunnel lives an hour at most, busy or not.
+
+### What the allowlist doesn't stop
+
+**Issue.** A byte tunnel can't see what goes through it.
+
+**Solution.** Recorded, not solved: a tunnel to an allowed host that shares
+a CDN front with other sites can reach them by SNI or `Host` inside TLS
+(domain fronting), so an allowlist entry is only as narrow as its host's
+front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
+sandbox pick any public address; and egress is gated on a live placeholder
+at the source address, not on a running turn, so a process left from an
+earlier turn can use the allowlist between turns (the plan's deferred
+"Killing leftover processes" entry covers that). Resolving the name with a
+trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
+allowed host to a fixed address there; pin it in DNS instead.
+
+### Log lines don't name the host
+
+**Issue.** Refusals and tunnel lines logged the host the sandbox asked
+for. A host name is chosen by the sandbox, so a refused `CONNECT` to
+`<secret>.attacker.example` wrote the secret into agentd's logs, which
+leave the trust boundary the allowlist guards.
+
+**Solution.** Egress log lines give the session, port, reason, the rule
+that allowed the host (once one has) and the address, never the host. The
+log test sends secret-bearing hosts that are allowed, refused by the
+allowlist and refused by address, and finds none of them in the log.
+The port stays in refusal lines on purpose, even for denied hosts: it
+carries at most 16 bits a line at the rate of refused `CONNECT`s, and
+operators need it to tell a wrong port from a wrong host.
+
+### Testing without the network
+
+**Issue.** Every address a real test server has is loopback, which the
+policy never reaches, and tests don't touch the network. The log test
+also missed events under a scoped subscriber.
+
+**Solution.** `EgressProxy::with_network` takes a `Network` that resolves
+and connects; the tests' fake answers with public-looking addresses and
+connects them to local echo servers, and records what was resolved and
+dialed. The log test installs a global subscriber for its test binary and
+filters by its own source addresses: with `tracing::subscriber::set_default`,
+callsites first hit by other tests' threads, which have no subscriber,
+kept their "never" interest and dropped the test's events.
+
+The Docker test serves the proxy on an internal network's gateway address,
+which the host holds on the bridge, maps `cred-proxy.internal` to it with
+`extra_hosts`, and runs `alpine/git:2.54.0` with `EGRESS_ENV`: cloning
+`github.com/octocat/Hello-World` works, a GitLab clone gets
+`403 from proxy after CONNECT`, and a clone without the proxy fails. It
+needs a route to github.com, which the CI runner has, and it passes in CI's
+Docker tests job. Where outbound TLS is intercepted, as in the environment
+it was written in, it passes only with the intercepting proxy's CA mounted
+into the container.
+
 ## T20: runner process driver
 
 ### The placeholder is not an environment entry
@@ -4405,303 +4897,3 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
 - `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
-
-## T14: Agent lifecycle on Rocket.Chat
-
-No Rocket.Chat server was run for this task; the tests use `testkit`'s fake
-server, and the server behavior below comes from the notes of T11 and T12.
-
-### A paused agent's bot keeps listening
-
-**Issue.** "Pause (events ignored)" could be read as stopping the paused
-agent's connection, or as dropping what it delivers. Rocket.Chat
-deduplication is global: whichever connection records a message first
-delivers it for every bot in the room. A paused bot that dropped what it
-recorded would lose messages for the other agents there, and a paused bot
-that stopped listening would leave `!agent resume` unheard in a room it
-alone shares with agentd.
-
-**Solution.** A paused agent's connection keeps running and feeding the
-command intake. "Ignored" is decided where messages go after the intake:
-before T23, [`Acknowledge`](#before-turns-a-bot-reacts-instead-of-replying)
-skips paused agents; from T23 the router refuses them, as T22 already does.
-Only `delete` stops a connection.
-
-### A creation can stop halfway
-
-**Issue.** Creating an agent is several steps on two systems: the store,
-then `users.create`, the bot's login and token, the avatar, then the store
-again. A failure or a crash in between would leave an agent without a bot,
-or a bot user nobody records, with the agent's name taken for good.
-
-**Solution.** `create_agent` stores the agent with a binding in state
-`creating` in one transaction; the unique index on `(owner_id, name)` only
-covers agents that aren't deleted, so the name is reserved from then on.
-Before each `users.create` the binding notes the username it asks for
-(`set_binding_bot_username`), and the bot user is recorded on the binding
-(`set_binding_bot_user`) as soon as `users.create` returns, whatever the
-binding's state by then: a creation abandoned meanwhile leaves a disabled
-binding with a bot user, which owes retirement like a deleted agent's and
-gets its leased, backed-off retries, rather than one best-effort
-deactivation. `activate_binding` stores the token and makes the binding
-`active` only while it is still `creating`. Any failure abandons the
-creation (`abandon_creation`): the binding is disabled, the agent deleted
-and the name freed, and a recorded bot user is deactivated. If recording
-the bot user fails in the store, it is deactivated at once, before the
-error is reported. A creation still `creating` after `CREATION_LEASE` (ten
-minutes, far longer than its REST calls with their 30-second timeouts can
-take) is abandoned by the next supervisor pass, which covers a crash. If
-that races a slow creation, the creation's own `activate_binding` fails and
-it gives up.
-
-A crash, or a store failure, between `users.create` answering and the bot
-user being recorded leaves a bot user no binding records. A disabled
-binding that noted a username but records no bot user therefore owes
-retirement too, and its retirement first looks the noted username up with
-`users.info`: if that user's email is the binding's
-(`agent-<binding id>@agent-core.invalid`), it is recorded and deactivated
-in the same attempt; if the email is another's, or missing, the username
-is forgotten (`forget_binding_bot_username`) and nothing is owed. A lookup
-Rocket.Chat doesn't answer is an attempt that failed, deferred with the
-retirement's backoff, so a creation that died because Rocket.Chat was
-unreachable still finds its bot user once Rocket.Chat is back. Rocket.Chat
-answers an unknown username with HTTP 400 and the error `User not found.`,
-without an error code, and older servers with `error-user-not-found` or
-`error-invalid-user`; `user_by_username` reads those answers as no user, so
-the username of a creation that never got as far as `users.create` is
-forgotten at the first lookup, like another's email, while a transport
-error, a 5xx or a 429 keeps the backoff. The adoption needs the manager's
-`view-full-other-user-info`, without which `users.info` leaves the emails
-out. A bot user still missed has no token and no password anyone knows, so
-it can't be used, but it keeps its username until an admin removes it.
-Review asked for both quiet paths to be visible: a found user with no
-email at all is logged as a warning (binding and username only) before the
-username is forgotten, since that is what every user looks like to a
-manager without `view-full-other-user-info`, and a lookup that fails is a
-warning like a failed deactivation, bounded by the retirement's backoff,
-instead of a debug line that hid a long outage until "giving up".
-
-### Deactivating a deleted agent's bot is owed until it happens
-
-**Issue.** `delete` deactivates the bot user with the manager's
-`users.setActiveStatus`, which can fail: the manager lacks
-`edit-other-user-active-status`, Rocket.Chat is down, the rate limiter.
-Forgetting the failure would leave an active bot user whose personal access
-token still works.
-
-**Solution.** `delete_agent` disables the agent's bindings and forgets their
-tokens in the same transaction that marks the agent deleted. A disabled
-binding with a bot user and no `retired_at` owes its retirement, in columns
-modeled on the relink notices': a claim counts an attempt and holds a
-ten-minute lease (`retire_attempts`, `retire_next_attempt_at`), success sets
-`retired_at`, and a failure defers the next attempt by a backoff from a
-minute doubling to six hours, for 20 attempts (about three days). `delete`
-tries once at once and says whether it worked; the supervisor retries every
-pass. A bot user Rocket.Chat no longer knows counts as retired, but only
-when it says so with `error-invalid-user` or `error-user-not-found`: a bare
-HTTP 404, such as a reverse proxy's, defers the attempt like any other
-failure. `delete` reports the deletion even when looking up or retiring the
-bindings afterwards fails in the store; that failure is logged and left to
-the supervisor.
-
-### Connections follow the store
-
-**Issue.** agentd has to start a connection when an agent is created, stop
-it when the agent is deleted, and restore every connection at startup. With
-more than one instance (a blue-green deploy), an agent created on one
-instance would be heard only there until a restart.
-
-**Solution.** The `Supervisor` owns the connections and derives them from
-the store: each pass starts one for every `active` binding of an active or
-paused agent and stops the rest. A pass runs at startup, whenever a
-command pokes it (`create`, `delete`), and every minute, so another
-instance's changes are picked up within a minute. After the connections,
-so slow REST calls don't delay them, it abandons stale creations and
-retires what is owed. A binding whose row doesn't read (a token that no
-longer decrypts) is logged and skipped, and the other bots keep listening. The command handlers never hold a
-`CommandFeed`, only the poke: the intake runs until every feed is dropped,
-and it owns the handlers, so a feed held there would keep it running
-forever. The supervisor drops its feed when agentd stops, after stopping its
-connections. A connection that ends on its own (a revoked token, a
-deactivated bot) or panics is logged and started again by a later pass: the
-supervisor maps each connection task's id to its binding, so a panic, which
-returns no value, still frees the binding. A connection that keeps ending
-waits longer each time, kept in memory per binding: the next pass after its
-first end, then one interval, doubling up to 32 intervals (32 minutes), and
-one that ran that long starts over. A broken bot so logs an error about
-twice an hour, not every minute, until it is fixed or deleted.
-
-### Retiring a bot and stopping its connection happen in either order
-
-**Issue.** `the_supervisor_follows_the_store_and_restarts_ended_connections`
-failed under CPU load, always at "the pass retired the bot": 1 of 200
-runs with 8 busy loops on 4 CPUs, 34 of 200 with 16. It waited for the fake
-server to count no connections, then read the binding once. A pass stops a
-connection by signalling its task, which closes the socket on its own while
-the pass goes on to `abandon_stale` and `retire_pending`, so the socket can
-close before `mark_retired` runs.
-Adding 300 ms before `mark_retired` failed it 10 of 10 runs without load.
-The order can also flip: a delete that lands between a pass's `reconcile`
-and its `retire_pending` is retired by that pass and disconnected by the
-next, and the `delete` command retires the bot before it pokes.
-
-**Solution.** The supervisor stays as it is. Both steps follow from the
-disabled binding, every pass does both, and a delete pokes after disabling
-it, so the end state is the same in either order within a pass: the bot
-user deactivated, `retired_at` set, and no connection. The test now waits
-for that whole end state through a shared `eventually` helper, and passed
-200 of 200 runs with 8 busy loops, 200 of 200 with 16, and 10 of 10 with
-the 300 ms added.
-
-`a_bot_made_after_its_creation_was_abandoned_owes_retirement` had the same
-shape: a 100 ms sleep stood in for "`create_bot` has recorded the username
-and sent `users.create`", and a 300 ms response delay for "the abandonment
-lands before the response". Adding 150 ms before the username is recorded
-failed it 10 of 10 runs. Its `users.create` response is now held until the
-test has abandoned the creation, so the abandonment always lands while the
-request is in flight; it passes 10 of 10 with the 150 ms added.
-
-The hold is `testkit::Held`, described in T04's notes with the auth tests
-that use it, the expired-token test's wait for its callers included.
-
-### Before turns, a bot reacts instead of replying
-
-**Issue.** The plan allows a fixed acknowledgement before T23, and the live
-check needs to see which bot a mention reaches. A reply is a
-`chat.postMessage`, which makes the bot join a public channel it isn't in
-(see T11's notes). Rocket.Chat deduplication is global, so a mention of an
-agent that isn't in the room can be delivered by another bot's connection,
-and replying would pull the mentioned bot into the channel. T23 has the
-same problem for real replies.
-
-**Solution.** Until T23, every connection passes the messages that aren't
-commands to `Acknowledge`, which makes each active agent a person's message
-mentions, and in a one-to-one DM the agent whose bot received it, react
-with `:eyes:` as its own bot. `chat.react` doesn't join the room. Messages
-from bots, the manager bot and managed agents are ignored whatever the
-surface flags say. T23 replaces `Acknowledge` with the pipeline, and should
-check that a mentioned agent is in the room before posting there.
-
-### Bot usernames
-
-**Issue.** The plan names the bot `<name>`, or `<owner>-<name>` when taken,
-but not what happens when both are taken, what email Rocket.Chat's required
-field gets, or how an owner's username is found; members are stored with
-their user id as display name.
-
-**Solution.**
-
-- The username is `<name>`, then `<owner>.<name>`, where `<owner>` is the
-  owner's username from `users.info`. If both are taken, the agent isn't
-  created and the owner is asked for another name. The separator is a dot
-  because agent names can't contain one (they are `a-z`, `0-9` and `-`),
-  while Rocket.Chat usernames can: with `-`, alice could name an agent
-  `bob-helper` and take the username bob's `helper` would fall back to.
-  Now no agent name, and no other owner's fallback, can be
-  `bob.helper`. `all` and `here` go
-  straight to the prefixed form, since Rocket.Chat reads `@all` and `@here`
-  as broadcasts and nobody could mention such a bot.
-- The display name is the agent's name. The email is
-  `agent-<binding id>@agent-core.invalid`: unique, unverified (T11), and in
-  a domain that can't receive mail.
-- `agent_bindings.bot_username` records the username, which the plan's
-  columns didn't have, so `list` and the create reply can show `@username`
-  without a lookup.
-- `create` stores the owner's username as their display name, which `list`
-  shows as the owner.
-- A deleted agent's bot user stays, deactivated, and keeps its username
-  for good: creating an agent of the same name again gets the prefixed
-  username, and once that one is deleted too, the name can't be created
-  again by that owner until an admin removes the old bot users.
-- So does the bot user of a creation that failed after `users.create`, for
-  example because the `bot` role lacks `create-personal-access-tokens`: it
-  is deactivated, not deleted, so a retry after the failure gets the
-  prefixed username. Deleting it would need `delete-user` on the manager's
-  role, a broader grant than the username is worth.
-
-### Agent names are the owner's
-
-**Issue.** Names are unique per owner, so `persona helper …` from a member
-who isn't the owner can't name the owner's `helper` at all.
-
-**Solution.** Every owner-only command looks the agent up among the
-sender's own agents, so a non-owner gets "You have no agent named `helper`.
-Only an agent's owner can change it." The name is free again once the agent
-is deleted, since deleted agents keep their row for the volumes, sessions
-and message refs that name them. `visibility` is `public` or `private`;
-`list` shows private agents only to their owner, and nothing sets `private`
-yet.
-
-### A bot sets its own avatar
-
-**Issue.** Setting another user's avatar needs `edit-other-user-avatar`
-(T11's table), one more permission for the manager's roles.
-
-**Solution.** The new bot sets `rocketchat.avatar_url` as its own avatar
-with its token, which Rocket.Chat allows while `Accounts_AllowUserAvatarChange`
-is on (the default). A failure is logged and the agent is created anyway.
-The Compose README's permission table drops `edit-other-user-avatar`, and
-`edit-other-user-info`, since agentd renames no bot.
-
-### The text of an upload
-
-**Issue.** A `persona.md` upload's command is the message's text. Depending
-on the client and version, Rocket.Chat puts the text typed with an upload
-in `msg` or in the file attachment's `description` (`sendFileMessage`
-builds the attachment from the upload's description and takes `msg` from
-the confirm body).
-
-**Solution.** `surface-rocketchat` takes the attachment's `description` as
-the text of a file message whose `msg` is empty. Which one a real 7.x
-client fills is for the live check. The file is downloaded from
-`<base>/file-upload/<id>/<name>` with the manager's `X-User-Id` and
-`X-Auth-Token` headers (Rocket.Chat's `requestCanAccessFiles` accepts them),
-never with the token in the URL, and refused past 64 KB by its
-`Content-Length` or while it is read, as `SurfaceError::TooLarge`, a
-variant added so callers don't match on error text.
-
-With the Amazon S3 or Google Cloud Storage file store, Rocket.Chat answers
-the download with a 302 to a presigned URL in the bucket (the default,
-`FileUpload_S3_Proxy_Uploads` off). reqwest follows redirects and drops
-`Authorization` and `Cookie` on a cross-origin hop, but not custom headers,
-so the manager's `X-User-Id` and `X-Auth-Token` would reach the object
-store. `RestClient` now follows redirects only within the origin it called
-(scheme, host and port; `http` to `https` on the same host counts as
-another origin), up to 10, and stops at any other, for every REST call, so
-the headers never leave the server. `download` then fetches a cross-origin
-`Location` once, with a separate client that sends no Rocket.Chat header
-and follows no redirect, and applies the same size limit: the presigned URL
-authorizes itself. A file message's text falls back to the attachment's
-`description` only when the message has files and an empty `msg`, so a
-message without files, such as one quoting another, keeps its own text. Only a file attached in the manager
-bot's DM is read: a persona uploaded to a room would be public anyway, but
-the manager may not be able to read files there.
-
-### A member's agents are capped
-
-**Issue.** Each agent is a Rocket.Chat user with a token and a realtime
-connection agentd keeps open, and nothing stopped one member from creating
-hundreds of them.
-
-**Solution.** `[agents] max_per_owner` (default 10, at least 1) caps the
-agents that aren't deleted per member. `create_agent` counts them inside
-its `BEGIN IMMEDIATE` transaction, so concurrent creations can't both slip
-under the cap, and returns `LimitReached`; `create` then tells the member
-the limit and to delete one first. Deleted agents don't count, but their
-bot users stay, deactivated.
-
-### The manager's permissions on the Community Edition
-
-**Issue.** T16 found that custom roles need an Enterprise license. T14 adds
-nothing to the permissions T11 derived: `create-user`, `edit-other-user-active-status`
-for `delete`, `add-user-to-joined-room` for `!agent create` in a room,
-`view-full-other-user-info` and `api-bypass-rate-limit`, plus
-`create-personal-access-tokens` on the `bot` role.
-
-**Solution.** [T11's live check](#the-live-check-against-7139) settled it.
-On the Community Edition the manager holds the built-in `bot` and `app`
-roles, and the admin adds these permissions to `app`, whose only other
-holders are Apps-Engine app users, which can't log in; `app` and `bot`
-already have `api-bypass-rate-limit`. Granting them to `user` or `bot`
-would grant them to every member or every agent. The Compose README walks
-through it, and the manager is never an admin.
