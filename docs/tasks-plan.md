@@ -2904,9 +2904,9 @@ Not scheduled. Each needs a decision before it becomes a task.
   `work/` or `shared/`, or in the transcript, that runs or instructs code
   in a later requester's process. Clearing `home/`, `tmp/` and everything
   in `claude/` but the transcript and `settings.json` on a requester
-  change, or putting `HOME` and `TMPDIR` on a tmpfs of the container's
-  own, would close the first three; `work/`, `shared/` and the transcript
-  would still carry over.
+  change would close the first three, and putting `HOME` and `TMPDIR` on a
+  tmpfs of the container's own would close `home/` and `tmp/`; `work/`,
+  `shared/` and the transcript would still carry over.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
