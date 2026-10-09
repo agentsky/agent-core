@@ -13,7 +13,7 @@ use core_types::{
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
-use surface_slack::{BindingRef, SlackClient, SlackEvent, SlackInbound, SlashCommand};
+use surface_slack::{BindingRef, InFlight, SlackClient, SlackEvent, SlackInbound, SlashCommand};
 use testkit::TempDir;
 use time::OffsetDateTime;
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
@@ -886,7 +886,10 @@ async fn a_command_sent_as_a_manager_dm_is_answered_in_that_dm() {
     let h = slack_harness().await;
     let running = Running::start(&h);
     running
-        .send(SlackInbound::Message(Box::new(dm_event("U0HUMAN01", "me"))))
+        .send(SlackInbound::Message(
+            Box::new(dm_event("U0HUMAN01", "me")),
+            InFlight::untracked(),
+        ))
         .await;
     let (channel, text) = wait_for(async || h.posts().await.pop()).await;
     assert_eq!(channel, "D0DM00001");
@@ -930,21 +933,38 @@ async fn the_managers_own_and_other_bots_messages_are_not_commands() {
     let running = Running::start(&h);
     let mut own = dm_event("U0MANAGER", "me");
     own.sender_is_bot = true;
-    running.send(SlackInbound::Message(Box::new(own))).await;
+    running
+        .send(SlackInbound::Message(Box::new(own), InFlight::untracked()))
+        .await;
     let mut unflagged_own = dm_event("U0MANAGER", "me");
     unflagged_own.sender_is_bot = false;
     running
-        .send(SlackInbound::Message(Box::new(unflagged_own)))
+        .send(SlackInbound::Message(
+            Box::new(unflagged_own),
+            InFlight::untracked(),
+        ))
         .await;
     let mut bot = dm_event("U0BOT0001", "me");
     bot.sender_bot_user = Some(UserId::new("U0BOT0001"));
-    running.send(SlackInbound::Message(Box::new(bot))).await;
+    running
+        .send(SlackInbound::Message(Box::new(bot), InFlight::untracked()))
+        .await;
     let mut channel = dm_event("U0HUMAN01", "me");
     channel.conv_kind = ConvKind::Channel;
-    running.send(SlackInbound::Message(Box::new(channel))).await;
+    running
+        .send(SlackInbound::Message(
+            Box::new(channel),
+            InFlight::untracked(),
+        ))
+        .await;
     let mut agent = dm_event("U0HUMAN01", "me");
     agent.binding = BindingId::new_v4();
-    running.send(SlackInbound::Message(Box::new(agent))).await;
+    running
+        .send(SlackInbound::Message(
+            Box::new(agent),
+            InFlight::untracked(),
+        ))
+        .await;
     running.stop().await;
     assert!(h.posts().await.is_empty());
 }
@@ -1107,10 +1127,20 @@ async fn the_slack_inbound_passes_a_dms_files_to_the_intake() {
     let running = Running::start(&h);
     let mut too_big = dm_event("U0HUMAN01", "persona helper");
     too_big.files = vec![file(64 * 1024 + 1)];
-    running.send(SlackInbound::Message(Box::new(too_big))).await;
+    running
+        .send(SlackInbound::Message(
+            Box::new(too_big),
+            InFlight::untracked(),
+        ))
+        .await;
     let mut event = dm_event("U0HUMAN01", "persona helper");
     event.files = vec![file(12)];
-    running.send(SlackInbound::Message(Box::new(event))).await;
+    running
+        .send(SlackInbound::Message(
+            Box::new(event),
+            InFlight::untracked(),
+        ))
+        .await;
     running.stop().await;
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
     assert_eq!(row.persona, "Via the DM.\n");
@@ -1130,10 +1160,10 @@ async fn a_persona_sent_in_a_manager_dm_arrives_decoded() {
     let agent = slack_agent(&h, alice).await;
     let running = Running::start(&h);
     running
-        .send(SlackInbound::Message(Box::new(dm_event(
-            "U0HUMAN01",
-            "persona helper You &amp; me &lt;3",
-        ))))
+        .send(SlackInbound::Message(
+            Box::new(dm_event("U0HUMAN01", "persona helper You &amp; me &lt;3")),
+            InFlight::untracked(),
+        ))
         .await;
     running.stop().await;
     let row = h.store.agent(agent.id).await.unwrap().unwrap();
@@ -1313,7 +1343,9 @@ async fn requests_from_another_workspace_are_dropped() {
     dm.sender = outsider.clone();
     dm.conv.team = other.clone();
     dm.message.conv.team = other.clone();
-    running.send(SlackInbound::Message(Box::new(dm))).await;
+    running
+        .send(SlackInbound::Message(Box::new(dm), InFlight::untracked()))
+        .await;
 
     let envelope: Value = serde_json::from_str(testkit::slack::USER_CHANGE).unwrap();
     for team in [Some(other.clone()), None] {

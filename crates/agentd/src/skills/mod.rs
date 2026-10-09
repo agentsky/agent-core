@@ -67,11 +67,11 @@ pub mod package;
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use core_types::{AgentId, LeaseId, MemberId, SessionId};
+use core_types::{AgentId, LeaseId, MemberId, SessionId, Throttle};
 use cred_proxy::{EgressExtension, HostRule};
 use store::{AgentSkill, NewSkill, SkillState, Store, StoreError};
 use time::OffsetDateTime;
@@ -83,7 +83,6 @@ pub use package::{BUNDLED_NAME, Manifest, Problem};
 use package::CheckError;
 
 use crate::sweeper::SWEEP_INTERVAL;
-use crate::throttle::Throttle;
 
 /// The bundled skill's `SKILL.md`, documenting `agentctl`.
 pub const BUNDLED_SKILL: &str = include_str!("../../assets/skills/agentctl/SKILL.md");
@@ -112,7 +111,10 @@ pub const LEASE_WAIT: Duration = Duration::from_secs(2);
 /// How often a change waiting for a skill's lease tries again.
 const LEASE_RETRY: Duration = Duration::from_millis(100);
 /// How often a skill whose files in use don't declare its hosts is warned
-/// about; the denials between are logged at debug level, and counted.
+/// about; the denials between are logged at debug level, and counted in its
+/// next warning. While the [`Throttle`] is full of recently warned skills
+/// ([`MAX_THROTTLE_KEYS`](core_types::throttle::MAX_THROTTLE_KEYS)), a new
+/// skill's denials are all logged at debug level, uncounted.
 pub const MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Writes the bundled skill into `agent`'s skills directory under
@@ -280,7 +282,7 @@ struct Inner {
     data_dir: PathBuf,
     git: Git,
     changes: Arc<RwLock<()>>,
-    mismatches: Mutex<Throttle<(AgentId, String)>>,
+    mismatches: Throttle<(AgentId, String)>,
 }
 
 impl fmt::Debug for Skills {
@@ -302,7 +304,7 @@ impl Skills {
                 data_dir,
                 git,
                 changes: Arc::default(),
-                mismatches: Mutex::new(Throttle::new(MISMATCH_WARN_INTERVAL)),
+                mismatches: Throttle::new(MISMATCH_WARN_INTERVAL),
             }),
         }
     }
@@ -803,8 +805,6 @@ impl Skills {
             let warn = self
                 .inner
                 .mismatches
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
                 .record((skill.agent, skill.name.clone()), Instant::now());
             match warn {
                 Some(quiet) => {

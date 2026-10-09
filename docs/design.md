@@ -123,7 +123,7 @@ A mentionable agent therefore needs its own bot identity.
 | --- | --- | --- |
 | Mention in the message | `<@U…>` user id token, produced by autocomplete | `@username` text, parsed by the server into `mentions[]` |
 | Agent identity | One Slack app with a bot user per agent | One user with the `bot` role per agent |
-| How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel message only if it mentions the bot (`<@U…>` in the text or blocks) or replies in a thread, so the router can see replies to the agent's own messages. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
+| How the bot hears it | `message.channels`, `message.groups`, `message.im` and `message.mpim` events, not `app_mention`[^slack-mention]. agentd keeps a channel or group DM message only if it mentions the bot (`<@U…>` in the text or blocks) or replies in a thread whose root the bot may have posted (its `parent_user_id` is the bot user, or isn't known), so the router can see replies to the agent's own messages. When the bot user is known, it drops the bot's own posts, and other bots' messages that don't mention it, in every kind of conversation. The bot must be a channel member | Realtime `stream-room-messages`, check `mentions[]` for the bot's `_id`[^rc-stream] |
 | Bot-to-bot mentions | Expected but not yet verified: whether one app's bot user's post reaches another app as a `message.*` event[^slack-botmention] | Delivered |
 | Who creates the identity | The member installs the app. Admin approval only if "Require App Approval" is on[^slack-approval] | agentd's manager account with dedicated roles (`create-user`, plus token creation granted to `bot`)[^rc-create] |
 | Scaling limit | 10 app installs on the free plan[^slack-free] | None in practice |
@@ -160,10 +160,12 @@ Each agent is its own Slack app, created from a manifest.
   verified with its own `signing_secret`, a `v0` HMAC-SHA256 over the raw body
   compared in constant time, with a timestamp at most five minutes from now.
   Unknown bindings get 404.
-- **The challenge is answered unsigned.** Slack sends `url_verification` while
-  `apps.manifest.create` is still running, before agentd has the new app's
-  signing secret, so agentd echoes the challenge for any binding it knows
-  (including one still being created) without checking the signature. That is
+- **The challenge is answered unsigned while an app is created.** Slack sends
+  `url_verification` while `apps.manifest.create` is still running, before
+  agentd has the new app's signing secret, so agentd echoes the challenge for a
+  binding it knows but has no secret for yet (one still being created) without
+  checking the signature. A binding with a secret, the manager app's included,
+  answers a challenge only once it verified. That is
   safe because the echo has no side effects: it reads no state beyond the
   binding's existence, writes nothing and queues nothing, and returns only the
   string the caller sent, as `text/plain` with `nosniff`. A forger learns only
@@ -177,12 +179,42 @@ Each agent is its own Slack app, created from a manifest.
   and retries otherwise. Turns take minutes, so agentd acknowledges every event,
   command and interaction as soon as it is verified and queued, processes it
   asynchronously, and replies to commands and interactions through their
-  `response_url`. A full queue gets 503: Slack retries an event later, while
-  a command or interaction fails and its user can try again. Deduplication is
-  per binding and happens after the ack: a message, whether retried or reaching
-  the same app twice, by `(channel, ts)`, and only once normalization has kept
-  it, so unaddressed channel messages cost no store write; other events by
-  `event_id`; and a replayed command or interaction by its signature.
+  `response_url`. A binding with too many requests in flight (acknowledged,
+  and not yet handed on) gets 503: each agent's app may have 32, one owner's
+  agents' apps together 64, agents' apps together 1024, and the manager app
+  1024 of its own, so one app's flood is refused without refusing another's.
+  An agent's app that sends faster than Slack delivers to one app (a burst of
+  100, then 8 a second, about Slack's 30,000 events an hour) gets 503 too.
+  Slack retries an event later, while a command or interaction fails and its
+  user can try again. Slack turns off an app's events when too many
+  deliveries fail, so only what a forger sends should meet a refusal: each
+  app gets every message in every channel it is in, and one owner's agents
+  may share busy channels, so their owner's limit counts only the messages
+  agentd keeps. An agent's app is only a way to reach its agent, so its
+  events other than messages, its commands and its interactions get an
+  empty 200 and are dropped, and so does a message posted more than 15
+  minutes before it arrived, which confirming would refuse, with a warning
+  once a minute per app, since a fast clock or a backlog at Slack drops
+  every one; none of them takes a place or writes anything. The queue keeps
+  each body as it arrived, at most a megabyte, and parses it again after
+  the ack.
+  Deduplication is per binding and happens after the ack: a message,
+  whether retried or reaching the same app twice, by `(channel, ts)`, and
+  only once normalization has kept it, so unaddressed channel messages cost
+  no store write; other events by `event_id`; and a replayed command or
+  interaction by its signature. One owner's agents' apps together keep a
+  burst of 200 messages, then 16 a second; a message past that is dropped
+  after its 200, before its row. Slack's keys are kept an hour, longer than
+  Slack retries, a signature is accepted or a message is confirmed. Those
+  ids must be shaped like Slack's (`Ev…`, `T…`/`E…`, `C…`/`D…`/`G…`, each
+  with room to grow to 64 characters after its prefix, and a `ts` of 10 to
+  20 and 6 digits), or the body gets 400 before the ack, so a key is at
+  most about a hundred bytes. A message's sender is no key: one not shaped
+  like Slack's (`U…`/`W…`, `B…`) is dropped after the 200, before any row.
+  A kept message is cut to Slack's own limits, 160 KB of text (40,000
+  characters of at most 4 bytes each, cut in bytes since Slack's escaping
+  of `&`, `<` and `>` lengthens what was typed), 10 files and 100
+  mentions, so each is at most about 225 KB.
 
 Slash commands are neither namespaced nor unique. Two apps can both register
 `/agent`, and Slack routes it to whichever was installed most recently, so a
@@ -813,8 +845,9 @@ for Rocket.Chat bindings.
 | Manager account compromise on Rocket.Chat | Dedicated roles (a custom role with a license, or the built-in `bot` and `app` roles on the Community Edition) instead of admin. The manager token never enters sandboxes. |
 | agentd holds members' Slack configuration refresh tokens | Encrypted at rest, used only to create and update that member's agent apps, deleted on `/agent logout` or when the member leaves. Compromise of agentd lets an attacker create or edit apps as those members, so agentd's store and key need the same protection as the Claude tokens. |
 | A later-installed Slack app takes over `/agent` | Only the manager bot declares it. `/agent me` shows the manager app's name. |
-| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals are logged as warnings at most once a minute. |
-| Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel messages at ingress and never logs message content. |
+| Forged or replayed Slack requests | Each app's requests are verified with its own `signing_secret` over the raw body, in constant time, and refused when the timestamp is more than five minutes off. Only the side-effect-free `url_verification` echo, for a binding still being created, and `ssl_check` answer skip it. Retried events are deduplicated by `event_id` (messages by channel and timestamp), and a command or interaction replayed within the window by its signature. Reading the body and looking up the secret share a 2-second timeout, and refusals, answered challenges and retried deliveries are logged at most once a minute per app. |
+| Every agent app hears whole channels | Agent apps subscribe to `message.*` instead of `app_mention`, so the design's "reply to the agent's own message" gating works on Slack. The cost: each agent app needs the `channels:history`, `groups:history`, `im:history` and `mpim:history` scopes and receives every message in every channel it is in; N agents in a channel means N copies of its traffic; each member's app can read the channel's history; and workspaces that require app approval are more likely to block the install. agentd drops unaddressed channel and group DM messages at ingress, thread replies under another user's root included, and never logs message content. |
+| An agent's owner forges its app's events | Each agent's app is created with its owner's configuration token, so the owner can read the app's signing secret, client secret and bot token at api.slack.com. With the signing secret they can sign a `message` event with any sender, conversation, kind, thread, mentions and files: a copy of a linked member's message with a mention added, to run a turn on that member's Claude plan; a message in another member's DM with the agent, to resume that member's scope; an agent's post with a mention added, to inherit the requester recorded for it; or a message from themselves in another member's thread or DM, to resume, reset or replace that member's session. So Slack's copy is the source of truth: before agentd acts on any message it doesn't ignore (a turn, a link prompt or a refusal), whoever the event says sent it, the owner included, it reads the message back from Slack over TLS with the app's bot token (`conversations.history`, or `conversations.replies` in the thread the event names, at exactly that `ts`), takes the conversation's kind from `conversations.info` (cached per channel for an hour, and refused unless Slack's channel id is the event's exactly), normalizes Slack's copy with the ingress's own rules, and routes that copy again. It acts only if the copy is the same message in the same thread and routes to the same decision, and then acts on the copy. What the forged event said decides nothing. A message older than 15 minutes when its event arrived is acknowledged and dropped before it is recorded, since deduplication forgets a message after an hour and messages from before the bot joined never had one. A copy Slack doesn't have, won't show or that routes differently is dropped silently. An unreachable Slack or a rate limit drops the message and tells the thread to try again. A bot's post that was edited is refused, since agentd never edits its agents' posts. An edited message runs once, with its text when its turn comes; the edit starts no turn of its own, and a deleted message is dropped. The cost is one cached `conversations.info` per channel plus one Tier 3 read per message not ignored, on the agent's own token. Forged events slow or refuse only their owner's own agents: each agent's app has at most 32 requests in flight, from the ack until its message reaches the pipeline, one owner's agents' apps together 64, and each app gets 503 past that or past a rate of 100 at once then 8 a second, near Slack's own ceiling for one app; one owner's apps together keep 200 messages at once then 16 a second, and drop the rest after their 200, but only messages an agent's app keeps count, and outside one-to-one DMs it keeps only mentions of its bot and replies in threads its bot may have started, so busy channels and threads one owner's agents share take from that owner's bucket only what may be addressed to one of them, however many agents are there; each deduplication key is made of ids shaped like Slack's, or the body gets 400, so the rows one owner can add to the shared store are at most about a hundred bytes each, at 16 a second, kept an hour, about 60,000 rows or 20 MB at most, and only for messages; each app's messages reach the pipeline in a lane of their own, so the `bots.info` lookup of a sender known only by a made-up bot id holds up only that app's, and a message whose bot id isn't shaped like Slack's is dropped after its 200, with a throttled warning, before it is looked up or cached; an event keeps at most 160 KB of text, 10 files and 100 mentions, each id shaped like Slack's, so the 64 messages one owner's apps may have in flight hold at most about 14 MB; the lookups never wait for the token's quota or retry a 429 (past it, a bot sender stays unknown and is ignored, and the thread gets the "try again" line, posted like the busy line in a task that holds no place); one owner's agents, however many, hold at most 16 of the pipeline's 64 places and post 8 such lines at once; the warnings a flood causes, confirmations that fail included, are logged once a minute per agent; and the workspace's shared member list is read only with the manager app's token, never an agent's, which its owner could revoke or exhaust. Only several owners flooding together (four for the pipeline's places, 16 for the ingress's 1024) could take what other agents need. The owner's bot token still reads every conversation the bot is in, so confirming protects other members' sessions, scopes and bills, not what the bot can read. The manager app's secret stays with the operators, so its requests aren't read back. |
 | One member's usage billed to another | Requester-pays policy. Owner credential only with owner action or approval. |
 
 ## Crate layout

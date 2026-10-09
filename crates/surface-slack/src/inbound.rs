@@ -8,12 +8,15 @@ use secrecy::SecretString;
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 
+use crate::ingress::InFlight;
+
 /// One verified request from Slack, after deduplication.
 #[derive(Debug)]
 pub enum SlackInbound {
-    /// A `message` event the router can use, normalized. Boxed, since it
-    /// is much larger than the other variants.
-    Message(Box<InboundEvent>),
+    /// A `message` event the router can use, normalized, with its place
+    /// among its binding's requests in flight. Boxed, since it is much
+    /// larger than the other variants.
+    Message(Box<InboundEvent>, InFlight),
     /// Any other Events API event, such as `user_change` or
     /// `app_uninstalled`, as Slack sent it.
     Event(SlackEvent),
@@ -28,7 +31,7 @@ impl SlackInbound {
     /// The binding whose app received the request.
     pub fn binding(&self) -> BindingId {
         match self {
-            Self::Message(event) => event.binding,
+            Self::Message(event, _) => event.binding,
             Self::Event(event) => event.binding,
             Self::Command(command) => command.binding,
             Self::Interaction(interaction) => interaction.binding,
@@ -40,7 +43,7 @@ impl SlackInbound {
     /// `None` when Slack named none.
     pub fn team(&self) -> Option<&TeamId> {
         match self {
-            Self::Message(event) => Some(&event.conv.team),
+            Self::Message(event, _) => Some(&event.conv.team),
             Self::Event(event) => event.team.as_ref(),
             Self::Command(command) => Some(&command.sender.team),
             Self::Interaction(interaction) => {
@@ -53,7 +56,7 @@ impl SlackInbound {
     /// `command` or `interaction`.
     pub fn kind(&self) -> &'static str {
         match self {
-            Self::Message(_) => "message",
+            Self::Message(..) => "message",
             Self::Event(_) => "event",
             Self::Command(_) => "command",
             Self::Interaction(_) => "interaction",

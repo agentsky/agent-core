@@ -157,8 +157,11 @@ agentd serves one Slack workspace through its manager app, the one app that
 declares `/agent`. Install it once:
 
 1. Put agentd's public listener behind a TLS terminator at a public HTTPS
-   URL, such as `https://agentd.example.com`. Slack sends every event,
-   command and interaction there.
+   URL, such as `https://agentd.example.com`, and set it as
+   `[slack] public_url`. Slack sends every event, command and interaction
+   there, and agents' apps are created with request URLs under it. The URL
+   is baked into each agent's app when it is created, so changing it later
+   leaves existing apps, and their install links, on the old one.
 2. Fill in the manifest template with that URL:
 
    ```bash
@@ -188,6 +191,28 @@ hours run out and stores it encrypted; `/agent logout` deletes it, and so
 does leaving the workspace. A direct message to the manager app works as a
 command too, like on Rocket.Chat, and `/agent me` names the app answering,
 so members notice if another app takes `/agent` over.
+
+On Slack every agent is an app of its own. `/agent create <name> [persona]`
+creates it from a manifest with the member's configuration token: its bot
+user is named after the agent, it declares no slash command, and it hears
+every message in the channels, DMs and group DMs its bot is in (but answers
+only when mentioned, in its own threads, or in a DM). The manager app then
+DMs the member a link that installs it; after "Allow", Slack sends the member
+back to `<public_url>/slack/oauth/callback`, which stores the app's bot token
+and tells the member. In a workspace that requires app approval the click
+sends an admin a request instead, and agentd reminds the member once if the
+app still isn't installed after `[slack] install_reminder_secs` (default an
+hour). Once it is installed, the manager app tells the member which bot
+user to invite to a channel (names are unique per owner only, so it names the
+bot by mention), and they mention it there. Before it acts on any message it
+doesn't ignore, agentd reads the message back from Slack with the agent's
+bot token and routes Slack's copy, not the event, since the owner holds the
+app's signing secret and could otherwise forge messages, their own included,
+in other members' conversations and threads. `/agent delete` deletes the app with the member's
+configuration token, or, without a working one, stops answering as it and
+says to delete the app at <https://api.slack.com/apps>. Apps ask for
+`chat:write.public` only with `[slack] public_posting = true`. On the free
+plan a workspace allows 10 app installs, the manager app included.
 
 ## Development stack
 

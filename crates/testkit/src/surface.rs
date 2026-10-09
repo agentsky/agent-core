@@ -123,6 +123,7 @@ pub struct UploadedFile {
 ///   injected before the loop starts wait for it.
 /// - [`render`](Surface::render) doesn't convert anything. It splits the
 ///   text into chunks that fit [`Caps::message_limit`].
+/// - [`confirm`](Surface::confirm) returns every message as it arrived.
 ///
 /// Share it with the code under test through an `Arc`:
 ///
@@ -460,6 +461,11 @@ impl Surface for MockSurface {
             limit,
         });
         Ok(page)
+    }
+
+    /// Returns every message as it arrived.
+    async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
+        Ok(Some(event.clone()))
     }
 
     fn render(&self, markdown: &str) -> Vec<String> {

@@ -71,6 +71,20 @@ pub trait Surface: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Msg>>;
 
+    /// The platform's own copy of `event`'s message, normalized as the
+    /// surface normalizes events, or `None` when the platform doesn't have
+    /// it, or has it in a form the surface wouldn't deliver. Only the
+    /// binding, the event id and the arrival time come from `event`;
+    /// everything routing reads comes from the platform.
+    ///
+    /// A surface whose events arrive over a connection only the platform
+    /// can speak on returns `event` itself without asking. One whose events
+    /// someone else could forge, such as Slack's, where an agent's owner
+    /// holds the app's signing secret, reads the message back from the
+    /// platform. The pipeline asks before acting on a message for anyone
+    /// but the agent's owner, and routes the copy instead of the event.
+    async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>>;
+
     /// Converts Markdown to the surface's format and splits it into
     /// messages that each fit [`Caps::message_limit`].
     fn render(&self, markdown: &str) -> Vec<String>;
@@ -261,6 +275,12 @@ impl<T: Send + 'static> Sender<T> {
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         self.sink.send(item).await
     }
+
+    /// Whether the receiver is known to take no more items, so the sender
+    /// can skip the work of making one (see [`Sink::is_closed`]).
+    pub fn is_closed(&self) -> bool {
+        self.sink.is_closed()
+    }
 }
 
 impl<T: Send + 'static> Clone for Sender<T> {
@@ -301,6 +321,12 @@ impl<T: Send + 'static> fmt::Debug for Sender<T> {
 pub trait Sink<T: Send + 'static>: Send + Sync {
     /// Delivers one item. Fails once the receiver is gone.
     async fn send(&self, item: T) -> Result<(), SendError>;
+
+    /// Whether the receiver takes no more items. False unless the sink can
+    /// tell; [`send`](Self::send) still decides.
+    fn is_closed(&self) -> bool {
+        false
+    }
 }
 
 /// The receiver behind a [`Sender`] is gone.
@@ -445,6 +471,10 @@ mod tests {
             ])
         }
 
+        async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
+            Ok((event.text != "forged").then(|| event.clone()))
+        }
+
         fn render(&self, markdown: &str) -> Vec<String> {
             vec![markdown.to_owned()]
         }
@@ -513,6 +543,10 @@ mod tests {
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].id.as_str(), "1.0");
         assert_eq!(history[0].text, "2.0");
+        let mut forged = event(BindingId::new_v4());
+        assert_eq!(ready(surface.confirm(&forged)), Ok(Some(forged.clone())));
+        forged.text = "forged".into();
+        assert_eq!(ready(surface.confirm(&forged)), Ok(None));
         assert_eq!(surface.render("**x**"), ["**x**"]);
         assert_eq!(surface.caps().message_limit.unit, LengthUnit::Utf16);
         assert_eq!(surface.caps().message_limit.max, 5000);

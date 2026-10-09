@@ -5,12 +5,12 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use core_types::{
     AgentId, Caps, ConvKind, CredentialRef, Hop, InboundEvent, MemberId, MemberKey, MsgRef,
     ReplyTarget, Requester, ScopeKey, ScopeKind, SendError, Sender, Side, Sink, Surface,
-    SurfaceError, ThreadKey, TurnId, TurnKind,
+    SurfaceError, ThreadKey, Throttle, TurnId, TurnKind,
 };
 use futures::FutureExt as _;
 use render::directives::{self, Directive};
@@ -47,6 +47,10 @@ pub const DELIVERY_FAILED_TEXT: &str = "Sorry, part of this reply couldn't be de
 /// it finished.
 pub const RESTARTING_TEXT: &str =
     "Sorry, I'm restarting and couldn't finish this. Please ask again in a minute.";
+/// What the thread is told when a message couldn't be checked with the
+/// platform: the platform failed, or asked to slow down, or the client
+/// had no quota left for the lookup.
+pub const UNCONFIRMED_TEXT: &str = "Sorry, I couldn't check this message. Try again in a moment.";
 /// Appended to a reply cut at [`MAX_POST_BYTES`].
 pub const TRUNCATED_NOTE: &str = "\n\n*(The reply was cut here: it was too long to post.)*";
 
@@ -56,6 +60,18 @@ pub const DEFAULT_QUEUE_PER_THREAD: usize = 8;
 /// How many messages may wait or be answered at once across every agent
 /// and thread, unless the settings say otherwise.
 pub const DEFAULT_MAX_PENDING: usize = 64;
+/// How many messages may wait or be answered at once for the agents of one
+/// owner, across their threads, unless the settings say otherwise.
+pub const DEFAULT_MAX_PENDING_PER_OWNER: usize = 16;
+
+/// How many notices the agents of one owner may be posting at once: busy
+/// lines and asks to try again. One more while that many are is dropped.
+const MAX_NOTICES: usize = 8;
+
+/// How often a warning about one agent's flood (a message not taken, a
+/// notice not posted) is logged, at most; the next says how many went
+/// quiet.
+const FLOOD_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// How long the notices of turns cut short by a shutdown may take.
 const NOTICE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -80,6 +96,9 @@ pub struct PipelineSettings {
     pub queue_per_thread: usize,
     /// How many messages may wait or be answered at once in all.
     pub max_pending: usize,
+    /// How many messages may wait or be answered at once for the agents of
+    /// one owner.
+    pub max_pending_per_owner: usize,
 }
 
 /// Takes every surface's messages that aren't commands, decides which
@@ -99,14 +118,29 @@ pub struct PipelineSettings {
 ///    up and queued one at a time, in the order their sending started,
 ///    even when different connections deliver them at once. At most
 ///    [`queue_per_thread`](PipelineSettings::queue_per_thread) messages
-///    wait for one agent in one thread, and
-///    [`max_pending`](PipelineSettings::max_pending) wait or run in all; a
-///    person's message past either gets one line saying the agent is busy,
-///    and a bot's gets nothing, so two bots can't answer each other's busy
-///    lines.
+///    wait for one agent in one thread,
+///    [`max_pending_per_owner`](PipelineSettings::max_pending_per_owner)
+///    wait or run for the agents of one owner, and
+///    [`max_pending`](PipelineSettings::max_pending) in all, so one owner's
+///    agents can't take every agent's place, however many they are and
+///    whatever their owner signs for them; a person's message past any of
+///    them gets one line saying the agent is busy, and a bot's gets
+///    nothing, so two bots can't answer each other's busy lines.
 /// 3. **Routing.** [`router::route`] for the candidate, with a view of the
 ///    store loaded for it.
-/// 4. **The turn.** On [`Decision::Run`], only when the agent's bot may
+/// 4. **Confirming.** Unless the decision is to ignore, the platform's
+///    copy of the message ([`Surface::confirm`]) replaces the event, and is
+///    routed again. The decision stands only if the copy's is the same, in
+///    the same conversation, message and thread; anything else drops the
+///    message silently. A confirmation that fails, the platform being down
+///    or asking to slow down, tells the thread to try again
+///    ([`UNCONFIRMED_TEXT`]). So what an event claims decides nothing,
+///    whoever it names as the sender.
+///
+///    The busy line and the ask to try again are notices, posted in a task
+///    of their own, which holds none of the message's places: at most eight
+///    at once for the agents of one owner, and one more is dropped.
+/// 5. **The turn.** On [`Decision::Run`], only when the agent's bot may
 ///    post in the conversation without joining it
 ///    ([`Surface::can_post`]): the persona file is written from the store,
 ///    and the bundled `agentctl` skill into the agent's skills,
@@ -120,7 +154,7 @@ pub struct PipelineSettings {
 ///    [`RunnerError::SessionReset`] runs once more, on the session looked
 ///    up again. What the turn message recorded as shown is forgotten when
 ///    the turn never reached the model, so the next turn shows it again.
-/// 5. **Delivery**, as the agent's bot, in the thread: the directives are
+/// 6. **Delivery**, as the agent's bot, in the thread: the directives are
 ///    taken out of the reply, the turn's staged attachments uploaded, the
 ///    reply cut at [`MAX_POST_BYTES`] (closing a code block the cut left
 ///    open), rendered, split and posted, and a `message_refs` row recorded
@@ -140,7 +174,7 @@ pub struct PipelineSettings {
 ///    the CLI read its message posts [`TIMED_OUT_TEXT`]; any other
 ///    failure, including a crash or a timeout before the CLI read the
 ///    message, posts [`FAILED_TEXT`].
-/// 6. [`Decision::LinkPrompt`] sends the requester a DM from the manager
+/// 7. [`Decision::LinkPrompt`] sends the requester a DM from the manager
 ///    bot saying how to link an account, and [`Decision::RelinkPrompt`]
 ///    one saying their link stopped working and how to link it again, when
 ///    the agent's bot may post in the conversation; nothing runs for them.
@@ -178,22 +212,59 @@ struct Inner {
     lanes: Mutex<HashMap<LaneKey, VecDeque<Job>>>,
     dispatching: KeyedLocks<ThreadKey>,
     pending: Arc<Semaphore>,
+    shares: Mutex<HashMap<MemberId, Share>>,
     tasks: Mutex<JoinSet<()>>,
     closed: AtomicBool,
     working: Mutex<Working>,
+    floods: Throttle<(AgentId, Flood)>,
+}
+
+/// What an agent's flood makes the pipeline refuse or drop, each warned
+/// about apart: a message not taken, a notice not posted or failed, and a
+/// message that confirming dropped or couldn't check, which is what a
+/// forged event reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Flood {
+    BotMessage,
+    Message,
+    Notice,
+    Unconfirmed,
 }
 
 /// One agent in one thread: its messages are answered in arrival order.
 type LaneKey = (AgentId, ThreadKey);
 
-/// A message waiting for one candidate agent. Dropping it releases its
-/// place under [`PipelineSettings::max_pending`] and tells whoever waits
-/// for it in [`Pipeline::handle`].
+/// A message waiting for one candidate agent, whose owner is `owner`.
+/// Dropping it releases its places under [`PipelineSettings::max_pending`]
+/// and [`PipelineSettings::max_pending_per_owner`]; once it and the notices
+/// it started are gone, whoever waits for it in [`Pipeline::handle`] is
+/// told.
 struct Job {
     event: Arc<InboundEvent>,
     caps: Caps,
-    _pending: OwnedSemaphorePermit,
-    _done: oneshot::Sender<()>,
+    owner: MemberId,
+    _pending: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+    done: Done,
+}
+
+/// Dropped, with every clone, once a message is done with.
+type Done = Arc<oneshot::Sender<()>>;
+
+/// The places of one owner's agents: their messages waiting or being
+/// answered, and their notices being posted.
+#[derive(Clone)]
+struct Share {
+    pending: Arc<Semaphore>,
+    notices: Arc<Semaphore>,
+}
+
+/// A line the pipeline posts on its own, in a task of its own.
+#[derive(Debug, Clone, Copy)]
+enum Notice {
+    /// The agent has too many messages to take this one.
+    Busy,
+    /// The message couldn't be confirmed: [`UNCONFIRMED_TEXT`].
+    Unconfirmed,
 }
 
 /// The working emoji of the turns running, and of those a shutdown cut
@@ -257,6 +328,16 @@ impl Drop for WorkingGuard {
     }
 }
 
+/// Takes the pipeline's finished tasks off `tasks`, logging any that
+/// panicked, as [`Pipeline::drain`] does.
+fn reap(tasks: &mut JoinSet<()>) {
+    while let Some(joined) = tasks.try_join_next() {
+        if let Err(err) = joined {
+            tracing::error!(error = %err, "a pipeline task failed");
+        }
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -282,9 +363,11 @@ impl Pipeline {
                 lanes: Mutex::new(HashMap::new()),
                 dispatching: KeyedLocks::default(),
                 pending,
+                shares: Mutex::new(HashMap::new()),
                 tasks: Mutex::new(JoinSet::new()),
                 closed: AtomicBool::new(false),
                 working: Mutex::new(Working::default()),
+                floods: Throttle::new(FLOOD_WARNING_INTERVAL),
             }),
         }
     }
@@ -402,7 +485,8 @@ impl Pipeline {
     /// connection in a room may deliver a message, and two of a thread's
     /// messages delivered by different connections at once would
     /// otherwise reach the lanes in the order their lookups ended. The
-    /// busy lines are posted after the lock is released.
+    /// busy lines are posted in tasks of their own, so the lock never
+    /// waits for one.
     async fn dispatch(&self, event: InboundEvent, caps: Caps) -> Vec<oneshot::Receiver<()>> {
         if self.is_closed() {
             tracing::info!(message = %event.message.id, "shutting down: not handling a message");
@@ -419,54 +503,68 @@ impl Pipeline {
         };
         let event = Arc::new(event);
         let mut waiting = Vec::new();
-        let mut busy = Vec::new();
-        for agent in candidates {
+        for (agent, owner) in candidates {
             let (done, finished) = oneshot::channel();
-            if self.enqueue((agent, thread.clone()), Arc::clone(&event), caps, done) {
+            let done: Done = Arc::new(done);
+            let taken = self.places(owner).is_some_and(|places| {
+                let job = Job {
+                    event: Arc::clone(&event),
+                    caps,
+                    owner,
+                    _pending: places,
+                    done: Arc::clone(&done),
+                };
+                self.enqueue((agent, thread.clone()), job)
+            });
+            if taken {
                 waiting.push(finished);
             } else if from_bot {
-                tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; dropping a bot's message");
+                if let Some(quiet) = self.flooded(agent, Flood::BotMessage) {
+                    tracing::warn!(%agent, message = %event.message.id, dropped_since_last_warning = quiet, "too many messages waiting; dropping a bot's message");
+                }
             } else {
-                busy.push(agent);
+                if let Some(quiet) = self.flooded(agent, Flood::Message) {
+                    tracing::warn!(%agent, message = %event.message.id, refused_since_last_warning = quiet, "too many messages waiting; not taking this one");
+                }
+                self.notice(&event, agent, owner, caps, Notice::Busy, done);
+                waiting.push(finished);
             }
         }
         drop(in_order);
-        for agent in busy {
-            self.busy(&event, agent, caps).await;
-        }
         waiting
     }
 
-    /// Queues `event` for the agent of `key`, starting the lane's task if
-    /// it has none. False when the lane or the pipeline is full. Once the
-    /// pipeline is [closed](Self::close) the message is dropped instead,
-    /// and true returned. It never waits, so a sender cancelled
-    /// mid-dispatch can't leave a lane without its task.
+    /// Whether a warning about `agent`'s `flood` is due: `Some` of how many
+    /// went quiet since the last, at most once per
+    /// [`FLOOD_WARNING_INTERVAL`] for each agent and kind, since whoever
+    /// signs an agent's events can make as many as they like.
+    fn flooded(&self, agent: AgentId, flood: Flood) -> Option<u64> {
+        self.inner.floods.record((agent, flood), Instant::now())
+    }
+
+    /// A place in the pipeline and one among `owner`'s agents', or `None`
+    /// when either is full.
+    fn places(&self, owner: MemberId) -> Option<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
+        let pending = Arc::clone(&self.inner.pending).try_acquire_owned().ok()?;
+        let owners = self.share(owner).pending.try_acquire_owned().ok()?;
+        Some((pending, owners))
+    }
+
+    /// Queues `job` for the agent of `key`, starting the lane's task if it
+    /// has none. False when the lane is full. Once the pipeline is
+    /// [closed](Self::close) the job is dropped instead, and true returned.
+    /// It never waits, so a sender cancelled mid-dispatch can't leave a
+    /// lane without its task.
     ///
     /// The open check, the queueing and the start of a lane's task happen
     /// under the lanes' lock, so every message queued before the close is
     /// in a lane whose task is in the set [`drain`](Self::drain) waits for.
-    fn enqueue(
-        &self,
-        key: LaneKey,
-        event: Arc<InboundEvent>,
-        caps: Caps,
-        done: oneshot::Sender<()>,
-    ) -> bool {
+    fn enqueue(&self, key: LaneKey, job: Job) -> bool {
         let mut lanes = lock(&self.inner.lanes);
         if self.is_closed() {
-            tracing::info!(agent = %key.0, message = %event.message.id, "shutting down: not handling a message");
+            tracing::info!(agent = %key.0, message = %job.event.message.id, "shutting down: not handling a message");
             return true;
         }
-        let Ok(pending) = Arc::clone(&self.inner.pending).try_acquire_owned() else {
-            return false;
-        };
-        let job = Job {
-            event,
-            caps,
-            _pending: pending,
-            _done: done,
-        };
         match lanes.get_mut(&key) {
             Some(queue) if queue.len() >= self.inner.settings.queue_per_thread => return false,
             Some(queue) => {
@@ -478,16 +576,28 @@ impl Pipeline {
             }
         }
         let mut tasks = lock(&self.inner.tasks);
-        while tasks.try_join_next().is_some() {}
+        reap(&mut tasks);
         tasks.spawn(self.clone().lane(key, job));
         true
+    }
+
+    /// The places of `owner`'s agents, made on their first message.
+    fn share(&self, owner: MemberId) -> Share {
+        let settings = &self.inner.settings;
+        lock(&self.inner.shares)
+            .entry(owner)
+            .or_insert_with(|| Share {
+                pending: Arc::new(Semaphore::new(settings.max_pending_per_owner)),
+                notices: Arc::new(Semaphore::new(MAX_NOTICES)),
+            })
+            .clone()
     }
 
     /// Answers the lane's messages one at a time, until none waits.
     async fn lane(self, key: LaneKey, mut job: Job) {
         let agent = key.0;
         loop {
-            let answered = AssertUnwindSafe(self.candidate(&job.event, agent, job.caps))
+            let answered = AssertUnwindSafe(self.candidate(&job, agent))
                 .catch_unwind()
                 .await;
             if answered.is_err() {
@@ -508,10 +618,40 @@ impl Pipeline {
         }
     }
 
-    /// Tells `event`'s thread that `agent` has too many messages to take
-    /// this one.
-    async fn busy(&self, event: &InboundEvent, agent: AgentId, caps: Caps) {
-        tracing::warn!(%agent, message = %event.message.id, "too many messages waiting; not taking this one");
+    /// Posts `notice` in `event`'s thread as `agent`, whose owner is
+    /// `owner`, in a task of its own, unless [`MAX_NOTICES`] of the owner's
+    /// agents' are being posted already or the pipeline is closed. `done`
+    /// is dropped once the line is posted or given up on.
+    fn notice(
+        &self,
+        event: &Arc<InboundEvent>,
+        agent: AgentId,
+        owner: MemberId,
+        caps: Caps,
+        notice: Notice,
+        done: Done,
+    ) {
+        let Ok(permit) = self.share(owner).notices.try_acquire_owned() else {
+            if let Some(quiet) = self.flooded(agent, Flood::Notice) {
+                tracing::warn!(%agent, message = %event.message.id, ?notice, not_posted_since_last_warning = quiet, "too many notices being posted; not posting another");
+            }
+            return;
+        };
+        let mut tasks = lock(&self.inner.tasks);
+        if self.is_closed() {
+            return;
+        }
+        reap(&mut tasks);
+        let pipeline = self.clone();
+        let event = Arc::clone(event);
+        tasks.spawn(async move {
+            let _permit = permit;
+            let _done = done;
+            pipeline.post_notice(&event, agent, caps, notice).await;
+        });
+    }
+
+    async fn post_notice(&self, event: &InboundEvent, agent: AgentId, caps: Caps, notice: Notice) {
         let told = async {
             let Some(surface) = self.inner.surfaces.surface(agent, &event.conv).await else {
                 return Ok(());
@@ -519,28 +659,36 @@ impl Pipeline {
             if !surface.can_post(&event.conv).await? {
                 return Ok(());
             }
-            let name = self.agent_name(agent).await?;
-            let text = format!("{name} is busy with other requests. Ask again in a few minutes.");
+            let text = match notice {
+                Notice::Busy => format!(
+                    "{} is busy with other requests. Ask again in a few minutes.",
+                    self.agent_name(agent).await?
+                ),
+                Notice::Unconfirmed => UNCONFIRMED_TEXT.to_owned(),
+            };
             say(surface.as_ref(), &reply_target(event, caps), &text).await?;
             Ok::<_, PipelineError>(())
         };
-        if let Err(err) = told.await {
-            tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't say an agent is busy");
+        if let Err(err) = told.await
+            && let Some(quiet) = self.flooded(agent, Flood::Notice)
+        {
+            tracing::warn!(%agent, message = %event.message.id, ?notice, error = %err, failed_since_last_warning = quiet, "couldn't post a notice");
         }
     }
 
-    /// The agents that may answer `event`, each once, and whether a bot
-    /// sent it: one the surface flags, an agent's or a manager bot.
+    /// The agents that may answer `event`, each once with its owner, and
+    /// whether a bot sent it: one the surface flags, an agent's or a
+    /// manager bot.
     async fn candidates(
         &self,
         event: &InboundEvent,
         caps: Caps,
-    ) -> Result<(Vec<AgentId>, bool), StoreError> {
+    ) -> Result<(Vec<(AgentId, MemberId)>, bool), StoreError> {
         let store = &self.inner.store;
         let mut candidates = Vec::new();
         if caps.per_binding_delivery {
             if let Some(agent) = store.agent_for_binding(event.binding).await? {
-                candidates.push(agent.id);
+                candidates.push((agent.id, agent.owner));
             }
         } else {
             for user in &event.mentions {
@@ -550,26 +698,27 @@ impl Pipeline {
                     user: user.clone(),
                 };
                 if let Some((agent, _)) = store.agent_for_bot(&bot).await? {
-                    candidates.push(agent.id);
+                    candidates.push((agent.id, agent.owner));
                 }
             }
             if event.conv_kind == ConvKind::Dm
                 && let Some(agent) = store.agent_for_binding(event.binding).await?
             {
-                candidates.push(agent.id);
+                candidates.push((agent.id, agent.owner));
             }
             if let Some(reply_to) = &event.reply_to
                 && let Some(agent) = store
                     .posted_message_ref(reply_to)
                     .await?
                     .and_then(|posted| posted.agent)
+                && let Some(agent) = store.agent(agent).await?
             {
-                candidates.push(agent);
+                candidates.push((agent.id, agent.owner));
             }
         }
         let sender = store.agent_of_bot_user(&event.sender).await?;
         let mut seen = Vec::new();
-        candidates.retain(|agent| {
+        candidates.retain(|(agent, _)| {
             let keep = Some(*agent) != sender && !seen.contains(agent);
             seen.push(*agent);
             keep
@@ -581,22 +730,100 @@ impl Pipeline {
         Ok((candidates, from_bot))
     }
 
-    /// Routes `event` for `agent` and acts on the decision.
-    async fn candidate(&self, event: &InboundEvent, agent: AgentId, caps: Caps) {
+    /// Routes `job`'s message for `agent`, and unless the decision is to
+    /// ignore it, routes the platform's copy again and acts on the copy.
+    async fn candidate(&self, job: &Job, agent: AgentId) {
+        let (event, caps) = (job.event.as_ref(), job.caps);
+        let Some(decision) = self.decide(event, agent).await else {
+            return;
+        };
+        if let Decision::Ignore(reason) = decision {
+            tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
+            return;
+        }
+        let Some(copy) = self.confirmed(job, agent).await else {
+            return;
+        };
+        if copy == *event {
+            self.act(event, agent, caps, decision).await;
+            return;
+        }
+        let Some(confirmed) = self.decide(&copy, agent).await else {
+            return;
+        };
+        if confirmed != decision {
+            if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform's copy of a message routes differently from its event; dropped it");
+            }
+            return;
+        }
+        self.act(&copy, agent, caps, confirmed).await;
+    }
+
+    /// The router's decision on `event` for `agent`. `None` when the store
+    /// can't be read.
+    async fn decide(&self, event: &InboundEvent, agent: AgentId) -> Option<Decision> {
         let store = &self.inner.store;
         let view = match StoreView::load(store, event, agent, &self.inner.settings.managers).await {
             Ok(view) => view,
             Err(err) => {
                 tracing::warn!(%agent, message = %event.message.id, error = %err, "couldn't load what routing needs");
-                return;
+                return None;
             }
         };
-        let decision = router::route(event, agent, &view);
-        let result = match decision {
-            Decision::Ignore(reason) => {
-                tracing::debug!(%agent, message = %event.message.id, %reason, "ignored a message");
-                Ok(())
+        Some(router::route(event, agent, &view))
+    }
+
+    /// The platform's copy of `job`'s message, if it is the same message in
+    /// the same thread. On a failure that says nothing about the message
+    /// (the platform unreachable, or asking to slow down past the client's
+    /// retries), the thread is told to try again with a
+    /// [`notice`](Self::notice), if `agent`'s bot may post there; a copy
+    /// the platform doesn't have, or has elsewhere, is dropped without a
+    /// word.
+    async fn confirmed(&self, job: &Job, agent: AgentId) -> Option<InboundEvent> {
+        let (event, caps) = (job.event.as_ref(), job.caps);
+        let surface = self.inner.surfaces.surface(agent, &event.conv).await?;
+        match surface.confirm(event).await {
+            Ok(Some(copy))
+                if copy.message == event.message
+                    && thread_of(&copy, caps) == thread_of(event, caps) =>
+            {
+                Some(copy)
             }
+            Ok(_) => {
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, unconfirmed_since_last_warning = quiet, "the platform doesn't have this message as it arrived; dropped it");
+                }
+                None
+            }
+            Err(err @ (SurfaceError::RateLimited { .. } | SurfaceError::Transport(_))) => {
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, unconfirmed_since_last_warning = quiet, "couldn't confirm a message with the platform; asking to try again");
+                }
+                self.notice(
+                    &job.event,
+                    agent,
+                    job.owner,
+                    caps,
+                    Notice::Unconfirmed,
+                    Arc::clone(&job.done),
+                );
+                None
+            }
+            Err(err) => {
+                if let Some(quiet) = self.flooded(agent, Flood::Unconfirmed) {
+                    tracing::warn!(%agent, message = %event.message.id, error = %err, unconfirmed_since_last_warning = quiet, "the platform refused to confirm a message; dropped it");
+                }
+                None
+            }
+        }
+    }
+
+    /// Acts on `decision` for `agent` on `event`.
+    async fn act(&self, event: &InboundEvent, agent: AgentId, caps: Caps, decision: Decision) {
+        let result = match decision {
+            Decision::Ignore(_) => Ok(()),
             Decision::LinkPrompt { requester } => {
                 self.link_prompt(event, agent, &requester, link_text).await
             }
@@ -1314,6 +1541,10 @@ impl Sink<InboundEvent> for PipelineSink {
         self.pipeline.dispatch(event, self.caps).await;
         Ok(())
     }
+
+    fn is_closed(&self) -> bool {
+        self.pipeline.is_closed()
+    }
 }
 
 #[cfg(test)]
@@ -1391,17 +1622,29 @@ mod tests {
         })
     }
 
+    fn job(pipeline: &Pipeline, key: &LaneKey, owner: MemberId) -> (Job, oneshot::Receiver<()>) {
+        let (done, finished) = oneshot::channel();
+        let job = Job {
+            event: event(key),
+            caps: MockSurface::DEFAULT_CAPS,
+            owner,
+            _pending: pipeline.places(owner).unwrap(),
+            done: Arc::new(done),
+        };
+        (job, finished)
+    }
+
     #[tokio::test]
     async fn after_close_a_message_for_a_running_lane_is_dropped_not_queued() {
         let dir = TempDir::new("pipeline-lanes");
         let pipeline = pipeline(&dir).await;
         let key = lane_key();
+        let owner = MemberId::new_v4();
         lock(&pipeline.inner.lanes).insert(key.clone(), VecDeque::new());
         let permits = pipeline.inner.pending.available_permits();
 
-        let (done, before) = oneshot::channel();
-        let caps = MockSurface::DEFAULT_CAPS;
-        assert!(pipeline.enqueue(key.clone(), event(&key), caps, done));
+        let (queued, before) = job(&pipeline, &key, owner);
+        assert!(pipeline.enqueue(key.clone(), queued));
         assert_eq!(
             lock(&pipeline.inner.lanes)[&key].len(),
             1,
@@ -1409,8 +1652,8 @@ mod tests {
         );
 
         pipeline.close();
-        let (done, after) = oneshot::channel();
-        assert!(pipeline.enqueue(key.clone(), event(&key), caps, done));
+        let (dropped, after) = job(&pipeline, &key, owner);
+        assert!(pipeline.enqueue(key.clone(), dropped));
         assert_eq!(
             lock(&pipeline.inner.lanes)[&key].len(),
             1,

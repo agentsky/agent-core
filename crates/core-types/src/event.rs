@@ -7,6 +7,11 @@ use time::OffsetDateTime;
 
 use crate::{BindingId, ConvKind, ConvRef, InFile, MemberKey, MessageId, MsgRef, UserId};
 
+/// The most mentions an [`InboundEvent`] carries: a surface keeps the first
+/// this many different users a message mentions. The router looks each one
+/// up, and a message can hold thousands.
+pub const MAX_MENTIONS: usize = 100;
+
 /// One inbound chat message, normalized by its surface. Everything after
 /// this is shared between surfaces.
 ///
@@ -57,7 +62,8 @@ pub struct InboundEvent {
     pub message: MsgRef,
     /// The message text as the platform sent it.
     pub text: String,
-    /// Every user the message mentions, in order.
+    /// Every user the message mentions, in order, each once, at most
+    /// [`MAX_MENTIONS`].
     pub mentions: Vec<UserId>,
     /// The message this one replies to, if any. For a thread reply this is
     /// the thread root, so the router can check whether the agent posted it.

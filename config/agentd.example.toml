@@ -265,3 +265,21 @@ manager_user_id = "aBcD1234eFgH5678"
 [slack]
 # The Web API's base URL. Change it only to point tests at a fake.
 api_url = "https://slack.com/api/"
+
+# agentd's public HTTPS URL, as Slack reaches the public listener through the
+# TLS terminator. Every agent's Slack app is created with request URLs under
+# it (/slack/b/<binding>/events and /interactivity) and with
+# <public_url>/slack/oauth/callback as its OAuth redirect URL. The URL is baked
+# into each app when it is created: changing it later doesn't move existing
+# apps, whose install links keep the old one. Without it, `/agent create` on
+# Slack is refused. No default.
+# public_url = "https://agentd.example.com"
+
+# Whether agents' apps ask for chat:write.public, which lets a bot post in
+# public channels it isn't in. It applies to apps created after it changes.
+public_posting = false
+
+# How long an agent's app may wait to be installed before its owner is
+# reminded, once, in seconds (60 to 604800). In a workspace that requires app
+# approval, the install waits for an admin.
+install_reminder_secs = 3600
