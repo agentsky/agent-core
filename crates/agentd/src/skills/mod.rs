@@ -784,7 +784,7 @@ impl Skills {
     /// at most once every [`MISMATCH_WARN_INTERVAL`].
     ///
     /// Only the front matter is read, so each skill costs a bounded read.
-    /// The row's hosts were written by [`host_names`] at add time, and are
+    /// The row's hosts were written by `host_names` at add time, and are
     /// compared with what it gives for the files today: a change to how
     /// [`package::parse_skill_file`] or [`HostRule`] normalizes a host must
     /// migrate the stored rows, or existing skills lose their hosts.
