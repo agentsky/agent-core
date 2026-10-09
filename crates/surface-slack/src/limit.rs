@@ -139,8 +139,8 @@ impl Limiter {
     ///
     /// # Errors
     ///
-    /// When a 429 blocked the bucket for longer than `max_block`, returns
-    /// how much longer it is blocked, without waiting.
+    /// When a 429 blocked the bucket's method for longer than `max_block`,
+    /// returns how much longer it is blocked, without waiting.
     pub(crate) async fn acquire(
         &self,
         bucket: &Bucket,

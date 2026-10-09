@@ -111,7 +111,9 @@ pub const LEASE_WAIT: Duration = Duration::from_secs(2);
 /// How often a change waiting for a skill's lease tries again.
 const LEASE_RETRY: Duration = Duration::from_millis(100);
 /// How often a skill whose files in use don't declare its hosts is warned
-/// about; the denials between are logged at debug level, and counted.
+/// about; the denials between are logged at debug level, and counted while
+/// the [`Throttle`] has room for the skill
+/// ([`MAX_THROTTLE_KEYS`](core_types::throttle::MAX_THROTTLE_KEYS)).
 pub const MISMATCH_WARN_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Writes the bundled skill into `agent`'s skills directory under
@@ -782,7 +784,7 @@ impl Skills {
     /// at most once every [`MISMATCH_WARN_INTERVAL`].
     ///
     /// Only the front matter is read, so each skill costs a bounded read.
-    /// The row's hosts were written by [`host_names`] at add time, and are
+    /// The row's hosts were written by `host_names` at add time, and are
     /// compared with what it gives for the files today: a change to how
     /// [`package::parse_skill_file`] or [`HostRule`] normalizes a host must
     /// migrate the stored rows, or existing skills lose their hosts.
