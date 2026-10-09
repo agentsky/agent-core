@@ -58,8 +58,10 @@ pub struct TurnRequest {
     /// from the one whose turn started the warm container stops the
     /// container, and every process left running in it, and starts another,
     /// resuming from the transcript, since the turn's credential and its
-    /// agentctl token would otherwise reach those processes. An
-    /// agent-to-agent hop inherits its requester, so it keeps the container.
+    /// agentctl token would otherwise reach those processes. Files an
+    /// earlier turn left in the session's directories are kept. An
+    /// agent-to-agent hop runs as the requester it inherits, so it keeps a
+    /// container started for that requester.
     pub requester: Requester,
     /// How many agent-to-agent hops led to it.
     pub hop: Hop,
