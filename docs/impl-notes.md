@@ -3852,11 +3852,14 @@ placeholder revoked by `process_stopping` before the turn's `turn_finished`
 runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
-What remains: a background process left from turn N can still spend turn
-N+1's credential while N+1 runs, whoever its requester is. Killing what a
-turn leaves behind has no clean boundary, and recycling the container when
-the requester changes removes the cross-requester case; the plan's Deferred
-work ("Processes a turn leaves running") has both.
+T21 recycles the session's container when the requester changes, which
+ends every process a turn left running, so a leftover never spends another
+requester's credential
+([T21](#another-requesters-turn-gets-a-new-container)). What remains: a
+background process left from turn N can still spend the credential of a
+later turn of the same requester while that turn runs. Killing what a turn
+leaves behind has no clean boundary; the plan's Deferred work ("Processes a
+turn leaves running") records it.
 
 ### Headers the proxy changes besides the credential
 
@@ -4083,8 +4086,9 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Processes a turn leaves running" entry records it; recycling the container
-when the requester changes doesn't close it). Resolving the name with a
+"Processes a turn leaves running" entry records it; T21 recycles the
+container only when the requester changes, so the process keeps it until
+then). Resolving the name with a
 trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
 allowed host to a fixed address there; pin it in DNS instead.
 
@@ -4429,6 +4433,34 @@ private task a non-owner asked for) `shared/` read-only and no `memory/`.
 Every other volume mounts `shared/` read-write and no `memory/`. A turn
 whose mounts differ from the warm container's stops the container, like a
 credential kind or model change stops the process.
+
+### Another requester's turn gets a new container
+
+**Issue.** A warm container is reused across turns of one session, and a
+background process a turn leaves running, such as a `&` job or a Bash-tool
+background shell, survives in it. `turn_starting` points the container's
+placeholder at each turn's credential and records the turn on the agentctl
+token, so a process left from requester A's turn could spend requester B's
+credential, or act through `agentctl`, while B's turn runs. Restarting the
+process on a credential kind change doesn't help: the leftover isn't the CLI,
+and two members' subscriptions are the same kind.
+
+**Solution.** `Held` records the `Requester` whose turn started the container,
+and `ensure_process` stops the whole container, as it does a dead one or one
+with other mounts, when a turn's requester differs, before it looks at the
+process. Stopping the container ends its PID namespace and every process in
+it; stopping only the CLI would leave the leftovers running. It compares the
+full `Requester`, not the `CredentialRef`: a community-key turn of another
+requester also gets the agentctl token, so it gets a new container too. An
+agent-to-agent hop inherits its requester, so it keeps the container. The cost
+is a container start and a `--resume` of the transcript whenever consecutive
+turns of one session come from different requesters, as in a busy channel
+thread; a requester's own run of turns keeps the warm process.
+`a_requester_change_replaces_the_container` checks that another requester's
+turn, a community-key one included, replaces the container, and that the same
+requester and a hop carrying it keep it. A leftover can still use its own
+requester's later turns and the egress allowlist between turns, and files left
+in the session's `work/` or `home/` outlive the container.
 
 ### How turns queue and survive their caller
 
@@ -6169,10 +6201,12 @@ says which process ran a turn: every process of a session sends the same
 
 **Solution.** The tests' scripted turns run `sh -c 'echo $PPID >> pids'`
 through `fake-claude`, which records the pid of the `claude` process that
-ran each turn. A change of credential kind or model shows as a new pid,
-and a test with two linked members on one model shows the same pid for
-both turns, with each turn's own bearer token upstream: the warm process's
-placeholder follows the requester.
+ran each turn. A change of credential kind or model shows as a new pid.
+A test with two linked members on one model shows a new pid for the
+second member's turn, with each turn's own bearer token upstream, since
+T21 recycles the container when the requester changes
+([T21](#another-requesters-turn-gets-a-new-container)), and the same pid
+for that member's next turn.
 
 ### A broken link asks for a new login, never the community key
 
@@ -6305,10 +6339,10 @@ code before this, the test read 0.25 where the CLI restored 5 for
 All of that holds only if nothing changes the file between the runner's
 read and the CLI's, and a process the agent leaves running in the
 container can: when the agent kills its own CLI, the exit is confirmed
-and the container kept, so the next requester's `--resume` ran in a
-container where a background loop could wait for `resume <id>` to appear
-and append a `cost-state` line of 900 after the runner read 5, billing the
-next requester about $895. `SessionManager::ensure_process` now reads the
+and the container kept, so the next turn's `--resume` ran in a container
+where a background loop could wait for `resume <id>` to appear and append
+a `cost-state` line of 900 after the runner read 5, billing that turn's
+requester about $895. `SessionManager::ensure_process` now reads the
 restored total only when it started the container in the same call:
 nothing of the agent's runs in a fresh one before the CLI (its command is
 `sleep infinity` from the image, the exec wrapper is the image's `sh`, and
@@ -6317,10 +6351,12 @@ earlier container is stopped before another starts. A `--resume` in a
 container an earlier process ran in (after a crash, a kill, or a
 credential kind or model change) counts its first turn's cost as unknown.
 A runner test resumes in such a container and gets no cost; before this
-it got the turn's cost. Stopping the container before every resume would
-keep that cost known at a container start's price, and would also end
-the agent's leftover processes (Deferred work's "Processes a
-turn leaves running").
+it got the turn's cost. T21 stops the container when the requester
+changes ([T21](#another-requesters-turn-gets-a-new-container)), so only a
+requester's own later turns resume in a used one. Stopping the container
+before every resume would keep that cost known at a container start's
+price, and would also end the agent's leftover processes on every resume
+(Deferred work's "Processes a turn leaves running").
 
 A turn's cost is unknown (an `Err` with a `CostUnknown` reason, and
 billed as 0) when its result or the process's previous one has no
@@ -6426,9 +6462,10 @@ make tokens and cost a bound too (the plan's Deferred work). The same
 stdout predates T27 with a worse problem, which this task leaves there
 too: a forged `result` line ends the turn early with the agent's text as
 the reply, and the CLI's real result for the turn is then read as the
-next turn's, so the next requester gets this turn's reply and pays its
-cost and tokens. Reading turns from a channel the agent can't write
-closes both.
+next turn's, so the requester's next turn in the session gets this turn's
+reply and pays its cost and tokens. Another requester's turn gets a new
+container (T21), so it never reads that result. Reading turns from a
+channel the agent can't write closes both.
 
 ### One table counts threads and agents
 
