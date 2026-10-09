@@ -3149,8 +3149,9 @@ Deliverables:
       (T35c), the put either commits first, and the delete finds its row, or
       comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id, the URL origin
-    and the opened token. `cloud_routines(member)` lists labels, ids and
-    times, never tokens.
+    and the opened token, and from T35c the registration it read, which
+    `begin_cloud_handoff` checks is still stored. `cloud_routines(member)`
+    lists labels, ids and times, never tokens.
   - `delete_cloud_routine(member, label)`, and
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
@@ -3214,7 +3215,7 @@ Deliverables:
 Acceptance, as tests named after the rules:
 
 - `cloud_add_is_secret_bearing`.
-- `cloud_add_debug_redacts_the_token`.
+- `cloud_debug_names_the_command_and_holds_no_token_or_task`.
 - `a_cloud_add_that_fails_to_parse_is_secret_bearing`.
 - `routine_url_must_be_the_fire_endpoint` (user info, a query, a fragment,
   `.` and `..` segments, `%2e`, a missing `trig_`, other characters in the
@@ -3224,14 +3225,13 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
-- `a_routine_is_refused_without_a_claude_link`.
-- `a_handoff_is_refused_without_a_claude_link`.
+- `a_routine_is_refused_without_a_claude_link` (from T35c).
+- `a_handoff_is_refused_without_a_claude_link` (from T35c).
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`).
-- `finishing_a_deleted_handoff_is_a_no_op`.
+  `rejected`, and from T35c `Gone` for a deleted hand-off).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3259,12 +3259,14 @@ types are `core_types::RoutineId`, `RoutineToken`, `CloudRoutineId` and
 `CloudHandoffId`, and the store's `CloudOrigin`, `CloudHandoffState`,
 `CloudOutcome` (`retry_after_secs` a `u32`, and
 `Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
-`unknown_reason` column. T35b's `fire` takes the opened routine, token
-and `url_origin` included, and its `FireOutcome` is `CloudOutcome` (see
-Decided in T35b). `RoutineUrl::origin()` is a `url::Origin`. A notice's
-mark needs a claim that was made, not the latest one; its deferral needs
-the latest. `CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the
-task, and the store hands a task back only as a `SecretString`. agentd's
+`unknown_reason` column. T35b's `fire` takes the opened routine, token and
+`url_origin` included, and its `FireOutcome` is `CloudOutcome` (see
+Decided in T35b). The link checks (`CloudRoutinePut::Unlinked`,
+`CloudBegun`), the `per_hour` cap and the registration check land with
+T35c. `RoutineUrl::origin()` is a `url::Origin`. A notice's mark needs a
+claim that was made, not the latest one; its deferral needs the latest.
+`CloudCommand`'s and `NewCloudHandoff`'s `Debug` leave out the task, and
+the store hands a task back only as a `SecretString`. agentd's
 public-secret refusal has its `cloud add` arm already; the other `cloud`
 commands answer "isn't available yet" until T35c.
 
@@ -3676,16 +3678,14 @@ Deliverables:
   - The sender is `(slack, workspace, user)`.
   - The sender's team fields are `user_team`, `source_team`,
     `user_profile.team` and `team`. One not shaped like a team id is
-    `Skip::Malformed`. `Context::team` stays the installation's team, which
-    the other-workspace checks compare. `Context` gains `home_team` and
-    `home_org`, the home workspace and the home organization, if any, as
-    `ManagerIdentity` keeps them (below), used only to classify the team
-    fields. The ingress's `Context` (`ingress.rs`) and
-    `SlackSurface::confirm`'s take both from that same `ManagerIdentity`:
-    the ingress is given them where agentd builds it, and `confirm` takes
-    them from the directory. So a home member whose field names the home
-    organization is home in the event and in the copy alike.
-  - When a field names neither `home_team` nor `home_org`, `outside` is
+    `Skip::Malformed`. `Context` gains `home_org`, the `enterprise_id`
+    `auth.test` gave at startup (T30's `App::open`), if any. The ingress is
+    given it with the workspace (`Queue::with_workspace`, from
+    `ManagerIdentity::enterprise`), and `SlackSurface::confirm` takes it
+    from the directory (`TeamDirectory::home_org`), so a home member whose
+    field names the home organization is home in the event and in the copy
+    alike.
+  - When a field names neither the workspace nor `home_org`, `outside` is
     `Some(Outside { team })` with the first such field, in that order.
     Otherwise it is `None`, which only the event's own first routing uses:
     the home check below decides for the copy and for manager DMs before
@@ -3832,13 +3832,14 @@ Acceptance:
 - `the_first_foreign_field_names_the_organization`.
 - `a_sender_is_home_only_when_the_home_check_agrees`.
 - `a_home_member_in_a_shared_channel_is_home`.
-- `a_home_lookup_naming_another_organization_drops_the_message_and_names_it`.
+- `confirm_reads_who_is_outside_from_slacks_copy`.
 - `an_event_naming_the_organization_only_the_lookup_gives_is_dropped`.
 - `a_home_lookup_naming_no_team_is_not_home`.
 - `a_home_organization_field_with_a_home_lookup_is_home`.
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
-- `a_home_lookup_slack_refuses_drops_the_message`.
+- `a_home_lookup_slack_refuses_is_not_home`.
+- `a_refused_home_lookup_drops_the_message_and_only_the_directory_warns`.
 - `an_event_and_its_copy_disagreeing_on_outside_is_dropped`.
 - `a_forged_organization_on_an_event_cannot_change_the_stored_team`.
 - `a_bots_copy_is_kept_whatever_it_says_of_outside`.
