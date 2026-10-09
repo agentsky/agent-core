@@ -251,7 +251,9 @@ fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
 /// starts another, resuming from the transcript. Another requester's turn
 /// gets a new container because stopping it ends every process an earlier
 /// turn left running there, which could otherwise spend this turn's
-/// credential and act through agentctl while it runs. A process that
+/// credential and act through agentctl while it runs. It ends running
+/// processes only: files an earlier turn left in the session's directories,
+/// which every container of the session mounts, stay. A process that
 /// crashed, timed out or refused its `--resume` is stopped after the turn;
 /// if it wasn't seen to exit, its container is stopped too before the next
 /// process starts, so two processes never write one transcript. A container
@@ -740,8 +742,8 @@ impl<H: TurnHooks> Inner<H> {
     /// A container started for another requester goes, process and all,
     /// as a dead one or one with other mounts does, so nothing an earlier
     /// requester's turn left running sees this turn's credential or
-    /// agentctl token. An agent-to-agent hop inherits its requester, so it
-    /// keeps the container.
+    /// agentctl token. An agent-to-agent hop runs as the requester it
+    /// inherits, so it keeps a container started for that requester.
     ///
     /// A `--resume`d process counts its cost from the total the CLI will
     /// restore only in a container started by this call, where nothing of
