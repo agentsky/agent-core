@@ -596,14 +596,41 @@ async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
 }
 
 #[tokio::test]
-async fn an_acquire_agentd_failed_is_retried() {
-    let fake = FakeLock::start(30, 0, Renewals::FailOnce).await;
-    *fake.state.failed_acquires.lock().unwrap() = 1;
+async fn an_acquire_that_failed_or_lost_its_answer_is_retried_under_the_same_lease() {
+    for hiccup in [Hiccup::Internal, Hiccup::Garbled] {
+        let fake = FakeLock::start(30, 0, Renewals::Grant).await;
+        fake.state.hiccups.lock().unwrap().push(hiccup);
+        let dir = TempDir::new("agentctl-test");
+        let out = Run::from(
+            tokio::time::timeout(
+                WAIT,
+                agentctl(&fake.url, "tok", dir.path())
+                    .args(["lock", "--", "true"])
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+        out.ok();
+        assert!(fake.state.hiccups.lock().unwrap().is_empty(), "{hiccup:?}");
+        assert_eq!(fake.granted().len(), 1, "{hiccup:?}");
+        assert_eq!(fake.released(), fake.granted(), "{hiccup:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_acquire_that_cant_connect_fails_at_once() {
+    let url = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        format!("http://{}", listener.local_addr().unwrap())
+    };
     let dir = TempDir::new("agentctl-test");
+    let started = Instant::now();
     let out = Run::from(
         tokio::time::timeout(
             WAIT,
-            agentctl(&fake.url, "tok", dir.path())
+            agentctl(&url, "tok", dir.path())
                 .args(["lock", "--", "true"])
                 .output(),
         )
@@ -611,10 +638,12 @@ async fn an_acquire_agentd_failed_is_retried() {
         .unwrap()
         .unwrap(),
     );
-    out.ok();
-    assert_eq!(*fake.state.failed_acquires.lock().unwrap(), 0);
-    assert_eq!(fake.granted().len(), 1);
-    assert_eq!(fake.released(), fake.granted());
+    assert!(started.elapsed() < Duration::from_secs(1), "{out:?}");
+    out.refused("can't connect");
+    assert_eq!(
+        out.stderr,
+        format!("agentctl: agentd at {url}: can't connect\n")
+    );
 }
 
 #[tokio::test]
@@ -746,6 +775,17 @@ enum Renewals {
     FailOnce,
     /// It grants renewals with more seconds left than a clock can hold.
     Endless,
+    /// It grants every renewal.
+    Grant,
+}
+
+/// How [`FakeLock`] answers an acquire instead of simply granting it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hiccup {
+    /// It fails with agentd's internal error, granting nothing.
+    Internal,
+    /// It grants the lease, then answers with something unreadable.
+    Garbled,
 }
 
 /// A fake ctl API whose lock grants leases of `ttl` seconds, with whole
@@ -761,8 +801,8 @@ struct FakeState {
     skew: i64,
     renewals: Renewals,
     acquire_delay: Duration,
-    /// How many more acquires fail with agentd's internal error.
-    failed_acquires: Mutex<usize>,
+    /// The hiccups to answer the next acquires with, last first.
+    hiccups: Mutex<Vec<Hiccup>>,
     expires_at: Mutex<Option<SystemTime>>,
     granted: Mutex<Vec<LeaseId>>,
     renewed: Mutex<usize>,
@@ -783,7 +823,7 @@ impl FakeLock {
             skew,
             renewals,
             acquire_delay,
-            failed_acquires: Mutex::new(0),
+            hiccups: Mutex::new(Vec::new()),
             expires_at: Mutex::new(None),
             granted: Mutex::new(Vec::new()),
             renewed: Mutex::new(0),
@@ -854,20 +894,22 @@ async fn fake_lock(
     Json(request): Json<LockRequest>,
 ) -> axum::response::Response {
     match request {
-        LockRequest::Acquire => {
+        LockRequest::Acquire { lease } => {
             state.acquiring.notify_one();
             tokio::time::sleep(state.acquire_delay).await;
-            let failing = {
-                let mut failed = state.failed_acquires.lock().unwrap();
-                let failing = *failed > 0;
-                *failed = failed.saturating_sub(1);
-                failing
-            };
-            if failing {
+            let hiccup = state.hiccups.lock().unwrap().pop();
+            if hiccup == Some(Hiccup::Internal) {
                 return internal_error();
             }
-            let lease = LeaseId::new_v4();
-            state.granted.lock().unwrap().push(lease);
+            {
+                let mut granted = state.granted.lock().unwrap();
+                if !granted.contains(&lease) {
+                    granted.push(lease);
+                }
+            }
+            if hiccup == Some(Hiccup::Garbled) {
+                return "garbled".into_response();
+            }
             state.held(lease)
         }
         LockRequest::Renew { lease } => {
@@ -888,7 +930,7 @@ async fn fake_lock(
                 *renewed += 1;
                 *renewed == 1
             };
-            if first {
+            if first && state.renewals == Renewals::FailOnce {
                 return internal_error();
             }
             state.held(lease)
