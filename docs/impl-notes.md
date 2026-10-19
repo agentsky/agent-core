@@ -2641,6 +2641,20 @@ for: an answer for another lease is agentd misbehaving, so an acquire
 gives back its own lease and fails, and a renewal is treated as a lost
 lease.
 
+Review then found two gaps in giving a lease back. A stop signal during
+that release, after giving up or after refusing a lease agentctl won't
+rely on, cut it short and made `lock` exit 1, with the refusal or the
+timeout as its error, rather than 128 plus the signal, as a signal
+anywhere else in an acquire does; it now exits with the signal, and says
+the lease expires on its own. And only giving up said when the release
+failed: refusing a lease too short or too long to hold, which agentd had
+certainly granted, or an answer for another lease said nothing, so the
+session couldn't tell why the next `lock` waited. Every give-back now
+adds that the lease expires within its TTL when its release fails. A
+signal during the release after the command exits is different: the
+command's work is done, so agentctl reports it as a failed release and
+`lock` exits with the command's own status.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
