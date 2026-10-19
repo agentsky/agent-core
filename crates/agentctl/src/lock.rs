@@ -28,7 +28,8 @@
 //! attempt whose answer was lost may have been granted, before it fails. An
 //! answer for a lease other than the one named is agentd misbehaving, and
 //! `lock` fails on it. Whenever `lock` fails after giving back a lease, as
-//! in these cases or for a lease too short or too long to hold, its error
+//! in these cases, for a lease too short or too long to hold, or when the
+//! command can't be started or the lease is lost while it runs, its error
 //! adds when that release failed too, leaving the lease to expire within
 //! its TTL. An acquire that can't connect to agentd (its name doesn't
 //! resolve, the connection is refused, or connecting takes over five
@@ -55,15 +56,16 @@
 //! group, gives it up to two seconds to exit (never past the lease's
 //! deadline), then kills the group. Either way it releases the lease and
 //! exits with 128 plus the signal. A signal that comes while agentctl gives
-//! back a lease it won't rely on, or one it gave up waiting for at
-//! `--timeout`, also ends it with 128 plus the signal, the lease left to
-//! expire on its own. One that comes while agentctl releases the lease
-//! after the command has exited only cuts that release short: agentctl
-//! reports it as a failed release, and `lock` exits with the command's own
-//! status. A process that leaves the group (with `setsid`, say) escapes the
-//! kill, and one the command leaves running when it exits on its own is not
-//! stopped. An agentctl killed outright stops renewing, and the lease
-//! expires on its own.
+//! back a lease it won't rely on, one it gave up waiting for at
+//! `--timeout`, or one whose command couldn't be started or was stopped
+//! when the lease was lost, also ends it with 128 plus the signal, the
+//! lease left to expire on its own. One that comes while agentctl releases
+//! the lease after the command has exited only cuts that release short:
+//! agentctl reports it as a failed release, and `lock` exits with the
+//! command's own status. A process that leaves the group (with `setsid`,
+//! say) escapes the kill, and one the command leaves running when it exits
+//! on its own is not stopped. An agentctl killed outright stops renewing,
+//! and the lease expires on its own.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -153,7 +155,10 @@ pub async fn run(
         Err(err) => Err(format!("can't run {}: {err}", program.to_string_lossy())),
     };
     let released = release(client, lease, &mut stop).await;
-    let ended = outcome?;
+    let ended = match outcome {
+        Ok(ended) => ended,
+        Err(why) => return gave_back(why, released).map(signal_code),
+    };
     report_release(released.err());
     Ok(match ended {
         Ended::Exited(status) => exit_code(status),
@@ -246,16 +251,24 @@ async fn acquire(
 }
 
 /// Gives back `lease`, which agentctl won't rely on, and fails with `why`,
-/// adding that the lease wasn't given back if giving it back failed. A stop
-/// signal that comes first stops [`acquire`] instead, as one during it
-/// would.
+/// as [`gave_back`] says. A stop signal that comes first stops [`acquire`]
+/// instead, as one during it would.
 async fn give_back(
     client: &Client,
     lease: LeaseId,
     stop: &mut Stop,
     why: String,
 ) -> Result<Acquired, String> {
-    match release(client, lease, stop).await {
+    gave_back(why, release(client, lease, stop).await).map(Acquired::Stopped)
+}
+
+/// How `lock` fails with `why` once it has tried to give back its lease
+/// and `released` says how that went: with `why` alone, or with `why` and
+/// that the lease expires within its TTL if the release failed. A stop
+/// signal that cut the release short is returned instead, for `lock` to end
+/// with 128 plus it.
+fn gave_back(why: String, released: Result<(), Unreleased>) -> Result<i32, String> {
+    match released {
         Ok(()) => Err(why),
         Err(Unreleased::Failed(err)) => Err(format!(
             "{why}; couldn't give back a lease agentd may have granted ({err}), so it expires \
@@ -263,7 +276,7 @@ async fn give_back(
         )),
         Err(err @ Unreleased::Stopped(signal)) => {
             not_given_back(&err);
-            Ok(Acquired::Stopped(signal))
+            Ok(signal)
         }
     }
 }
