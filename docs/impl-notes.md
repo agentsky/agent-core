@@ -5810,8 +5810,13 @@ an archive's set-id modes and symlinks through), with only
 `deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`,
 `typed-path` and, on macOS and the BSDs only, `nix` (MIT): stored or
 deflated entries, none encrypted, each counted as it inflates against
-its declared size, so a small archive can't unpack past the cap. macOS's
-`__MACOSX/` entries are skipped. `SKILL.md` is at the
+its declared size, so a small archive can't unpack past the cap. An
+entry's Unix mode is read from the high 16 bits of its external attributes
+even when it is tagged as made on MS-DOS, where `zip` 9.0.5 makes up a
+plain file's mode, so such an entry can't hide a symlink or a FIFO. An
+archive that names an entry twice, or whose local headers disagree with
+its central directory, is refused rather than unpacked with one of the
+two. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
 top or in the only top-level directory (anything else, a lone file at the
 top included, is "no SKILL.md"), at most 256 KB of UTF-8; its front
 matter, at most 16 KB between `---` lines (YAML's `...` doesn't close it), is read with `serde_norway`
