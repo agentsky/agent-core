@@ -3562,16 +3562,14 @@ Deliverables:
   - The sender is `(slack, workspace, user)`.
   - The sender's team fields are `user_team`, `source_team`,
     `user_profile.team` and `team`. One not shaped like a team id is
-    `Skip::Malformed`. `Context::team` stays the installation's team, which
-    the other-workspace checks compare. `Context` gains `home_team` and
-    `home_org`, the home workspace and the home organization, if any, as
-    `ManagerIdentity` keeps them (below), used only to classify the team
-    fields. The ingress's `Context` (`ingress.rs`) and
-    `SlackSurface::confirm`'s take both from that same `ManagerIdentity`:
-    the ingress is given them where agentd builds it, and `confirm` takes
-    them from the directory. So a home member whose field names the home
-    organization is home in the event and in the copy alike.
-  - When a field names neither `home_team` nor `home_org`, `outside` is
+    `Skip::Malformed`. `Context` gains `home_org`, the `enterprise_id`
+    `auth.test` gave at startup (T30's `App::open`), if any. The ingress is
+    given it with the workspace (`Queue::with_workspace`, from
+    `ManagerIdentity::enterprise`), and `SlackSurface::confirm` takes it
+    from the directory (`TeamDirectory::home_org`), so a home member whose
+    field names the home organization is home in the event and in the copy
+    alike.
+  - When a field names neither the workspace nor `home_org`, `outside` is
     `Some(Outside { team })` with the first such field, in that order.
     Otherwise it is `None`, which only the event's own first routing uses:
     the home check below decides for the copy and for manager DMs before
@@ -3617,16 +3615,16 @@ Deliverables:
     the message there, whatever the event says: `confirm` returns
     `Ok(None)`, as for a copy the ingress wouldn't keep, with a warning
     throttled per binding naming the user and the organization the lookup
-    gave, which names nothing else. So the lookup's answer never becomes an
-    `Outside` an event could match: an event naming the organization the
-    lookup gives, forged or not, is dropped, even when that organization is
-    listed (T36b). A genuine event is dropped too when Slack's copy names
-    the sender's organization in none of its fields, such as a copy
-    without `user_team`; that fails closed, and T36e's step 2 finds out
-    whether it happens. `Transport` and `RateLimited` fail the
-    confirmation as T31's lookups do, and the thread gets the "try again"
-    line. The check reads only the copy, so it only ever looks up a real
-    user.
+    gave, which names nothing else. The lookup's answer never becomes the
+    copy's `Outside`, by T31's rule that the event may not supply what the
+    copy lacks: an event naming the organization the lookup gives, such as
+    a forged one, is dropped, even when that organization is listed (T36b).
+    A genuine event is dropped too when Slack's copy names the sender's
+    organization in none of its fields, such as a copy without `user_team`;
+    that fails closed, and T36e's step 2 finds out whether it happens.
+    `Transport` and `RateLimited` fail the confirmation as T31's lookups
+    do, and the thread gets the "try again" line. The check reads only the
+    copy, so it only ever looks up a real user.
 
     The event of an agent's app is never looked up: its first routing takes
     a sender the fields left `None` as home, and nothing acts on that
@@ -3718,13 +3716,14 @@ Acceptance:
 - `the_first_foreign_field_names_the_organization`.
 - `a_sender_is_home_only_when_the_home_check_agrees`.
 - `a_home_member_in_a_shared_channel_is_home`.
-- `a_home_lookup_naming_another_organization_drops_the_message_and_names_it`.
+- `confirm_reads_who_is_outside_from_slacks_copy`.
 - `an_event_naming_the_organization_only_the_lookup_gives_is_dropped`.
 - `a_home_lookup_naming_no_team_is_not_home`.
 - `a_home_organization_field_with_a_home_lookup_is_home`.
 - `another_workspace_of_the_home_organization_is_outside`.
 - `a_sender_team_not_shaped_like_slacks_is_malformed`.
-- `a_home_lookup_slack_refuses_drops_the_message`.
+- `a_home_lookup_slack_refuses_is_not_home`.
+- `a_refused_home_lookup_drops_the_message_and_only_the_directory_warns`.
 - `an_event_and_its_copy_disagreeing_on_outside_is_dropped`.
 - `a_forged_organization_on_an_event_cannot_change_the_stored_team`.
 - `copy_stands_compares_key_and_outside`.
