@@ -1558,7 +1558,11 @@ Deliverables:
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
   given environment and working directory, and `ip` returns `127.0.0.1`. It
-  isolates nothing, and says so in its rustdoc.
+  isolates nothing, and says so in its rustdoc. Since every running container
+  shares that address, it supports one running container at a time wherever
+  agentd binds something to an address (agentctl tokens, T15; credential
+  placeholders, T18), which revokes the other sessions' there
+  ([impl-notes](impl-notes.md#processsandbox-gives-every-container-one-address)).
 - `reap_orphans()` at startup: stop every container labeled `agentd.session`
   with this agentd's `agentd.instance`.
   Placeholder mappings and agentctl tokens don't survive a restart, so no
@@ -1897,11 +1901,13 @@ Deliverables:
     ([impl-notes](impl-notes.md#mounts-come-from-the-turns-side)).
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
-  If the next turn's `Requester` differs from the one whose turn started the
+  If the next turn's requester differs from the one whose turn started the
   container, stop the container, which ends every process a turn left running
-  in it, and start a new one, whose process starts with `--resume`. An
-  agent-to-agent hop runs as the requester it inherits, so it keeps a
-  container started for that requester
+  in it, and start a new one, whose process starts with `--resume`.
+  Requesters are compared by `MemberKey`, so a requester whose account is
+  linked between two turns keeps the container. An agent-to-agent hop runs as
+  the requester it inherits, so it keeps a container started for that
+  requester
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
@@ -1924,7 +1930,8 @@ Acceptance:
   - A credential-kind change restarts the process.
   - A model change restarts the process.
   - Another requester's turn replaces the container; a turn of the same
-    requester, and an agent-to-agent hop carrying it, keep it.
+    requester, and an agent-to-agent hop carrying it, keep it, as does one
+    whose requester was linked to a member since.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
@@ -2513,8 +2520,13 @@ Deliverables:
   - `users.info`, `users.list` (paginated), `bots.info`, `auth.test`.
   - The file upload flow: `files.getUploadURLExternal`, then upload, then
     `files.completeUploadExternal` with `channel_id` and `thread_ts`.
-- Rate limits: on 429, honor `Retry-After`. Each method is tagged with its tier
-  for a simple per-token limiter.
+- Rate limits: each method is tagged with its tier for a simple limiter per
+  token and method (and channel, for `chat.postMessage`). A 429 (or `ok:
+  false` with `ratelimited`) doesn't say which limit it hit, so it holds
+  every call to that method with that token, in any channel, until
+  `Retry-After` has passed; the call retries after it, at most three times
+  and while the wait is within the client's maximum, and fails with
+  `RateLimited` otherwise.
 - `response_url` helper for private command replies (`response_type:
   ephemeral`).
 - `SlackSurface`, implementing `Surface`. Its `Caps` have a `message_limit`
