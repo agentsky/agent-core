@@ -51,12 +51,16 @@
 //! command runs, agentctl passes the signal on to the command's process
 //! group, gives it up to two seconds to exit (never past the lease's
 //! deadline), then kills the group. Either way it releases the lease and
-//! exits with 128 plus the signal. A process that leaves the group (with
-//! `setsid`, say) escapes the kill, and one the command leaves running when
-//! it exits on its own is not stopped. An agentctl killed outright stops
-//! renewing, and the lease expires on its own.
+//! exits with 128 plus the signal. A signal that comes while agentctl gives
+//! back a lease it won't rely on, or one it gave up waiting for at
+//! `--timeout`, also ends it with 128 plus the signal, the lease left to
+//! expire on its own. A process that leaves the group (with `setsid`, say)
+//! escapes the kill, and one the command leaves running when it exits on
+//! its own is not stopped. An agentctl killed outright stops renewing, and
+//! the lease expires on its own.
 
 use std::ffi::OsString;
+use std::fmt;
 use std::process::{ExitCode, ExitStatus};
 use std::time::Duration;
 
@@ -144,7 +148,7 @@ pub async fn run(
     };
     let released = release(client, lease, &mut stop).await;
     let ended = outcome?;
-    report_release(released);
+    report_release(released.err());
     Ok(match ended {
         Ended::Exited(status) => exit_code(status),
         Ended::Signalled(signal) => signal_code(signal),
@@ -192,20 +196,26 @@ async fn acquire(
         };
         let why = match answer {
             Ok(LockResponse::Held { lease: granted, .. }) if granted != lease => {
-                let _ = release(client, lease, stop).await;
-                return Err(format!("couldn't hold the shared/ lock ({OTHER_LEASE})"));
+                return give_back(client, lease, stop, |_| {
+                    format!("couldn't hold the shared/ lock ({OTHER_LEASE})")
+                })
+                .await;
             }
             Ok(LockResponse::Held { seconds_left, .. }) => {
                 let Some(deadline) = reliable_until(sent, seconds_left) else {
-                    let _ = release(client, lease, stop).await;
-                    return Err(format!("couldn't hold the shared/ lock ({TOO_LONG})"));
+                    return give_back(client, lease, stop, |_| {
+                        format!("couldn't hold the shared/ lock ({TOO_LONG})")
+                    })
+                    .await;
                 };
                 if deadline.saturating_duration_since(Instant::now()) < MIN_TIME_LEFT {
-                    let _ = release(client, lease, stop).await;
-                    return Err(format!(
-                        "the shared/ lock's lease is too short to hold (agentd granted \
-                         {seconds_left}s; agentctl needs at least 3s)"
-                    ));
+                    return give_back(client, lease, stop, |_| {
+                        format!(
+                            "the shared/ lock's lease is too short to hold (agentd granted \
+                             {seconds_left}s; agentctl needs at least 3s)"
+                        )
+                    })
+                    .await;
                 }
                 return Ok(Acquired::Held { deadline });
             }
@@ -217,17 +227,20 @@ async fn acquire(
             Err(Failure::Transport(message)) => message,
         };
         if Instant::now() + wait > give_up {
-            let why = match release(client, lease, stop).await {
-                None => why,
-                Some(err) => format!(
-                    "{why}; couldn't give back a lease agentd may have granted ({err}), so it \
-                     expires within its TTL"
-                ),
-            };
-            return Err(format!(
-                "gave up waiting for the shared/ lock after the {}s timeout; {why}",
-                timeout.as_secs()
-            ));
+            return give_back(client, lease, stop, |failure| {
+                let why = match failure {
+                    None => why,
+                    Some(err) => format!(
+                        "{why}; couldn't give back a lease agentd may have granted ({err}), so \
+                         it expires within its TTL"
+                    ),
+                };
+                format!(
+                    "gave up waiting for the shared/ lock after the {}s timeout; {why}",
+                    timeout.as_secs()
+                )
+            })
+            .await;
         }
         if !told {
             eprintln!("agentctl: waiting for the shared/ lock");
@@ -241,16 +254,40 @@ async fn acquire(
     }
 }
 
+/// Gives back `lease`, which agentctl won't rely on, and fails with what
+/// `failed` makes of why giving it back failed, if it did. A stop signal
+/// that comes first stops [`acquire`] instead, as one during it would.
+async fn give_back(
+    client: &Client,
+    lease: LeaseId,
+    stop: &mut Stop,
+    failed: impl FnOnce(Option<String>) -> String,
+) -> Result<Acquired, String> {
+    match release(client, lease, stop).await {
+        Ok(()) => Err(failed(None)),
+        Err(Unreleased::Failed(err)) => Err(failed(Some(err))),
+        Err(err @ Unreleased::Stopped(signal)) => {
+            not_given_back(&err);
+            Ok(Acquired::Stopped(signal))
+        }
+    }
+}
+
 /// Gives back `lease`, which an acquire may have been granted without
 /// agentctl hearing of it, after `signal` stopped [`acquire`].
 async fn stopped(client: &Client, lease: LeaseId, signal: i32, stop: &mut Stop) -> Acquired {
-    if let Some(err) = release(client, lease, stop).await {
-        eprintln!(
-            "agentctl: couldn't give back the shared/ lock agentd may have granted ({err}); \
-             it expires on its own"
-        );
+    if let Err(err) = release(client, lease, stop).await {
+        not_given_back(&err);
     }
     Acquired::Stopped(signal)
+}
+
+/// Tells the model that a lease agentd may have granted wasn't given back.
+fn not_given_back(err: &Unreleased) {
+    eprintln!(
+        "agentctl: couldn't give back the shared/ lock agentd may have granted ({err}); it \
+         expires on its own"
+    );
 }
 
 /// Waits for `child`, renewing `lease` about three times per lease period,
@@ -320,20 +357,37 @@ async fn hold(
     }
 }
 
-/// Gives `lease` back, within [`RELEASE_TIMEOUT`] and unless another stop
-/// signal comes first. Returns why it failed, if it did.
-async fn release(client: &Client, lease: LeaseId, stop: &mut Stop) -> Option<String> {
+/// Gives `lease` back, within [`RELEASE_TIMEOUT`] and unless a stop signal
+/// comes first.
+async fn release(client: &Client, lease: LeaseId, stop: &mut Stop) -> Result<(), Unreleased> {
     let request = LockRequest::Release { lease };
     tokio::select! {
-        released = client.send_within(&request, RELEASE_TIMEOUT) => {
-            released.err().map(|err| err.to_string())
+        released = client.send_within(&request, RELEASE_TIMEOUT) => released
+            .map(drop)
+            .map_err(|err| Unreleased::Failed(err.to_string())),
+        signal = stop.recv() => Err(Unreleased::Stopped(signal)),
+    }
+}
+
+/// Why [`release`] didn't give a lease back.
+enum Unreleased {
+    /// The request failed, for this reason.
+    Failed(String),
+    /// This stop signal came first.
+    Stopped(i32),
+}
+
+impl fmt::Display for Unreleased {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Failed(err) => f.write_str(err),
+            Self::Stopped(_) => f.write_str("interrupted"),
         }
-        _ = stop.recv() => Some("interrupted".to_owned()),
     }
 }
 
 /// Tells the model that releasing the lease failed, if it did.
-fn report_release(failure: Option<String>) {
+fn report_release(failure: Option<Unreleased>) {
     if let Some(err) = failure {
         eprintln!("agentctl: releasing the shared/ lock failed ({err}); it expires on its own");
     }
