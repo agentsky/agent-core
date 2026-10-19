@@ -3356,7 +3356,11 @@ gives and returns the outcome alone: `FireOutcome` is
 `CloudUnknownReason::NoAnswer`. A routine whose `url_origin` isn't
 `FireClient::origin()` and a task `cloud::check_task` refuses (empty or
 over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
-`Rejected` with no status. Building the client fails with
+`Rejected` with no status. That origin check compares `url_origin` with
+`FireClient::origin()` as two strings `url::Origin::ascii_serialization`
+wrote, which is correct: equal strings are equal origins, and a mismatch
+only leaves the token unsent, so it needs no parsing; parsing the stored
+origin, as T35a decided, is for T35c's check. Building the client fails with
 `FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
 not at most equal, so a connection that never opened is always
 `rejected`. `Retry-After` is capped at a day. Each fire is one request on
