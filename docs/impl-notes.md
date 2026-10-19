@@ -3177,10 +3177,25 @@ starting a private task delete the session's leases in the same
 transaction. The refusals agentd gives only after that, no turn,
 unauthorized and refused, now count as given back wherever agentctl
 releases. The match on the error code names every code, so a new one
-needs a decision. Every other code, such as agentd's internal error or a
-bad request, still counts as a failed release, as does one that failed
-in transit, couldn't connect, or was cut short by a signal, and those
-say the lease may still be held.
+needs a decision, and a unit test pins the answer for each. Every other
+code, such as agentd's internal error or a bad request, still counts as
+a failed release, as does one that failed in transit, couldn't connect,
+or was cut short by a signal, and those say the lease may still be held.
+Unauthorized also answers a valid token sent from an address other than
+the one it is bound to, and that deletes nothing; it can't happen to
+agentctl, which sends every request straight from its container's
+address, and agentd deletes a token's leases before binding that address
+to another token.
+
+Review also found a gap in the acquire. An acquire refused with any code
+but agentd's internal error, or one that couldn't connect, failed at
+once without giving the lease back, even when an earlier attempt's
+answer had been lost and agentd may have granted it, and it didn't say a
+lease may be held. It now gives the lease back first in that case,
+adding that it expires within its TTL if the release fails too, unless
+the refusal is one agentd gives only after deleting the session's
+leases. With no lost answer before it, nothing was granted, and it still
+fails at once.
 
 ### The command runs in its own process group
 

@@ -737,6 +737,41 @@ async fn an_acquire_that_failed_or_lost_its_answer_is_retried_under_the_same_lea
 }
 
 #[tokio::test]
+async fn an_acquire_refused_after_a_lost_answer_gives_back_a_lease_agentd_kept() {
+    for (code, kept) in [
+        (CtlErrorCode::BadRequest, true),
+        (CtlErrorCode::NoTurn, false),
+    ] {
+        let fake = FakeLock::start(30, 0, Renewals::Grant).await;
+        fake.state
+            .hiccups
+            .lock()
+            .unwrap()
+            .extend([Hiccup::Refused(code), Hiccup::Garbled]);
+        let dir = TempDir::new("agentctl-test");
+        let out = Run::from(
+            tokio::time::timeout(
+                WAIT,
+                agentctl(&fake.url, "tok", dir.path())
+                    .args(["lock", "--", "true"])
+                    .output(),
+            )
+            .await
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(out.code, Some(1), "{code:?} {out:?}");
+        assert_eq!(
+            out.stderr, "agentctl: waiting for the shared/ lock\nagentctl: agentd refused\n",
+            "{code:?}"
+        );
+        assert_eq!(fake.granted().len(), 1, "{code:?}");
+        let given_back = if kept { fake.granted() } else { Vec::new() };
+        assert_eq!(fake.released(), given_back, "{code:?}");
+    }
+}
+
+#[tokio::test]
 async fn an_acquire_that_cant_connect_fails_at_once() {
     let url = "http://127.0.0.1:1";
     let dir = TempDir::new("agentctl-test");
@@ -953,6 +988,8 @@ enum Hiccup {
     Lost,
     /// It grants nothing, and answers as held under another lease.
     OtherLease,
+    /// It grants nothing, and refuses with this code.
+    Refused(CtlErrorCode),
 }
 
 /// A fake ctl API whose lock grants leases of `ttl` seconds, with whole
@@ -1076,6 +1113,13 @@ async fn fake_lock(
             }
             if hiccup == Some(Hiccup::OtherLease) {
                 return state.held(LeaseId::new_v4());
+            }
+            if let Some(Hiccup::Refused(code)) = hiccup {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(CtlError::new(code, "agentd refused")),
+                )
+                    .into_response();
             }
             {
                 let mut granted = state.granted.lock().unwrap();
