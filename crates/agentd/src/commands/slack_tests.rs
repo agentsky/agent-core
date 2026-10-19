@@ -124,7 +124,8 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
     );
     let replies = Replies::new(None).with_slack(Arc::new(manager.manager_bot()), client);
     let data = TempDir::new("agentd-slack");
-    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()));
+    let git = crate::skills::Git::new(cred_proxy::EgressPolicy::new(Vec::new(), Vec::new()))
+        .serving_prefix_from_directory_for_tests("https://git.test/", &data.join("repos"));
     let skills = crate::skills::Skills::new(store.clone(), data.path().to_owned(), git);
     let commands = Commands::new(
         store.clone(),
@@ -1523,6 +1524,27 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     logs.snapshot()
         .assert_has("couldn't store a checked configuration token");
     global_logs().snapshot().assert_lacks("SECRET");
+}
+
+#[tokio::test]
+async fn a_skill_past_the_limit_says_how_to_remove_one_with_the_slash_command() {
+    let h = slack_harness().await;
+    super::tests::skill_repo(
+        &h.data.join("repos/notes.git"),
+        "---\nname: notes\ndescription: Keep notes.\n---\n",
+    );
+    let alice = h.linked("U0HUMAN01").await;
+    let agent = slack_agent(&h, alice).await;
+    super::tests::fill_skills(&h.store, agent.id, alice).await;
+    assert_eq!(
+        h.slash("U0HUMAN01", "skill add helper https://git.test/notes.git")
+            .await,
+        [format!(
+            "An agent may have at most {} skills. Remove one first with \
+             `/agent skill rm helper &lt;skill&gt;`.",
+            crate::skills::MAX_SKILLS
+        )]
+    );
 }
 
 #[tokio::test]
