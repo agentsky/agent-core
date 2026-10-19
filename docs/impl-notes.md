@@ -9209,6 +9209,23 @@ inactive bot is then neither handed nor claimed, but the agent's hop
 runs once for the turn whichever copy takes it, inside the place kept
 for it.
 
+Review then found `mentioned` order-dependent: an agent a post mentioned
+through its inactive bot and then its active one went to `over` on the
+first mention, `pass_over` claimed its hop, and the active mention was
+skipped as already seen, while the other order handed off. No flow gives
+an agent a second bot on one surface and team today (`create_agent` makes
+an agent's only binding, and a binding gets its bot user once), so this
+was latent, waiting for the first flow that replaces an agent's bot.
+`mentioned` now resolves all of a post's mentions to agents first,
+keeping for each agent its active bot if any mention names one, and then
+hands off or passes over each agent once, in the order of its first
+mention, so both orders hand off; with one bot per agent it decides as
+before. The hop is still claimed before the row for an agent mentioned
+only through inactive bots, and places still count against
+`MAX_HAND_OFFS`. A test gives an agent a second, inactive bot in the
+database and checks both orders
+(`a_post_mentioning_an_agents_old_and_current_bots_hands_off_in_either_order`).
+
 ### A chunk posted but not recorded
 
 **Issue.** The requester-pays delivery counted a reply whose
