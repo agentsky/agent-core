@@ -3249,7 +3249,7 @@ Acceptance, as tests named after the rules:
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`, and from T35c `Gone` for a deleted hand-off).
+  `rejected`, and from T35c `Gone` for a hand-off that isn't there).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
