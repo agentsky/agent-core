@@ -8642,11 +8642,11 @@ the claim and the end of `update_rich` (a crash, or a drain timeout
 aborting `close_cards` mid-update) leaves the card with live-looking
 buttons for good. `close_cards` reads the agent and the requester's name
 (`name_of`, a surface call) before claiming, so a store error there leaves
-no claim behind and the window is the update alone. Clicking such buttons is refused safely:
-`Consents::decide` answers `Decided::Settled`, or `Decided::NotYours` once
-the agent is deleted. A lease apart from the done mark, as the relink
-notices got, would fix it, but needs a migration, which a cosmetic
-leftover isn't worth.
+no claim behind and the window is the update alone. Clicking such buttons is
+refused safely: `Consents::decide` answers `Decided::Settled`, or
+`Decided::NotYours` once the agent is deleted. A lease apart from the done
+mark, as the relink notices got, would fix it, but needs a migration, which
+a cosmetic leftover isn't worth.
 
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a
