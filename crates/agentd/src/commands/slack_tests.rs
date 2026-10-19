@@ -1761,8 +1761,8 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
     assert_eq!(
         slashed_in_dm,
         [
-            "`reset helper here` resets the conversation it is sent in, and no agent answers in \
-          this one. Send `/agent reset helper here` in the conversation to reset, or \
+            "`/agent reset helper here` resets the conversation it is sent in, and no agent \
+          answers in this one. Send `/agent reset helper here` in the conversation to reset, or \
           `/agent reset helper` here to reset them all."
         ]
     );
