@@ -3243,32 +3243,31 @@ Acceptance, as tests named after the rules:
 - `a_handoff_notice_is_given_up_after_a_day`.
 - `old_handoffs_are_purged`.
 
-Decided in T35a
-([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
-`finish_cloud_handoff` takes a row that is `sending`, or `unknown`
-because the pass gave up on it (`unknown_reason` `no_answer`), once, and
-marks the notice done if it hasn't gone out; a late `unknown` keeps the
-row with its own reason. It refuses an `Unknown` whose reason is
-`NoAnswer` with `StoreError::Refused`, since only the pass sets it.
-`cloud_routines` also keeps the fire URL's origin (`url_origin`), which
-`put_cloud_routine` takes and T35c compares with `base_url`'s before
-each fire, parsing the stored origin rather than comparing strings.
-Sealed values are bound to the member as well as the row, and a token to
-its routine id, label and origin too; a label can't hold `:`. T35c
-answers a stored token that reads as `Corrupt` (one that no longer
-passes `RoutineToken::parse`) by asking the member to `cloud add` the
-routine again, which replaces the row without reading the old token.
-`cloud add`'s token must start with `sk-ant-` and be printable ASCII,
-checked once by `core_types::RoutineToken::parse`.
-`purge_cloud_handoffs(before, now)` keeps a row whose notice is still
-owed, and a `sending` row. The shared types are `core_types::RoutineId`,
-`RoutineToken`, `CloudRoutineId` and `CloudHandoffId`, and the store's
-`CloudOrigin`, `CloudHandoffState`, `CloudOutcome` (`retry_after_secs` a
-`u32`, and `Unknown { status, reason }`) and `CloudUnknownReason`,
-stored in its own `unknown_reason` column. T35b's `fire` takes a
-`RoutineId` and a `&RoutineToken` and can compare the opened routine's
-`url_origin` with `base_url`'s; T35c maps `FireOutcome` onto
-`CloudOutcome`. The link checks (`CloudRoutinePut::Unlinked`,
+Decided in T35a ([impl-notes](impl-notes.md#t35a-cloud-hand-off-store-and-grammar)):
+`finish_cloud_handoff` takes a row that is `sending`, or `unknown` because
+the pass gave up on it (`unknown_reason` `no_answer`), once, and marks the
+notice done if it hasn't gone out; a late `unknown` keeps the row with its
+own reason. It refuses an `Unknown` whose reason is `NoAnswer` with
+`StoreError::Refused`, since only the pass sets it. `cloud_routines` also
+keeps the fire URL's origin (`url_origin`), which `put_cloud_routine`
+takes and T35c compares with `base_url`'s before each fire, parsing the
+stored origin rather than comparing strings. Sealed values are bound to
+the member as well as the row, and a token to its routine id, label and
+origin too; a label can't hold `:`. T35c answers a stored token that reads
+as `Corrupt` (one that no longer passes `RoutineToken::parse`) by asking
+the member to `cloud add` the routine again, which replaces the row
+without reading the old token. `cloud add`'s token must start with
+`sk-ant-` and be printable ASCII, checked once by
+`core_types::RoutineToken::parse`. `purge_cloud_handoffs(before, now)`
+keeps a row whose notice is still owed, and a `sending` row. The shared
+types are `core_types::RoutineId`, `RoutineToken`, `CloudRoutineId` and
+`CloudHandoffId`, and the store's `CloudOrigin`, `CloudHandoffState`,
+`CloudOutcome` (`retry_after_secs` a `u32`, and
+`Unknown { status, reason }`) and `CloudUnknownReason`, stored in its own
+`unknown_reason` column. T35b's `fire` takes a `RoutineId` and a
+`&RoutineToken` and can compare the opened routine's `url_origin` with
+`base_url`'s; T35c maps `FireOutcome` onto `CloudOutcome`.
+The link checks (`CloudRoutinePut::Unlinked`,
 `CloudBegun`), the `per_hour` cap and the registration check land with
 T35c. `RoutineUrl::origin()` is a `url::Origin`. A notice's mark needs a
 claim that was made, not the latest one; its deferral needs the latest.
