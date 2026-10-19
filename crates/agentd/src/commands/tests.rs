@@ -1404,7 +1404,7 @@ async fn agent_commands_without_rocketchat_agents() {
 }
 
 /// A Git repository at `dir` holding one `SKILL.md`, committed.
-fn skill_repo(dir: &std::path::Path, text: &str) {
+pub(super) fn skill_repo(dir: &std::path::Path, text: &str) {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(dir.join("SKILL.md"), text).unwrap();
     for args in [
@@ -1423,6 +1423,90 @@ fn skill_repo(dir: &std::path::Path, text: &str) {
             .unwrap();
         assert!(status.success());
     }
+}
+
+/// Records as many skills for `agent` as it may have, added by `owner`.
+pub(super) async fn fill_skills(
+    store: &Store,
+    agent: core_types::AgentId,
+    owner: core_types::MemberId,
+) {
+    for i in 0..crate::skills::MAX_SKILLS {
+        let name = format!("s{i}");
+        let now = OffsetDateTime::now_utc();
+        let lease = store
+            .acquire_skill_lease(agent, &name, now, crate::skills::LEASE_TTL)
+            .await
+            .unwrap()
+            .unwrap();
+        let new = store::NewSkill {
+            agent,
+            name: &name,
+            source: "upload:SKILL.md",
+            hosts: &[],
+            digest: "digest",
+            added_by: owner,
+        };
+        assert!(
+            store
+                .put_skill(
+                    &new,
+                    store::SkillState::Active,
+                    crate::skills::MAX_SKILLS,
+                    now,
+                    lease
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .release_skill_lease(agent, &name, lease)
+                .await
+                .unwrap()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_skill_past_the_limit_says_how_to_remove_one() {
+    let h = harness().await;
+    skill_repo(
+        &h.root.join("repos/notes.git"),
+        "---\nname: notes\ndescription: Keep notes.\n---\n",
+    );
+    let (alice, _) = h.linked_member("alice", "claude_pro").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::RocketChat,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    fill_skills(&h.store, agent.id, alice).await;
+    h.dm("alice", "skill add helper https://git.test/notes.git")
+        .await;
+    assert_eq!(
+        h.last_reply("alice"),
+        format!(
+            "An agent may have at most {} skills. Remove one first with \
+             `skill rm helper <skill>`.",
+            crate::skills::MAX_SKILLS
+        )
+    );
 }
 
 #[tokio::test]

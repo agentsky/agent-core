@@ -3183,12 +3183,15 @@ Review then found that a lease lost because the turn ended or the token
 was revoked was reported as maybe still held: agentd refused the release
 for the same reason as the renewal, and `lock` added that the lease
 expires within its TTL, repeating the reason. agentd had deleted the
-lease already, since ending a turn and revoking or replacing a token
-delete the session's leases, and those are the only reasons it refuses a
-release. A release refused with anything but agentd's internal error now
-counts as given back wherever agentctl releases, so only one that failed
-in transit, couldn't connect, or got the internal error says the lease
-may still be held.
+lease already, since ending a turn, revoking or replacing a token, and
+starting a private task delete the session's leases in the same
+transaction. The refusals agentd gives only after that, no turn,
+unauthorized and refused, now count as given back wherever agentctl
+releases. The match on the error code names every code, so a new one
+needs a decision. Every other code, such as agentd's internal error or a
+bad request, still counts as a failed release, as does one that failed
+in transit, couldn't connect, or was cut short by a signal, and those
+say the lease may still be held.
 
 ### The command runs in its own process group
 
