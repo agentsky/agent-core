@@ -8,7 +8,9 @@ use store::SkillState;
 use super::agents::{Download, no_such_agent};
 use super::{Commands, Failure, Origin};
 use crate::skills::package::{MAX_SKILL_BYTES, MAX_SKILL_MD_BYTES};
-use crate::skills::{Added, BUNDLED_NAME, Confirmed, Manifest, PENDING_TTL, Removed, Source};
+use crate::skills::{
+    Added, BUNDLED_NAME, Confirmed, Manifest, PENDING_TTL, Refused, Removed, Source,
+};
 
 impl Commands {
     pub(super) async fn skill(
@@ -50,6 +52,10 @@ impl Commands {
                         manifest.name
                     ),
                     Ok(Added::Pending(manifest)) => pending_reply(name, &manifest, origin),
+                    Err(refused @ Refused::TooMany) => format!(
+                        "{refused} Remove one first with {}.",
+                        origin.command(&format!("skill rm {name} <skill>"))
+                    ),
                     Err(refused) => refused.to_string(),
                 };
                 Ok(match (source, files.len()) {

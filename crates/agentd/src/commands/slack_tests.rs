@@ -1467,6 +1467,12 @@ const FAIL_TOKEN_DELETES: &str = "\
     UPDATE token_write_failures SET remaining = remaining - 1; \
     SELECT RAISE(FAIL, 'injected write failure'); END;";
 
+/// Makes every delete of a cloud routine fail, until [`NO_FORGETTING_OFF`].
+pub(super) const NO_FORGETTING: &str = "CREATE TRIGGER no_forgetting BEFORE DELETE ON \
+     cloud_routines BEGIN SELECT RAISE(FAIL, 'injected'); END;";
+/// Undoes [`NO_FORGETTING`].
+pub(super) const NO_FORGETTING_OFF: &str = "DROP TRIGGER no_forgetting;";
+
 /// Links `member`'s Claude account in `store`, as `login` does.
 pub(super) async fn link(store: &Store, member: MemberId) {
     store
@@ -1945,8 +1951,8 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
     assert_eq!(
         slashed_in_dm,
         [
-            "`reset helper here` resets the conversation it is sent in, and no agent answers in \
-          this one. Send `/agent reset helper here` in the conversation to reset, or \
+            "`/agent reset helper here` resets the conversation it is sent in, and no agent \
+          answers in this one. Send `/agent reset helper here` in the conversation to reset, or \
           `/agent reset helper` here to reset them all."
         ]
     );
@@ -3176,12 +3182,6 @@ async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() 
     );
     assert_eq!(h.stored(alice).await, None);
 }
-
-/// Makes every delete of a cloud routine fail, until [`NO_FORGETTING_OFF`].
-pub(super) const NO_FORGETTING: &str = "CREATE TRIGGER no_forgetting BEFORE DELETE ON \
-     cloud_routines BEGIN SELECT RAISE(FAIL, 'injected'); END;";
-/// Undoes [`NO_FORGETTING`].
-pub(super) const NO_FORGETTING_OFF: &str = "DROP TRIGGER no_forgetting;";
 
 #[tokio::test]
 async fn a_logout_whose_token_and_routine_deletes_both_keep_failing_says_to_send_it_again() {

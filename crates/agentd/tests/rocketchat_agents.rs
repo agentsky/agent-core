@@ -1095,7 +1095,7 @@ async fn allow_and_deny_find_members_and_channels_by_name_and_admins_ban_by_name
             .await,
         "Banned `@alice`. Agents refuse their requests, and they can only run `me`, \
          `logout`, `cloud rm`, and `pause` or `delete` their agents. Undo it with \
-         `admin unban`."
+         `admin unban <user>`."
     );
     assert!(
         chat.command("alice", "limits helper turns=3")

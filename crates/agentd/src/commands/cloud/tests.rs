@@ -327,6 +327,12 @@ async fn cloud_add_and_run_are_refused_without_cloud_config() {
         "Cloud hand-off is off on this agentd, so I didn't start anything. `cloud list` and \
          `cloud rm` still work."
     );
+    assert_eq!(
+        h.slash("alice", &format!("cloud run {LABEL} Fix the flaky test"))
+            .await,
+        "Cloud hand-off is off on this agentd, so I didn't start anything. `/agent cloud list` \
+         and `/agent cloud rm` still work."
+    );
     assert!(handoffs(&h.store, alice).await.is_empty());
 
     h.dm("alice", "cloud list").await;
@@ -406,7 +412,7 @@ async fn a_banned_member_can_only_rm() {
     assert!(c.h.last_reply("alice").contains("`cloud rm`"));
 }
 
-const BANNED_REPLY: &str = super::super::BANNED;
+const BANNED_REPLY: &str = crate::commands::tests::BANNED;
 
 #[tokio::test]
 async fn a_task_with_invisible_characters_is_refused() {
