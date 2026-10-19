@@ -214,10 +214,26 @@ impl FollowUp {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
-/// The reply to a banned member's commands, those that only take
-/// something away aside.
-const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
-                      can still run `me`, `logout`, and `pause` or `delete` your agents.";
+/// The reply to a banned member's commands from `origin`, those that only
+/// take something away aside.
+fn banned_reply(origin: &Origin) -> String {
+    format!(
+        "A community admin banned you, so agents won't take your requests. You can still run \
+         {} your agents.",
+        banned_may_run(origin)
+    )
+}
+
+/// The commands a banned member may still run, as typed where `origin` is.
+fn banned_may_run(origin: &Origin) -> String {
+    format!(
+        "{}, {}, and {} or {}",
+        origin.command("me"),
+        origin.command("logout"),
+        origin.command("pause"),
+        origin.command("delete")
+    )
+}
 
 /// Runs `/agent` commands and sends their replies. Agents are created on
 /// Rocket.Chat through [`RocketChatAgents`], and on Slack, as apps, through
@@ -439,7 +455,7 @@ impl Commands {
             Ok(false) => {}
             Ok(true) => {
                 tracing::info!(%member, command = name, "refused a banned member's command");
-                return (BANNED.to_owned(), FollowUp::default());
+                return (banned_reply(origin), FollowUp::default());
             }
             Err(err) => {
                 tracing::warn!(%member, command = name, error = %err, "couldn't read whether a member is banned");
@@ -527,7 +543,7 @@ impl Commands {
                     self.api_key(member, command).await
                 }
                 Command::Admin(AdminCommand::Ban { user, reason }) => {
-                    self.ban(member, &user, reason).await
+                    self.ban(member, &user, reason, origin).await
                 }
                 Command::Admin(AdminCommand::Unban { user }) => self.unban(member, &user).await,
                 Command::Limits {
@@ -539,11 +555,11 @@ impl Commands {
                         .await
                 }
                 Command::Allow { name, target } => {
-                    self.allow_or_deny(member, name.as_str(), &target, true)
+                    self.allow_or_deny(member, name.as_str(), &target, true, origin)
                         .await
                 }
                 Command::Deny { name, target } => {
-                    self.allow_or_deny(member, name.as_str(), &target, false)
+                    self.allow_or_deny(member, name.as_str(), &target, false, origin)
                         .await
                 }
                 Command::Approve { consent } => self.decide(member, consent, true).await,
@@ -706,7 +722,11 @@ impl Commands {
         if let Some(member) = member.filter(|_| !self.is_admin(key))
             && let Some(ban) = self.inner.store.ban(member).await?
         {
-            reply.push_str("\nA community admin banned you: agents won't take your requests, and you can only run `me`, `logout`, and `pause` or `delete` your agents.");
+            reply.push_str(&format!(
+                "\nA community admin banned you: agents won't take your requests, and you can \
+                 only run {} your agents.",
+                banned_may_run(origin)
+            ));
             if let Some(reason) = ban.reason.filter(|reason| !reason.trim().is_empty()) {
                 let reason: String = reason
                     .chars()
