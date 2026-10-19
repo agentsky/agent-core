@@ -35,6 +35,19 @@ fn zip_of(entries: &[(&str, Option<&[u8]>, u32)]) -> Vec<u8> {
     zip.finish().unwrap().into_inner()
 }
 
+/// `bytes`, a zip whose last entry is marked as made on `system` (0 for
+/// MS-DOS, 3 for Unix) with `mode` in the high half of its external
+/// attributes and nothing in the low half.
+fn marked(mut bytes: Vec<u8>, system: u8, mode: u32) -> Vec<u8> {
+    let central = bytes
+        .windows(4)
+        .rposition(|w| w == [0x50, 0x4b, 0x01, 0x02])
+        .unwrap();
+    bytes[central + 5] = system;
+    bytes[central + 38..central + 42].copy_from_slice(&(mode << 16).to_le_bytes());
+    bytes
+}
+
 fn mode(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
 }
@@ -276,13 +289,7 @@ fn zip_symlinks_duplicates_and_special_files_are_refused() {
         problem(unpack_zip(&bytes, &dir.join("c"))),
         Problem::Duplicate
     );
-    let mut bytes = zip_of(&[("fifo", Some(b""), 0o100644)]);
-    let central = bytes
-        .windows(4)
-        .rposition(|w| w == [0x50, 0x4b, 0x01, 0x02])
-        .unwrap();
-    bytes[central + 5] = 3;
-    bytes[central + 38..central + 42].copy_from_slice(&(0o010_644u32 << 16).to_le_bytes());
+    let bytes = marked(zip_of(&[("fifo", Some(b""), 0o100644)]), 3, 0o010_644);
     assert_eq!(
         problem(unpack_zip(&bytes, &dir.join("d"))),
         Problem::SpecialFile
@@ -291,6 +298,54 @@ fn zip_symlinks_duplicates_and_special_files_are_refused() {
         problem(unpack_zip(b"not a zip", &dir.join("e"))),
         Problem::Archive
     );
+}
+
+#[test]
+fn the_unix_mode_of_an_entry_marked_as_made_on_ms_dos_still_counts() {
+    let dir = TempDir::new("agentd-skill");
+    let bytes = marked(
+        zip_of(&[("link", Some(b"/etc/passwd"), 0o100644)]),
+        0,
+        0o120_777,
+    );
+    assert_eq!(
+        problem(unpack_zip(&bytes, &dir.join("a"))),
+        Problem::Symlink
+    );
+    let bytes = marked(zip_of(&[("fifo", Some(b""), 0o100644)]), 0, 0o010_644);
+    assert_eq!(
+        problem(unpack_zip(&bytes, &dir.join("b"))),
+        Problem::SpecialFile
+    );
+    let bytes = marked(
+        zip_of(&[("run.sh", Some(b"#!/bin/sh\n"), 0o100644)]),
+        0,
+        0o100_755,
+    );
+    let out = dir.join("c");
+    unpack_zip(&bytes, &out).unwrap();
+    assert_eq!(mode(&out.join("run.sh")), 0o755);
+}
+
+#[test]
+fn of_two_entries_with_exactly_the_same_name_the_last_unpacks() {
+    let dir = TempDir::new("agentd-skill");
+    let mut bytes = zip_of(&[
+        ("a", Some(b"first"), 0o100644),
+        ("b", Some(b"second"), 0o100644),
+    ]);
+    for (signature, name_at) in [
+        ([0x50, 0x4b, 0x03, 0x04], 30),
+        ([0x50, 0x4b, 0x01, 0x02], 46),
+    ] {
+        let header = bytes.windows(4).rposition(|w| w == signature).unwrap();
+        assert_eq!(bytes[header + name_at], b'b');
+        bytes[header + name_at] = b'a';
+    }
+    let out = dir.join("out");
+    unpack_zip(&bytes, &out).unwrap();
+    assert_eq!(fs::read(out.join("a")).unwrap(), b"second");
+    assert!(!out.join("b").exists());
 }
 
 #[test]
