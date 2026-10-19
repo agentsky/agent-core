@@ -607,12 +607,67 @@ async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
     let out = Run::from(output);
     out.refused("gave up waiting for the shared/ lock after the 1s timeout; agentd at ");
     assert!(
-        out.stderr.ends_with(
-            ": timed out; a lease agentd granted after agentctl stopped waiting expires within \
-             its TTL\n"
-        ),
+        out.stderr.ends_with(&format!(
+            ": timed out; couldn't give back a lease agentd may have granted (agentd at \
+             {url}: timed out), so it expires within its TTL\n"
+        )),
         "{out:?}"
     );
+}
+
+#[tokio::test]
+async fn an_acquire_whose_last_answer_was_lost_gives_back_the_lease_it_may_have_been_granted() {
+    let fake = FakeLock::start(30, 0, Renewals::Grant).await;
+    fake.state.hiccups.lock().unwrap().push(Hiccup::Lost);
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args([
+                    "lock",
+                    "--timeout",
+                    "1",
+                    "--",
+                    "touch",
+                    marker.to_str().unwrap(),
+                ])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.refused("gave up waiting for the shared/ lock after the 1s timeout; agentd at ");
+    assert!(out.stderr.ends_with(": timed out\n"), "{out:?}");
+    assert!(!marker.exists(), "{out:?}");
+    assert_eq!(fake.granted().len(), 1, "{out:?}");
+    assert_eq!(fake.released(), fake.granted(), "{out:?}");
+}
+
+#[tokio::test]
+async fn a_grant_for_another_lease_is_refused_and_the_lease_asked_for_given_back() {
+    let fake = FakeLock::start(30, 0, Renewals::Grant).await;
+    fake.state.hiccups.lock().unwrap().push(Hiccup::OtherLease);
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "touch", marker.to_str().unwrap()])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.refused("couldn't hold the shared/ lock (agentd answered for another lease)");
+    assert!(!marker.exists(), "{out:?}");
+    let asked = fake.state.asked.lock().unwrap().clone();
+    assert_eq!(asked.len(), 1, "{out:?}");
+    assert_eq!(fake.released(), asked, "{out:?}");
 }
 
 #[tokio::test]
@@ -792,6 +847,8 @@ enum Renewals {
     FailOnce,
     /// It grants renewals with more seconds left than a clock can hold.
     Endless,
+    /// It answers renewals as held under another lease.
+    OtherLease,
     /// It grants every renewal.
     Grant,
 }
@@ -803,6 +860,10 @@ enum Hiccup {
     Internal,
     /// It grants the lease, then answers with something unreadable.
     Garbled,
+    /// It grants the lease, then never answers.
+    Lost,
+    /// It grants nothing, and answers as held under another lease.
+    OtherLease,
 }
 
 /// A fake ctl API whose lock grants leases of `ttl` seconds, with whole
@@ -922,6 +983,9 @@ async fn fake_lock(
             if hiccup == Some(Hiccup::Internal) {
                 return internal_error();
             }
+            if hiccup == Some(Hiccup::OtherLease) {
+                return state.held(LeaseId::new_v4());
+            }
             {
                 let mut granted = state.granted.lock().unwrap();
                 if !granted.contains(&lease) {
@@ -931,12 +995,18 @@ async fn fake_lock(
             if hiccup == Some(Hiccup::Garbled) {
                 return "garbled".into_response();
             }
+            if hiccup == Some(Hiccup::Lost) {
+                return std::future::pending().await;
+            }
             state.held(lease)
         }
         LockRequest::Renew { lease } => {
             state.renewing.notify_one();
             if state.renewals == Renewals::Stall {
                 return std::future::pending().await;
+            }
+            if state.renewals == Renewals::OtherLease {
+                return state.held(LeaseId::new_v4());
             }
             if state.renewals == Renewals::Endless {
                 return Json(LockResponse::Held {
@@ -1028,6 +1098,25 @@ async fn a_renewal_too_long_for_the_clock_stops_the_command_and_says_so() {
         "lost the shared/ lock (agentd granted a lease longer than the clock can hold); \
          stopped the command",
     );
+    assert_eq!(fake.released(), fake.granted());
+}
+
+#[tokio::test]
+async fn a_renewal_for_another_lease_stops_the_command_and_says_so() {
+    let fake = FakeLock::start(3, 0, Renewals::OtherLease).await;
+    let dir = TempDir::new("agentctl-test");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "sleep", "30"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.refused("lost the shared/ lock (agentd answered for another lease); stopped the command");
     assert_eq!(fake.released(), fake.granted());
 }
 

@@ -3090,8 +3090,9 @@ so `--timeout 1` took 30 seconds and the default could run past the Bash
 tool's 2 minutes. Each acquire is now given the time left, at least seven
 seconds and at most thirty. The floor lets `--timeout 0` take a free lock,
 and outlasts agentd's five-second SQLite busy timeout, so the common slow
-answer isn't abandoned. The default 100 seconds plus the floor stays under
-2 minutes.
+answer isn't abandoned. The default 100 seconds plus the floor, plus the
+two seconds giving the lease back may take after it, stays under 2
+minutes.
 
 ### The acquire is idempotent
 
@@ -3118,10 +3119,10 @@ that lands after agentctl released the lease is still orphaned: say an
 attempt is held up in agentd for over 30 seconds, a later attempt is
 granted, the command runs and the lease is released, and then the first
 attempt lands. The same goes for a grant landing after a stop signal's
-release, or after agentctl gave back a lease too short or too long to
-hold. Nobody renews such a lease, so it holds the lock for at most its
-TTL, 30 seconds by default. This was already so before the id; it is
-just not solved by it.
+release, after agentctl gave back a lease too short or too long to hold,
+or after it gave up at `--timeout`. Nobody renews such a lease, so it
+holds the lock for at most its TTL, 30 seconds by default. This was
+already so before the id; it is just not solved by it.
 
 An acquire that failed with agentd's internal error (a busy database,
 say), or whose answer was lost (it timed out, was cut off, or couldn't be
@@ -3134,9 +3135,18 @@ away. A renewal that can't connect is still retried until the deadline,
 since the command already runs under the lease and a brief outage
 shouldn't kill it. Any other refusal also fails at once. When `lock`
 gives up after the timeout, it names the last attempt's reason: busy,
-agentd's internal error, or the lost answer. Only after a lost answer
-does it add that a lease agentd granted anyway expires within its TTL,
-since no later attempt is left to pick it up.
+agentd's internal error, or the lost answer.
+
+Review found that giving up after a lost answer left the lease alone,
+although the likeliest lost answer is a grant that landed just after the
+last attempt stopped waiting, and no later attempt is left to pick it up:
+every session on the volume then waited out the TTL. agentctl now gives
+back the lease whenever it gives up, within the two seconds a release may
+take, and says the lease expires within its TTL only when that release
+fails. It also checks that a grant or renewal names the lease it asked
+for: an answer for another lease is agentd misbehaving, so an acquire
+gives back its own lease and fails, and a renewal is treated as a lost
+lease.
 
 ### The command runs in its own process group
 
@@ -4089,10 +4099,10 @@ sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
 "Processes a turn leaves running" entry records it; T21 recycles the
-container only when the requester changes, so the process keeps it until
-then). Resolving the name with a
-trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
-allowed host to a fixed address there; pin it in DNS instead.
+container on a requester change, not at turn end, so the process keeps it
+until the container goes). Resolving the name with a trailing dot also
+skips `/etc/hosts` on glibc, so an operator can't pin an allowed host to a
+fixed address there; pin it in DNS instead.
 
 ### Log lines don't name the host
 
@@ -4447,15 +4457,24 @@ credential, or act through `agentctl`, while B's turn runs. Restarting the
 process on a credential kind change doesn't help: the leftover isn't the CLI,
 and two members' subscriptions are the same kind.
 
-**Solution.** `Held` records the `Requester` whose turn started the container,
+**Solution.** `Held` records the requester whose turn started the container,
 and `ensure_process` stops the whole container, as it does a dead one or one
 with other mounts, when a turn's requester differs, before it looks at the
 process. Stopping the container ends its PID namespace and every process in
 it; stopping only the CLI would leave the leftovers running. It compares the
-full `Requester`, not the `CredentialRef`: a community-key turn of another
-requester also gets the agentctl token, so it gets a new container too. An
+requester, not the `CredentialRef`: a community-key turn of another requester
+also gets the agentctl token, so it gets a new container too. An
 agent-to-agent hop runs as the requester it inherits, so it keeps a container
-started for that requester. The cost is a container start and a `--resume` of
+started for that requester.
+
+Review noted that comparing the full `Requester` recycled the container when
+the requester's account was linked between two turns, flipping `member` from
+`None` to `Some`. It now compares `Requester::key` alone, which is as safe: a
+`MemberKey` names one member at most (`surface_identities` is keyed by it),
+and only ever the same one, since nothing rewrites or deletes an identity's
+member, so the key alone names the person. The credential that changes with a
+link, the community key to the member's subscription, changes the credential
+kind, and the fit check restarts the process in the kept container for it. The cost is a container start and a `--resume` of
 the transcript whenever consecutive turns of one session come from different
 requesters, as in a busy channel thread; a requester's own run of turns keeps
 the warm process. Only one requester's turns now share a warm process, so the
@@ -4463,7 +4482,9 @@ case the T20 note on `total_cost_usd` gives, of other members' turns on a
 shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
 no longer arises. `a_requester_change_replaces_the_container` checks that
 another requester's turn, a community-key one included, replaces the
-container, and that the same requester and a hop carrying it keep it.
+container, and that the same requester and a hop carrying it keep it;
+`a_requester_linked_between_turns_keeps_the_container` that a key gaining a
+member between turns keeps the container and restarts only the process.
 
 It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
 are the session's `home/`, `tmp/` and `claude/` on its volume, the working
@@ -4478,6 +4499,26 @@ a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 still use its own requester's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Processes a turn leaves running")
 records both, with a way to narrow the files' part.
+
+### `ProcessSandbox` gives every container one address
+
+**Issue.** Review noted that `ProcessSandbox::ip` answers `127.0.0.1` for
+every container, while agentd relies on an address holding one container
+at a time: `put_ctl_token` deletes every other token and lease bound to
+the address, and `Registry::mint` revokes other sessions' placeholders
+there. Two sessions running at once on it with real hooks would revoke
+each other's agentctl token and placeholders.
+
+**Solution.** It stays one address, and its rustdoc and the plan say it
+supports one running container at a time for those rules. Distinct
+loopback addresses per container wouldn't work end to end: its processes
+are local children that don't bind a source address, and Linux gives a
+connection to any `127.0.0.0/8` address the source `127.0.0.1`, so agentd
+would see every process at `127.0.0.1` whatever `ip` returned. T21's
+tests that run two sessions at once use fake hooks, which bind nothing to
+the address. A test that needs two live sessions with real hooks gives
+each its own address another way, as agentctl's integration tests do
+([T15](#one-token-per-container-address-too)).
 
 ### How turns queue and survive their caller
 
@@ -5980,15 +6021,16 @@ first check, inside their `BEGIN IMMEDIATE` transaction, that
 instance can take the lease over before the transaction ends. A
 confirmation fenced out after its move doesn't undo it: whoever holds the
 lease now owns the name, and putting the old skill back could put it under
-their row, so the files stay as a crash would leave them, for the roll
-forward below. `LEASE_TTL` is two minutes: a change makes two store calls,
+their row, so the moved files stay live for the roll forward below. Unlike
+a crash, which leaves the skill they replaced in the work directory for
+startup's purge, the work directory's guard removes it at once. `LEASE_TTL` is two minutes: a change makes two store calls,
 each of which may wait the pool's 30-second acquire timeout and then the
 5-second busy timeout, about 70 seconds at worst, and a lease a crash left
 keeps the name busy for those two minutes. The sweeper deletes ended
 leases, so names nothing changes again don't keep rows.
 
-With changes serialized, `confirm` reads the pending `SKILL.md` in place
-and moves the directory straight into the live one; the move into a work
+With changes serialized, `confirm` checks the pending directory in place
+and moves it straight into the live one; the move into a work
 directory, the inode check and the put-back of files a newer add replaced
 are gone, as is the sweeper's check for a skill added again, since the
 sweeper now deletes one name's expired row and removes its files under the
@@ -6021,19 +6063,30 @@ Only the owner's `confirm` does that, since it is consent to the pending
 row's hosts at that moment: the sweeper drops an expiring row as ever, and
 the grant check denies the live files the active row doesn't match. A
 sweeper that finished them could grant hosts nobody confirmed: a
-confirmation whose lease lapsed before its move can move a newer add's
-files in, and is then fenced out without undoing it. Matching the whole
-tree, not just the hosts, keeps a lost pending directory next to an active
-skill that declares the same hosts from recording an update that never
-arrived. One stopped in the middle of undoing its move can leave the old
-row without live files. Whatever a failed add or removal leaves, startup's
-purge removes. Purge takes no lease, so it still keeps both directories of
-a name with a row and leaves anything changed within `STALE_AFTER`, since
-the other side of a deploy may be mid-move or mid-clone. A pending
-directory `drop_expired` can't remove is logged; never mounted, it stays on
-disk until startup's purge if no row has the name, or else, since purge
-keeps every directory of a name with a row, until the name is next added or
-removed.
+confirmation whose lease lapsed can move in a newer add's files that land
+between its check and its move, and is then fenced out without undoing it.
+Matching the whole tree, not just the hosts, keeps a lost pending directory
+next to an active skill that declares the same hosts from recording an
+update that never arrived. One stopped in the middle of undoing its move
+can leave the old row without live files. Whatever a failed add or removal
+leaves, startup's purge removes. Purge takes no lease, so it still keeps
+both directories of a name with a row and leaves anything changed within
+`STALE_AFTER`, since the other side of a deploy may be mid-move or
+mid-clone. A pending directory `drop_expired` can't remove is logged;
+never mounted, it stays on disk until startup's purge if no row has the
+name, or else, since purge keeps every directory of a name with a row,
+until the name is next added or removed.
+
+Review found that `confirm` itself only checked, before its move, that the
+pending `SKILL.md` declared the row's hosts, so a confirmation whose lease
+lapsed could move in a successor's different files declaring the same
+hosts. It now compares the pending tree's digest with the row's instead,
+and confirms nothing on a mismatch, as for files that aren't there; files
+with the row's digest are the ones the row's hosts were read from, so they
+declare them. That leaves only an add landing between the check and the
+move. `a_confirmation_moves_only_the_files_its_row_was_added_with` changes
+a waiting skill's body, its hosts kept, and checks that nothing is
+confirmed.
 
 File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
 row, and its release logs that the lease ran out, but its moves still
@@ -6052,7 +6105,7 @@ landing after a lapsed lease can leave any files under any active row.
 `Skills::granted_hosts` reads the session's agent's active skills that
 declare hosts (`Store::active_skills_for_session`, which replaced
 `skill_hosts_for_session`) and grants each one's hosts only while its live
-`SKILL.md` declares exactly those hosts, parsed as `confirm` parses it. A
+`SKILL.md` declares exactly those hosts, parsed as at add. A
 skill whose files declare others, or are missing or unreadable, grants
 none, warned about with the agent, the skill and the counts at most once a
 minute per skill (`MISMATCH_WARN_INTERVAL`, through `core_types::Throttle`,

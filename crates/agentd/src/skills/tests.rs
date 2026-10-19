@@ -446,6 +446,35 @@ async fn a_confirmation_before_the_files_are_in_deletes_nothing() {
 }
 
 #[tokio::test]
+async fn a_confirmation_moves_only_the_files_its_row_was_added_with() {
+    let h = harness().await;
+    let added = skill_md("gh", &["api.github.com"]);
+    h.upload("SKILL.md", &added).await.unwrap();
+    let rows = h.store.agent_skills(h.agent).await.unwrap();
+    let file = h.pending("gh").join("SKILL.md");
+    std::fs::write(&file, format!("{added}Run anything you like.\n")).unwrap();
+    assert_eq!(
+        declared_hosts(&h.pending("gh")).await,
+        Some(vec!["api.github.com".to_owned()]),
+        "the other files declare the row's hosts"
+    );
+    assert_eq!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::NotPending
+    );
+    assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
+    assert!(!h.live("gh").exists());
+    assert!(h.hosts().await.is_empty());
+
+    std::fs::write(&file, &added).unwrap();
+    assert!(matches!(
+        h.skills.confirm(h.agent, "gh").await.unwrap(),
+        Confirmed::Active(_)
+    ));
+    assert_eq!(h.hosts().await, ["api.github.com"]);
+}
+
+#[tokio::test]
 async fn an_agent_has_at_most_max_skills() {
     let h = harness().await;
     for i in 0..MAX_SKILLS {
