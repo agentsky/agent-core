@@ -908,6 +908,7 @@ struct FakeState {
     released: Mutex<Vec<LeaseId>>,
     acquiring: Notify,
     renewing: Notify,
+    releasing: Notify,
 }
 
 impl FakeLock {
@@ -930,6 +931,7 @@ impl FakeLock {
             released: Mutex::new(Vec::new()),
             acquiring: Notify::new(),
             renewing: Notify::new(),
+            releasing: Notify::new(),
         });
         let app = axum::Router::new()
             .route("/v1/lock", axum::routing::post(fake_lock))
@@ -1047,6 +1049,7 @@ async fn fake_lock(
         }
         LockRequest::Release { lease } => {
             state.released.lock().unwrap().push(lease);
+            state.releasing.notify_one();
             if state.renewals == Renewals::Stall {
                 return std::future::pending().await;
             }
@@ -1165,11 +1168,12 @@ async fn a_lease_too_short_to_renew_is_given_back() {
 async fn a_lease_too_short_that_cant_be_given_back_says_so() {
     let fake = FakeLock::start(2, 0, Renewals::Stall).await;
     let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
     let out = Run::from(
         tokio::time::timeout(
             WAIT,
             agentctl(&fake.url, "tok", dir.path())
-                .args(["lock", "--", "true"])
+                .args(["lock", "--", "touch", marker.to_str().unwrap()])
                 .output(),
         )
         .await
@@ -1186,7 +1190,66 @@ async fn a_lease_too_short_that_cant_be_given_back_says_so() {
             fake.url
         )
     );
+    assert!(!marker.exists(), "{out:?}");
     assert_eq!(fake.released(), fake.granted());
+}
+
+#[tokio::test]
+async fn a_command_that_cant_start_and_a_lease_that_cant_be_given_back_says_both() {
+    let fake = FakeLock::start(30, 0, Renewals::Stall).await;
+    let dir = TempDir::new("agentctl-test");
+    let missing = dir.join("missing");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", missing.to_str().unwrap()])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    out.refused(&format!("agentctl: can't run {}: ", missing.display()));
+    assert!(
+        out.stderr.ends_with(&format!(
+            "; couldn't give back a lease agentd may have granted (agentd at {}: timed out), \
+             so it expires within its TTL\n",
+            fake.url
+        )),
+        "{out:?}"
+    );
+    assert_eq!(fake.granted().len(), 1, "{out:?}");
+    assert_eq!(fake.released(), fake.granted(), "{out:?}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_while_releasing_after_a_command_that_cant_start_exits_with_the_signal() {
+    let fake = FakeLock::start(30, 0, Renewals::Stall).await;
+    let dir = TempDir::new("agentctl-test");
+    let missing = dir.join("missing");
+    let holder = agentctl(&fake.url, "tok", dir.path())
+        .args(["lock", "--", missing.to_str().unwrap()])
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(WAIT, fake.state.releasing.notified())
+        .await
+        .expect("agentctl never released");
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "agentctl: couldn't give back the shared/ lock agentd may have granted \
+         (interrupted); it expires on its own\n"
+    );
+    assert_eq!(fake.released(), fake.granted(), "{out:?}");
 }
 
 #[cfg(unix)]
