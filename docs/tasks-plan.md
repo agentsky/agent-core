@@ -3356,7 +3356,11 @@ gives and returns the outcome alone: `FireOutcome` is
 `CloudUnknownReason::NoAnswer`. A routine whose `url_origin` isn't
 `FireClient::origin()` and a task `cloud::check_task` refuses (empty or
 over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
-`Rejected` with no status. Building the client fails with
+`Rejected` with no status. That origin check compares `url_origin` with
+`FireClient::origin()` as two strings `url::Origin::ascii_serialization`
+wrote, which is correct: equal strings are equal origins, and a mismatch
+only leaves the token unsent, so it needs no parsing; parsing the stored
+origin, as T35a decided, is for T35c's check. Building the client fails with
 `FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
 not at most equal, so a connection that never opened is always
 `rejected`. `Retry-After` is capped at a day. Each fire is one request on
@@ -3389,17 +3393,19 @@ Deliverables:
   (T35a): the handler answers `CloudRoutinePut::Unlinked` as an unlinked
   `cloud add` and `CloudBegun::Unlinked` as an unlinked `cloud run`,
   having stored or sent nothing. A member Slack reports deleted keeps their
-  link, so a `cloud add` that races that deletion can still store a
-  routine, which then stays until the member logs out, and a racing
-  `cloud run` still writes and fires a hand-off, whose row goes at
-  `[cloud] retention_days`. A member only on Slack can't send `logout`
-  once Slack deleted them, so their routine stays sealed at rest
-  indefinitely, as their Claude link already does, and a store leaked with
-  its master key would yield its token, as the design's threat row on
-  routine tokens says. This is an accepted gap: it needs the member's own
-  command to land in the moment Slack deletes them, and through agentd
-  only that member can fire the token, from another of their identities;
-  for a member only on Slack, nobody can:
+  link, so a `cloud add` that races that deletion, or one sent later from
+  another of the member's identities, such as on Rocket.Chat, can still
+  store a routine, which then stays until the member logs out, and a
+  racing or later `cloud run` still writes and fires a hand-off, whose row
+  goes at `[cloud] retention_days`. A member only on Slack can't send
+  `logout` once Slack deleted them, so a routine a racing `cloud add`
+  stored stays sealed at rest indefinitely, as their Claude link already
+  does, and a store leaked with its master key would yield its token, as
+  the design's threat row on routine tokens says. This is an accepted gap:
+  for a member only on Slack it needs their own command to land in the
+  moment Slack deletes them, and then nobody can fire the token through
+  agentd; a member with another identity adds, fires and logs out from it
+  as before, and only they can fire the token:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
@@ -3967,8 +3973,8 @@ Deliverables:
   one id form (the canonical id above, from T36e item 9). A copy whose
   fields don't name the organization is dropped unless the home check
   says home; the organization `users.info` gives is for logs only and
-  must never become the copy's `outside`, which would let a forged event
-  naming it stand.
+  must never become the copy's `outside`, since the event may not supply
+  what the copy lacks (T31): a forged event naming it would then stand.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,
