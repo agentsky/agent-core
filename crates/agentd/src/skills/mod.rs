@@ -512,10 +512,12 @@ impl Skills {
     /// Confirms the pending row `waiting` as [`confirm`](Self::confirm)
     /// read it, under the skill's `lease`. Files that aren't in the pending
     /// directory, because an add failed or died before moving them in, or
-    /// that declare other hosts than the row, leave nothing to confirm. If
-    /// the row can't be made active, the move is undone ([`put_back`])
-    /// before saying so, unless the lease was lost: whoever holds it now
-    /// owns the files, which stay as a crash would leave them.
+    /// that aren't the ones the row was added with (their digest isn't the
+    /// row's), leave nothing to confirm. If the row can't be made active,
+    /// the move is undone ([`put_back`]) before saying so, unless the lease
+    /// was lost: whoever holds it now owns the name, so the moved files stay
+    /// live, and the skill they replaced goes with the work directory at
+    /// once, where a crash would have left it for startup's purge.
     ///
     /// A confirmation stopped after its move and before its row write
     /// ([`moved_in`](Self::moved_in)) is finished: the row becomes active
@@ -538,8 +540,10 @@ impl Skills {
             return Ok(confirmed.map_or(Confirmed::NotPending, Confirmed::Active));
         }
         let pending = self.pending_dir(agent, name);
-        if declared_hosts(&pending).await.as_ref() != Some(&waiting.hosts) {
-            tracing::info!(%agent, skill = name, "no files declaring a pending skill's hosts wait for it; confirmed nothing");
+        let read = pending.clone();
+        let digest = blocking(move || package::tree_digest(&read)).await?;
+        if !digest.is_ok_and(|digest| digest == waiting.digest) {
+            tracing::info!(%agent, skill = name, "the files a pending skill was added with don't wait for it; confirmed nothing");
             return Ok(Confirmed::NotPending);
         }
         let live = self.live_dir(agent, name);

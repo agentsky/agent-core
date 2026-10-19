@@ -5962,15 +5962,16 @@ first check, inside their `BEGIN IMMEDIATE` transaction, that
 instance can take the lease over before the transaction ends. A
 confirmation fenced out after its move doesn't undo it: whoever holds the
 lease now owns the name, and putting the old skill back could put it under
-their row, so the files stay as a crash would leave them, for the roll
-forward below. `LEASE_TTL` is two minutes: a change makes two store calls,
+their row, so the moved files stay live for the roll forward below. Unlike
+a crash, which leaves the skill they replaced in the work directory for
+startup's purge, the work directory's guard removes it at once. `LEASE_TTL` is two minutes: a change makes two store calls,
 each of which may wait the pool's 30-second acquire timeout and then the
 5-second busy timeout, about 70 seconds at worst, and a lease a crash left
 keeps the name busy for those two minutes. The sweeper deletes ended
 leases, so names nothing changes again don't keep rows.
 
-With changes serialized, `confirm` reads the pending `SKILL.md` in place
-and moves the directory straight into the live one; the move into a work
+With changes serialized, `confirm` checks the pending directory in place
+and moves it straight into the live one; the move into a work
 directory, the inode check and the put-back of files a newer add replaced
 are gone, as is the sweeper's check for a skill added again, since the
 sweeper now deletes one name's expired row and removes its files under the
@@ -6003,19 +6004,30 @@ Only the owner's `confirm` does that, since it is consent to the pending
 row's hosts at that moment: the sweeper drops an expiring row as ever, and
 the grant check denies the live files the active row doesn't match. A
 sweeper that finished them could grant hosts nobody confirmed: a
-confirmation whose lease lapsed before its move can move a newer add's
-files in, and is then fenced out without undoing it. Matching the whole
-tree, not just the hosts, keeps a lost pending directory next to an active
-skill that declares the same hosts from recording an update that never
-arrived. One stopped in the middle of undoing its move can leave the old
-row without live files. Whatever a failed add or removal leaves, startup's
-purge removes. Purge takes no lease, so it still keeps both directories of
-a name with a row and leaves anything changed within `STALE_AFTER`, since
-the other side of a deploy may be mid-move or mid-clone. A pending
-directory `drop_expired` can't remove is logged; never mounted, it stays on
-disk until startup's purge if no row has the name, or else, since purge
-keeps every directory of a name with a row, until the name is next added or
-removed.
+confirmation whose lease lapsed can move in a newer add's files that land
+between its check and its move, and is then fenced out without undoing it.
+Matching the whole tree, not just the hosts, keeps a lost pending directory
+next to an active skill that declares the same hosts from recording an
+update that never arrived. One stopped in the middle of undoing its move
+can leave the old row without live files. Whatever a failed add or removal
+leaves, startup's purge removes. Purge takes no lease, so it still keeps
+both directories of a name with a row and leaves anything changed within
+`STALE_AFTER`, since the other side of a deploy may be mid-move or
+mid-clone. A pending directory `drop_expired` can't remove is logged;
+never mounted, it stays on disk until startup's purge if no row has the
+name, or else, since purge keeps every directory of a name with a row,
+until the name is next added or removed.
+
+Review found that `confirm` itself only checked, before its move, that the
+pending `SKILL.md` declared the row's hosts, so a confirmation whose lease
+lapsed could move in a successor's different files declaring the same
+hosts. It now compares the pending tree's digest with the row's instead,
+and confirms nothing on a mismatch, as for files that aren't there; files
+with the row's digest are the ones the row's hosts were read from, so they
+declare them. That leaves only an add landing between the check and the
+move. `a_confirmation_moves_only_the_files_its_row_was_added_with` changes
+a waiting skill's body, its hosts kept, and checks that nothing is
+confirmed.
 
 File moves can't be fenced. A change that outlives `LEASE_TTL` writes no
 row, and its release logs that the lease ran out, but its moves still
@@ -6034,7 +6046,7 @@ landing after a lapsed lease can leave any files under any active row.
 `Skills::granted_hosts` reads the session's agent's active skills that
 declare hosts (`Store::active_skills_for_session`, which replaced
 `skill_hosts_for_session`) and grants each one's hosts only while its live
-`SKILL.md` declares exactly those hosts, parsed as `confirm` parses it. A
+`SKILL.md` declares exactly those hosts, parsed as at add. A
 skill whose files declare others, or are missing or unreadable, grants
 none, warned about with the agent, the skill and the counts at most once a
 minute per skill (`MISMATCH_WARN_INTERVAL`, through the `Throttle` the
