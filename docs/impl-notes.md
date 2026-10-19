@@ -4073,10 +4073,10 @@ sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
 "Processes a turn leaves running" entry records it; T21 recycles the
-container only when the requester changes, so the process keeps it until
-then). Resolving the name with a
-trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
-allowed host to a fixed address there; pin it in DNS instead.
+container on a requester change, not at turn end, so the process keeps it
+until the container goes). Resolving the name with a trailing dot also
+skips `/etc/hosts` on glibc, so an operator can't pin an allowed host to a
+fixed address there; pin it in DNS instead.
 
 ### Log lines don't name the host
 
