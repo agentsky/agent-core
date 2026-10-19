@@ -3175,7 +3175,10 @@ Not scheduled. Each needs a decision before it becomes a task.
   The requester has to ask again, which takes a new consent and a rerun
   billed to the owner. Returning an error instead wouldn't help: the next
   claim finds the session reached the model and tells the thread the task
-  was interrupted. A fix needs the result stored durably (the private
+  was interrupted. A result posted without its `message_refs` row
+  (`Lost::Row`) leaves `consent_posted` false, so a restart before
+  `finish_consent` tells the thread the task was interrupted under a reply
+  it already has. A fix needs the result stored durably (the private
   output in the database), a redelivery path with backoff, and
   `consent_posted` redefined for a partial post, since any chunk posted
   now counts as the consent's last word, all within T33's rule that every
