@@ -395,12 +395,6 @@ say "$admin_id" "$admin_token" "$admin_dm" "admin api-key set $community_key" >/
 wait_manager "$admin_id" "$admin_token" "$admin_dm" "The community API key is set."
 pass "the admin set the community API key"
 
-bob=$(login bob "$bob_pass")
-root_id=$(say "${bob% *}" "${bob#* }" "$general" "@$bot and what is three plus three?")
-wait_answer "${bob% *}" "${bob#* }" "$root_id" bob
-
-echo "== The credentials fake-anthropic saw"
-
 # fake-anthropic prints the requests it recorded every 250 ms, so its log
 # can trail the answer the test saw. A log that holds still for a second
 # has printed them all.
@@ -413,14 +407,28 @@ settled() {
     [ "$(fake_requests | wc -l)" = "$printed" ]
 }
 poll 30 settled || die "fake-anthropic's log never stopped growing"
+before_bob=$(($(fake_requests | wc -l)))
+
+bob=$(login bob "$bob_pass")
+root_id=$(say "${bob% *}" "${bob#* }" "$general" "@$bot and what is three plus three?")
+wait_answer "${bob% *}" "${bob#* }" "$root_id" bob
+
+echo "== The credentials fake-anthropic saw"
+
+poll 30 settled || die "fake-anthropic's log never stopped growing"
 requests=$(fake_requests)
 printf '%s\n' "$requests" | sort | uniq -c
 printf '%s\n' "$requests" | grep -qx 'POST /v1/messages authorization=issued x-api-key=absent' ||
     die "no turn ran on the access token alice linked"
 pass "alice's turn ran on her linked account"
-printf '%s\n' "$requests" | grep -qx 'POST /v1/messages authorization=absent x-api-key=community' ||
-    die "no turn ran on the community key"
-pass "bob's turn ran on the community key"
+bob_messages=$(printf '%s\n' "$requests" | tail -n +"$((before_bob + 1))" |
+    grep '^POST /v1/messages ' || true)
+[ -n "$bob_messages" ] || die "bob's turn sent fake-anthropic no message"
+if printf '%s\n' "$bob_messages" |
+    grep -vqx 'POST /v1/messages authorization=absent x-api-key=community'; then
+    die "bob's turn sent a message on a credential other than the community key"
+fi
+pass "bob's turn ran on the community key alone"
 if printf '%s\n' "$requests" | grep -q '=other'; then
     die "a request reached fake-anthropic with a credential the proxy didn't swap"
 fi

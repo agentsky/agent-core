@@ -4328,8 +4328,10 @@ Deliverables:
      the community key with `admin api-key set`, and bob, who has no linked
      account, mentions the bot and gets the same answer.
   6. Checks the fake's log: a `/v1/messages` request on the access token it
-     issued, one on the community key, and none carrying another value, so
-     every turn went through the credential proxy's swap.
+     issued; from bob's mention on, at least one `/v1/messages` request
+     and each on the community key, so bob's turn used no member's
+     account; and none carrying another value, so every turn went through
+     the credential proxy's swap.
   It removes everything it created on exit, the sandboxes agentd started
   (by their `agentd.instance` label) included, and prints agentd's, the
   fake's and Rocket.Chat's logs when a step fails.
