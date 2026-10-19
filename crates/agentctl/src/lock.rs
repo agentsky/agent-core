@@ -31,13 +31,14 @@
 //! in these cases, for a lease too short or too long to hold, or when the
 //! command can't be started or waited for or the lease is lost while it
 //! runs, its error adds when that release failed too, leaving a lease
-//! agentd may hold to expire within its TTL. A release agentd refuses with
-//! anything but its internal error has nothing left to give back: agentd
-//! refuses it only once the turn has ended or the token is gone, and those
-//! delete the session's leases. An acquire that can't connect to agentd
-//! (its name doesn't resolve, the connection is refused, or connecting
-//! takes over five seconds) fails at once, so a wrong URL or an agentd that
-//! is down is reported straight away. A renewal that can't connect is
+//! agentd may hold to expire within its TTL. A release agentd refuses
+//! because the turn has ended, the token is gone, or a private task has
+//! started has nothing left to give back: agentd gives those refusals only
+//! after deleting the session's leases. Any other refusal is a failed
+//! release. An acquire that can't connect to agentd (its name doesn't
+//! resolve, the connection is refused, or connecting takes over five
+//! seconds) fails at once, so a wrong URL or an agentd that is down is
+//! reported straight away. A renewal that can't connect is
 //! retried like any other failed in transit: the command already runs under
 //! the lease, the deadline bounds the retries, and a brief outage shouldn't
 //! kill it.
@@ -367,19 +368,33 @@ async fn hold(
 }
 
 /// Gives `lease` back, within [`RELEASE_TIMEOUT`] and unless a stop signal
-/// comes first. A refusal other than agentd's internal error counts as
-/// given back: agentd refuses a release only once the turn the lease was
-/// taken under has ended or the token is revoked or replaced, and each of
-/// those deleted the session's leases.
+/// comes first. The refusals agentd gives only after deleting the session's
+/// leases count as given back: no turn, once the turn the lease was taken
+/// under has ended; unauthorized, once the token is revoked or replaced;
+/// and refused, once a private task has started in its place. Any other
+/// refusal leaves the lease as it was, so it counts as a failed release.
 async fn release(client: &Client, lease: LeaseId, stop: &mut Stop) -> Result<(), Unreleased> {
     let request = LockRequest::Release { lease };
     tokio::select! {
         released = client.send_within(&request, RELEASE_TIMEOUT) => match released {
             Ok(_) => Ok(()),
-            Err(Failure::Refused(err)) if err.code != CtlErrorCode::Internal => Ok(()),
+            Err(Failure::Refused(err)) if dropped_with_the_lease(err.code) => Ok(()),
             Err(err) => Err(Unreleased::Failed(err.to_string())),
         },
         signal = stop.recv() => Err(Unreleased::Stopped(signal)),
+    }
+}
+
+/// Whether agentd refuses a release with `code` only after deleting the
+/// session's leases, in the same transaction as what made it refuse.
+fn dropped_with_the_lease(code: CtlErrorCode) -> bool {
+    match code {
+        CtlErrorCode::NoTurn | CtlErrorCode::Unauthorized | CtlErrorCode::Refused => true,
+        CtlErrorCode::Internal
+        | CtlErrorCode::BadRequest
+        | CtlErrorCode::NotFound
+        | CtlErrorCode::TooLarge
+        | CtlErrorCode::NotAvailable => false,
     }
 }
 
