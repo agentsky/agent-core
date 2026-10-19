@@ -5,7 +5,7 @@ use commands::{RoomRef, Setting, Target, UserRef};
 use core_types::{AgentId, ConvRef, ConversationId, MemberKey, SurfaceKind};
 
 use super::agents::no_such_agent;
-use super::{Commands, Failure};
+use super::{Commands, Failure, Origin};
 use crate::policy::{Change, MAX_RULES, Rule, Rules};
 
 /// A limit after `setting`: unchanged when it is `None`.
@@ -69,13 +69,14 @@ impl Commands {
     }
 
     /// Runs `allow <name> <target>`, or `deny` when `allow` is false, for
-    /// `key`.
+    /// `key`, sent from `origin`.
     pub(super) async fn allow_or_deny(
         &self,
         key: &MemberKey,
         name: &str,
         target: &Target,
         allow: bool,
+        origin: &Origin,
     ) -> Result<String, Failure> {
         let Some(agent) = self.own_agent(key, name).await? else {
             return Ok(no_such_agent(name));
@@ -85,6 +86,7 @@ impl Commands {
             Err(reply) => return Ok(reply),
         };
         let allows_some = allow && rule != Rule::Everyone;
+        let allow_everyone = origin.command(&format!("allow {name} everyone"));
         let changed = self
             .inner
             .store
@@ -120,8 +122,8 @@ impl Commands {
             Err(err) => {
                 tracing::warn!(agent = %agent.id, kind = ?err.classify(), "an agent's rules don't read");
                 return Ok(format!(
-                    "I can't read `{name}`'s rules, so it refuses everyone, you too. Send `allow \
-                     {name} everyone` to clear them."
+                    "I can't read `{name}`'s rules, so it refuses everyone, you too. Send \
+                     {allow_everyone} to clear them."
                 ));
             }
         };
@@ -129,7 +131,7 @@ impl Commands {
         if allows_some && rules.denies_everyone() {
             reply.push_str(&format!(
                 " `everyone` is denied, which wins over any allow: to let only your allowed \
-                 targets use it, send `allow {name} everyone` first, then allow them again."
+                 targets use it, send {allow_everyone} first, then allow them again."
             ));
         }
         Ok(reply)

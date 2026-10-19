@@ -135,7 +135,7 @@ impl Commands {
         origin: &Origin,
     ) -> Result<String, Failure> {
         let Some(fire) = &self.cloud else {
-            return Ok(cloud_off("I didn't store the routine"));
+            return Ok(cloud_off("I didn't store the routine", origin));
         };
         let member = match self.cloud_member(key, origin).await? {
             Ok(member) => member,
@@ -217,7 +217,7 @@ impl Commands {
         delivered: &str,
     ) -> Result<String, Failure> {
         let Some(fire) = &self.cloud else {
-            return Ok(cloud_off("I didn't start anything"));
+            return Ok(cloud_off("I didn't start anything", origin));
         };
         let member = match self.cloud_member(key, origin).await? {
             Ok(member) => member,
@@ -459,10 +459,12 @@ fn cloud_origin(origin: &Origin) -> Option<CloudOrigin> {
     }
 }
 
-/// The reply to `cloud add` or `cloud run` without `[cloud]`.
-fn cloud_off(what: &str) -> String {
+/// The reply to `cloud add` or `cloud run` from `origin` without `[cloud]`.
+fn cloud_off(what: &str, origin: &Origin) -> String {
     format!(
-        "Cloud hand-off is off on this agentd, so {what}. `cloud list` and `cloud rm` still work."
+        "Cloud hand-off is off on this agentd, so {what}. {} and {} still work.",
+        origin.command("cloud list"),
+        origin.command("cloud rm")
     )
 }
 
