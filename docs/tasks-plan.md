@@ -3126,24 +3126,27 @@ Deliverables:
       label.
     - `Full` for a new label past 20 for the member, counted in the
       transaction.
-    - `Unlinked` when the member no longer has a Claude link, checked in the
-      transaction by `claude_links::linked`, the store's shared link check.
+    - `Unlinked` (from T35c) when the member no longer has a Claude link,
+      checked in the transaction by `claude_links::linked`, the store's
+      shared link check.
       Against a `logout` that unlinks and then deletes the member's routines
       (T35c), the put either commits first, and the delete finds its row, or
       comes after the unlink and is refused.
   - `cloud_routine(member, label)` returns the routine id and the opened
-    token. `cloud_routines(member)` lists labels, ids and times, never
-    tokens.
+    token, and from T35c the registration it read, which
+    `begin_cloud_handoff` checks is still stored. `cloud_routines(member)`
+    lists labels, ids and times, never tokens.
   - `delete_cloud_routine(member, label)`, and
     `delete_cloud_routines_of(member)`, by the `MemberId`, for `logout` and
     a member Slack reports deleted. The latter also deletes the member's
     `cloud_handoffs`.
-  - `begin_cloud_handoff(&NewCloudHandoff { … }, per_hour, now)` seals
-    the task with `cloud_handoffs/task_enc/<id>` and, in one
-    `BEGIN IMMEDIATE` transaction, checks the member still has a Claude
-    link with `claude_links::linked`, as `put_cloud_routine` does, and
-    inserts the row as `sending`. It returns `CloudBegun`, inserting
-    nothing but for `Begun`:
+  - `begin_cloud_handoff(&NewCloudHandoff { … }, now)` seals the task
+    with `cloud_handoffs/task_enc/<id>`, inserts the row as `sending` and
+    returns its `CloudHandoffId`. From T35c it also takes `per_hour` and,
+    in one `BEGIN IMMEDIATE` transaction, checks the member still has a
+    Claude link with `claude_links::linked`, as `put_cloud_routine` does,
+    and that the routine's registration is still stored, and returns
+    `CloudBegun`, inserting nothing but for `Begun`:
     - `Begun(id)` for the row.
     - `RoutineGone` when the routine was removed, or its token replaced,
       since the command read it.
@@ -3210,14 +3213,13 @@ Acceptance, as tests named after the rules:
 - `a_routine_label_is_replaced_in_place`.
 - `a_routine_id_is_registered_once_per_member`.
 - `the_twenty_first_routine_is_refused`.
-- `a_routine_is_refused_without_a_claude_link`.
-- `a_handoff_is_refused_without_a_claude_link`.
+- `a_routine_is_refused_without_a_claude_link` (from T35c).
+- `a_handoff_is_refused_without_a_claude_link` (from T35c).
 - `a_routine_token_is_sealed_to_its_row`.
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`).
-- `finishing_a_deleted_handoff_is_a_no_op`.
+  `rejected`, and from T35c `Gone` for a deleted hand-off).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3319,17 +3321,19 @@ Deliverables:
   (T35a): the handler answers `CloudRoutinePut::Unlinked` as an unlinked
   `cloud add` and `CloudBegun::Unlinked` as an unlinked `cloud run`,
   having stored or sent nothing. A member Slack reports deleted keeps their
-  link, so a `cloud add` that races that deletion can still store a
-  routine, which then stays until the member logs out, and a racing
-  `cloud run` still writes and fires a hand-off, whose row goes at
-  `[cloud] retention_days`. A member only on Slack can't send `logout`
-  once Slack deleted them, so their routine stays sealed at rest
-  indefinitely, as their Claude link already does, and a store leaked with
-  its master key would yield its token, as the design's threat row on
-  routine tokens says. This is an accepted gap: it needs the member's own
-  command to land in the moment Slack deletes them, and through agentd
-  only that member can fire the token, from another of their identities;
-  for a member only on Slack, nobody can:
+  link, so a `cloud add` that races that deletion, or one sent later from
+  another of the member's identities, such as on Rocket.Chat, can still
+  store a routine, which then stays until the member logs out, and a
+  racing or later `cloud run` still writes and fires a hand-off, whose row
+  goes at `[cloud] retention_days`. A member only on Slack can't send
+  `logout` once Slack deleted them, so a routine a racing `cloud add`
+  stored stays sealed at rest indefinitely, as their Claude link already
+  does, and a store leaked with its master key would yield its token, as
+  the design's threat row on routine tokens says. This is an accepted gap:
+  for a member only on Slack it needs their own command to land in the
+  moment Slack deletes them, and then nobody can fire the token through
+  agentd; a member with another identity adds, fires and logs out from it
+  as before, and only they can fire the token:
   - Every `cloud` command is refused unless `Origin::is_private()`.
     `cloud add` in a room gets the secret-bearing refusal, with its own arm
     saying to revoke the token with **Regenerate** or **Revoke** at
