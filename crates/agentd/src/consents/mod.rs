@@ -538,6 +538,7 @@ impl Consents {
                 continue;
             };
             let agent = store.agent(consent.agent).await?;
+            let name = replies.name_of(&consent.requester.key).await;
             let claimed_at = Self::now();
             if !store
                 .claim_consent_card_close(consent.id, claimed_at)
@@ -546,7 +547,6 @@ impl Consents {
                 continue;
             }
             let files = attachments(&consent);
-            let name = replies.name_of(&consent.requester.key).await;
             let card = Card {
                 consent: &consent,
                 agent: agent.as_ref().map_or("this agent", |agent| &agent.name),
