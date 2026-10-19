@@ -9250,10 +9250,15 @@ posted again in that case.
 - A hand-off isn't read back, so a post a moderator deletes after it was
   made still hands off, and one retried after a shutdown can run up to an
   hour later.
-- A background process left from an earlier turn (see "What remains" in
-  the T18 notes) can also run `ask-agent` or post mentions in the next
-  turn, starting hops attributed to that turn's requester. Killing the
-  processes a turn leaves, the deferred fix there, removes this too.
+- A background process left from an earlier turn can also run
+  `ask-agent` or post mentions while a later turn runs, starting hops
+  attributed to that turn's requester. T21 recycles the container on a
+  requester change, which ends such a process before another requester's
+  turn, so the hops it starts are only ever attributed to the requester
+  whose turn left it, during their later turns in the session. Killing
+  what a turn leaves behind would close that too; the "Processes a turn
+  leaves running" bullet in [Deferred work](tasks-plan.md#deferred-work)
+  says why it is deferred.
 
 ### Open items
 
