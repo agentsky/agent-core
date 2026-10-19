@@ -372,7 +372,11 @@ pub fn later_ids(
 /// chain of `binding`'s recorded changes in `changes` reaches, taking a
 /// settled change to where Slack found the channel rather than to its new
 /// id, since that answer is later than the event; `start` if none leads
-/// on from it.
+/// on from it. It is the last id reached breadth first, which on a chain
+/// is the chain's end; when two changes lead on from one old id, as a
+/// forged or replayed pair would, it depends on the order they were
+/// recorded in, harmlessly, since any answer but the channel's own id
+/// leaves the change waiting.
 pub fn latest_id(
     changes: &[KnownChannelIdChange],
     binding: BindingId,
