@@ -35,8 +35,10 @@
 #    fake-anthropic's reply. The admin sets the community API key, and bob,
 #    who has linked no account, mentions the bot and gets the same answer.
 # 6. Checks fake-anthropic's log: a /v1/messages request on the access token
-#    it issued, one on the community key, and no request carrying any other
-#    value, so every turn went through the credential proxy's swap.
+#    it issued; from bob's mention on, at least one /v1/messages request and
+#    each on the community key, so bob's turn used no member's account; and
+#    no request carrying any other value, so every turn went through the
+#    credential proxy's swap.
 #
 # Build the images and fake-anthropic first, add the iptables rules that let
 # sandboxes reach agentd, then run it from anywhere:
