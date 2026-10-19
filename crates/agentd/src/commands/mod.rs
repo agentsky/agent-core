@@ -803,13 +803,14 @@ impl Commands {
             }
             None => (false, Some(0), Some(CloudDeleted::default())),
         };
-        let mut reply = if unlinked {
-            format!(
+        let failed = tokens.is_none() || cloud.is_none();
+        let mut reply = match (unlinked, failed) {
+            (true, false) => format!(
                 "Your Claude account is unlinked. Send {} to link one again.",
                 origin.command("login")
-            )
-        } else {
-            "No Claude account is linked.".to_owned()
+            ),
+            (true, true) => "Your Claude account is unlinked.".to_owned(),
+            (false, _) => "No Claude account is linked.".to_owned(),
         };
         if tokens.is_some_and(|tokens| tokens > 0) {
             reply.push_str(
@@ -817,7 +818,6 @@ impl Commands {
                  change apps as you.",
             );
         }
-        let failed = tokens.is_none() || cloud.is_none();
         let cloud = cloud.unwrap_or_default();
         let forgot: Vec<String> = [
             (cloud.routines > 0).then(|| cloud::routines_counted(cloud.routines)),
@@ -837,9 +837,10 @@ impl Commands {
         }
         if failed {
             reply.push_str(&format!(
-                " Something went wrong on my side before I deleted everything, so send {} again \
-                 in a minute.",
-                origin.command("logout")
+                " Something went wrong on my side and I couldn't delete everything, so send {} \
+                 again in a minute, before you send {}.",
+                origin.command("logout"),
+                origin.command("login")
             ));
         }
         Ok(reply)

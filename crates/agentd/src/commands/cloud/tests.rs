@@ -1647,15 +1647,11 @@ async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_aga
     )
     .await;
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
-    assert!(
-        reply.starts_with("Your Claude account is unlinked."),
-        "{reply}"
-    );
-    assert!(!reply.contains("forgot"), "{reply}");
-    assert!(!reply.contains("revoke"), "{reply}");
-    assert!(
-        reply.ends_with("so send `/agent logout` again in a minute."),
-        "{reply}"
+    assert_eq!(
+        reply,
+        "Your Claude account is unlinked. Something went wrong on my side and I couldn't \
+         delete everything, so send `/agent logout` again in a minute, before you send \
+         `/agent login`."
     );
     assert!(h.store.get_claude_link(alice).await.unwrap().is_none());
     assert_eq!(h.store.cloud_routines(alice).await.unwrap().len(), 1);

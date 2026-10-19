@@ -2950,7 +2950,7 @@ async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() 
 
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
     assert!(
-        reply.starts_with("Your Claude account is unlinked."),
+        reply.starts_with("Your Claude account is unlinked. I also forgot"),
         "{reply}"
     );
     assert!(
@@ -2964,8 +2964,8 @@ async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() 
     );
     assert!(
         reply.ends_with(
-            "Something went wrong on my side before I deleted everything, so send `/agent \
-             logout` again in a minute."
+            "Something went wrong on my side and I couldn't delete everything, so send `/agent \
+             logout` again in a minute, before you send `/agent login`."
         ),
         "{reply}"
     );
