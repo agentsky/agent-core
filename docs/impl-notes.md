@@ -5014,15 +5014,24 @@ credential, or act through `agentctl`, while B's turn runs. Restarting the
 process on a credential kind change doesn't help: the leftover isn't the CLI,
 and two members' subscriptions are the same kind.
 
-**Solution.** `Held` records the `Requester` whose turn started the container,
+**Solution.** `Held` records the requester whose turn started the container,
 and `ensure_process` stops the whole container, as it does a dead one or one
 with other mounts, when a turn's requester differs, before it looks at the
 process. Stopping the container ends its PID namespace and every process in
 it; stopping only the CLI would leave the leftovers running. It compares the
-full `Requester`, not the `CredentialRef`: a community-key turn of another
-requester also gets the agentctl token, so it gets a new container too. An
+requester, not the `CredentialRef`: a community-key turn of another requester
+also gets the agentctl token, so it gets a new container too. An
 agent-to-agent hop runs as the requester it inherits, so it keeps a container
-started for that requester. The cost is a container start and a `--resume` of
+started for that requester.
+
+Review noted that comparing the full `Requester` recycled the container when
+the requester's account was linked between two turns, flipping `member` from
+`None` to `Some`. It now compares `Requester::key` alone, which is as safe: a
+`MemberKey` names one member at most (`surface_identities` is keyed by it),
+and only ever the same one, since nothing rewrites or deletes an identity's
+member, so the key alone names the person. The credential that changes with a
+link, the community key to the member's subscription, changes the credential
+kind, and the fit check restarts the process in the kept container for it. The cost is a container start and a `--resume` of
 the transcript whenever consecutive turns of one session come from different
 requesters, as in a busy channel thread; a requester's own run of turns keeps
 the warm process. Only one requester's turns now share a warm process, so the
@@ -5030,7 +5039,9 @@ case the T20 note on `total_cost_usd` gives, of other members' turns on a
 shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
 no longer arises. `a_requester_change_replaces_the_container` checks that
 another requester's turn, a community-key one included, replaces the
-container, and that the same requester and a hop carrying it keep it.
+container, and that the same requester and a hop carrying it keep it;
+`a_requester_linked_between_turns_keeps_the_container` that a key gaining a
+member between turns keeps the container and restarts only the process.
 
 It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
 are the session's `home/`, `tmp/` and `claude/` on its volume, the working

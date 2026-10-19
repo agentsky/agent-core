@@ -1889,11 +1889,13 @@ Deliverables:
     ([impl-notes](impl-notes.md#mounts-come-from-the-turns-side)).
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
-  If the next turn's `Requester` differs from the one whose turn started the
+  If the next turn's requester differs from the one whose turn started the
   container, stop the container, which ends every process a turn left running
-  in it, and start a new one, whose process starts with `--resume`. An
-  agent-to-agent hop runs as the requester it inherits, so it keeps a
-  container started for that requester
+  in it, and start a new one, whose process starts with `--resume`.
+  Requesters are compared by `MemberKey`, so a requester whose account is
+  linked between two turns keeps the container. An agent-to-agent hop runs as
+  the requester it inherits, so it keeps a container started for that
+  requester
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
@@ -1916,7 +1918,8 @@ Acceptance:
   - A credential-kind change restarts the process.
   - A model change restarts the process.
   - Another requester's turn replaces the container; a turn of the same
-    requester, and an agent-to-agent hop carrying it, keep it.
+    requester, and an agent-to-agent hop carrying it, keep it, as does one
+    whose requester was linked to a member since.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
