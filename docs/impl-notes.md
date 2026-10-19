@@ -8585,10 +8585,11 @@ its claim and is tried on a later pass; one the platform refuses is not
 tried again, and the card's buttons answer that the task was settled.
 `claim_consent_card_close` sets `card_closed_at`, which is both the claim
 and the mark that the card was closed, so an instance that stops between
-the claim and `update_rich` (a crash, or a drain timeout aborting
-`close_cards` mid-update) leaves the card with live-looking buttons for
-good. `close_cards` reads the agent before claiming, so a store error
-there leaves no claim behind. Clicking such buttons is refused safely:
+the claim and the end of `update_rich` (a crash, or a drain timeout
+aborting `close_cards` mid-update) leaves the card with live-looking
+buttons for good. `close_cards` reads the agent and the requester's name
+(`name_of`, a surface call) before claiming, so a store error there leaves
+no claim behind and the window is the update alone. Clicking such buttons is refused safely:
 `Consents::decide` answers `Decided::Settled`, or `Decided::NotYours` once
 the agent is deleted. A lease apart from the done mark, as the relink
 notices got, would fix it, but needs a migration, which a cosmetic
