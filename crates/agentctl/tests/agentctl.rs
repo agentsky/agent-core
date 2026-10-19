@@ -590,8 +590,8 @@ async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
     out.refused("gave up waiting for the shared/ lock after the 1s timeout; agentd at ");
     assert!(
         out.stderr.ends_with(&format!(
-            ": timed out; couldn't give back a lease agentd may have granted (agentd at \
-             {url}: timed out), so it expires within its TTL\n"
+            ": timed out; couldn't give back the shared/ lock's lease (agentd at {url}: timed \
+             out); if agentd holds it, it expires within its TTL\n"
         )),
         "{out:?}"
     );
@@ -631,8 +631,11 @@ async fn a_signal_while_giving_up_at_the_lock_timeout_exits_with_the_signal() {
     assert_eq!(out.code, Some(143), "{out:?}");
     assert_eq!(
         out.stderr,
-        "agentctl: couldn't give back the shared/ lock agentd may have granted \
-         (interrupted); it expires on its own\n"
+        format!(
+            "agentctl: gave up waiting for the shared/ lock after the 1s timeout; agentd at \
+             {url}: timed out; couldn't give back the shared/ lock's lease (interrupted); if \
+             agentd holds it, it expires within its TTL\n"
+        )
     );
 }
 
@@ -833,7 +836,12 @@ async fn losing_the_lease_stops_the_command_and_frees_the_lock_at_once() {
             .unwrap()
             .unwrap(),
     );
-    out.refused("lost the shared/ lock (no turn is running");
+    assert_eq!(out.code, Some(1), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "agentctl: lost the shared/ lock (no turn is running for this process; agentctl works \
+         only during a turn); stopped the command\n"
+    );
     assert!(started.elapsed() < Duration::from_secs(10), "{out:?}");
 
     server
@@ -855,7 +863,46 @@ async fn losing_the_lease_stops_the_command_and_frees_the_lock_at_once() {
             .unwrap()
             .unwrap(),
     );
-    out.refused("lost the shared/ lock (the agentctl token is missing, revoked");
+    assert_eq!(out.code, Some(1), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "agentctl: lost the shared/ lock (the agentctl token is missing, revoked, or not valid \
+         from this container); stopped the command\n"
+    );
+}
+
+#[tokio::test]
+async fn a_lease_dropped_with_its_turn_is_not_reported_as_unreleased() {
+    let server = Server::start().await;
+    let (_, token) = server.turn().await;
+    let started = server.dir.join("started");
+    let go = server.dir.join("go");
+    let holder = server
+        .agentctl(&token)
+        .args([
+            "lock",
+            "--",
+            "sh",
+            "-c",
+            &format!(
+                "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
+                started.display(),
+                go.display()
+            ),
+        ])
+        .spawn()
+        .unwrap();
+    wait_for(&started).await;
+    server.ctl.end_turn(&token).await.unwrap();
+    std::fs::write(&go, "").unwrap();
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(0), "{out:?}");
+    assert_eq!(out.stderr, "", "{out:?}");
 }
 
 /// How [`FakeLock`] answers renewals and releases.
@@ -1187,8 +1234,8 @@ async fn a_lease_too_short_that_cant_be_given_back_says_so() {
         out.stderr,
         format!(
             "agentctl: the shared/ lock's lease is too short to hold (agentd granted 2s; \
-             agentctl needs at least 3s); couldn't give back a lease agentd may have granted \
-             (agentd at {}: timed out), so it expires within its TTL\n",
+             agentctl needs at least 3s); couldn't give back the shared/ lock's lease (agentd \
+             at {}: timed out); if agentd holds it, it expires within its TTL\n",
             fake.url
         )
     );
@@ -1215,8 +1262,8 @@ async fn a_command_that_cant_start_and_a_lease_that_cant_be_given_back_says_both
     out.refused(&format!("agentctl: can't run {}: ", missing.display()));
     assert!(
         out.stderr.ends_with(&format!(
-            "; couldn't give back a lease agentd may have granted (agentd at {}: timed out), \
-             so it expires within its TTL\n",
+            "; couldn't give back the shared/ lock's lease (agentd at {}: timed out); if \
+             agentd holds it, it expires within its TTL\n",
             fake.url
         )),
         "{out:?}"
@@ -1248,8 +1295,12 @@ async fn a_signal_while_releasing_after_a_command_that_cant_start_exits_with_the
     assert_eq!(out.code, Some(143), "{out:?}");
     assert_eq!(
         out.stderr,
-        "agentctl: couldn't give back the shared/ lock agentd may have granted \
-         (interrupted); it expires on its own\n"
+        format!(
+            "agentctl: can't run {}: No such file or directory (os error 2); couldn't give back \
+             the shared/ lock's lease (interrupted); if agentd holds it, it expires within its \
+             TTL\n",
+            missing.display()
+        )
     );
     assert_eq!(fake.released(), fake.granted(), "{out:?}");
 }
