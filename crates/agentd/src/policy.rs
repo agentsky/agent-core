@@ -381,9 +381,10 @@ pub fn later_ids(
 /// id, since that answer is later than the event; `start` if none leads
 /// on from it. It is the last id reached breadth first, which on a chain
 /// is the chain's end; when two changes lead on from one old id, as a
-/// forged or replayed pair would, it depends on the order they were
-/// recorded in, harmlessly, since any answer but the channel's own id
-/// leaves the change waiting.
+/// forged or replayed pair would, the end chosen depends on the order
+/// they were recorded in. Only the binding's signer could record such a
+/// pair, Slack or the agent's owner, who sees the app's signing secret,
+/// and only that agent's rules move.
 pub fn latest_id(
     changes: &[KnownChannelIdChange],
     binding: BindingId,
