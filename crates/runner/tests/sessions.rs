@@ -791,6 +791,38 @@ async fn a_requester_change_replaces_the_container() {
 }
 
 #[tokio::test]
+async fn a_requester_linked_between_turns_keeps_the_container() {
+    let h = Harness::new(&[Turn::reply("unlinked"), Turn::reply("linked")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    let mut first = request("one");
+    first.credential = CredentialRef::Community;
+    reply(&h.run(id, first.clone()).await);
+    let member = MemberId::new_v4();
+    let mut second = request("two");
+    second.requester.member = Some(member);
+    second.credential = CredentialRef::Member(member);
+    let report = h.run(id, second.clone()).await;
+    assert_eq!(reply(&report), "linked");
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert_eq!(
+        h.events(),
+        [
+            Event::ContainerStarted(id),
+            Event::ProcessStarting(id, CredentialKind::ApiKey, 1),
+            Event::TurnStarting(id, 1, first.turn),
+            Event::TurnFinished(id, 1, first.turn),
+            Event::ProcessStopping(id, 1),
+            Event::ProcessStarting(id, CredentialKind::Subscription, 2),
+            Event::TurnStarting(id, 2, second.turn),
+            Event::TurnFinished(id, 2, second.turn),
+        ],
+        "the same key keeps the container, and the new credential kind restarts the process"
+    );
+    assert_eq!(h.transcript(&session), ["one", "two"]);
+}
+
+#[tokio::test]
 async fn reset_starts_with_a_new_id() {
     let h = Harness::new(&[Turn::reply("old"), Turn::reply("new")]).await;
     let old = h.thread_session("1.1").await;
