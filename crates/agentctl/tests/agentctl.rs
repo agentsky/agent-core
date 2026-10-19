@@ -1233,6 +1233,34 @@ async fn a_lease_too_short_to_renew_is_given_back() {
     assert_eq!(fake.granted().len(), 1);
 }
 
+#[tokio::test]
+async fn a_lease_too_short_that_cant_be_given_back_says_so() {
+    let fake = FakeLock::start(2, 0, Renewals::Stall).await;
+    let dir = TempDir::new("agentctl-test");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "true"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(out.code, Some(1), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        format!(
+            "agentctl: the shared/ lock's lease is too short to hold (agentd granted 2s; \
+             agentctl needs at least 3s); couldn't give back a lease agentd may have granted \
+             (agentd at {}: timed out), so it expires within its TTL\n",
+            fake.url
+        )
+    );
+    assert_eq!(fake.released(), fake.granted());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn a_signal_during_acquire_gives_back_the_lease_it_was_granted() {
