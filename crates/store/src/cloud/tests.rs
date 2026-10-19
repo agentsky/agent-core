@@ -373,6 +373,11 @@ async fn a_routine_is_refused_without_a_claude_link() {
         put(&store, bob, "other", "trig_3", "v", 11).await,
         CloudRoutinePut::Unlinked
     );
+    assert_eq!(
+        put(&store, MemberId::new_v4(), "agent-core", "trig_4", "w", 12).await,
+        CloudRoutinePut::Unlinked,
+        "a member who doesn't exist has no link"
+    );
     assert!(store.cloud_routines(ada).await.unwrap().is_empty());
     assert_eq!(
         opened(&store, bob, "agent-core").await,
@@ -388,23 +393,25 @@ async fn a_handoff_is_refused_without_a_claude_link() {
     put(&store, ada, "agent-core", "trig_1", "sk", 10).await;
     let registration = registration(&store, ada, "agent-core").await;
     assert!(store.delete_claude_link(ada).await.unwrap());
-    let begun = store
-        .begin_cloud_handoff(
-            &NewCloudHandoff {
-                member: ada,
-                routine_label: "agent-core",
-                routine_id: &routine("trig_1"),
-                registration: &registration,
-                requested_by: &member_key("ada"),
-                origin: CloudOrigin::RocketChatDm,
-                task: "Fix the flaky test",
-            },
-            u32::MAX,
-            at(20),
-        )
-        .await
-        .unwrap();
-    assert_eq!(begun, CloudBegun::Unlinked);
+    for member in [ada, MemberId::new_v4()] {
+        let begun = store
+            .begin_cloud_handoff(
+                &NewCloudHandoff {
+                    member,
+                    routine_label: "agent-core",
+                    routine_id: &routine("trig_1"),
+                    registration: &registration,
+                    requested_by: &member_key("ada"),
+                    origin: CloudOrigin::RocketChatDm,
+                    task: "Fix the flaky test",
+                },
+                u32::MAX,
+                at(20),
+            )
+            .await
+            .unwrap();
+        assert_eq!(begun, CloudBegun::Unlinked, "{member}");
+    }
     assert!(
         store
             .recent_cloud_handoffs(ada, 100)
