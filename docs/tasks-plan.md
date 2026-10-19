@@ -3942,8 +3942,8 @@ Deliverables:
   one id form (the canonical id above, from T36e item 9). A copy whose
   fields don't name the organization is dropped unless the home check
   says home; the organization `users.info` gives is for logs only and
-  must never become the copy's `outside`, which would let a forged event
-  naming it stand.
+  must never become the copy's `outside`, since the event may not supply
+  what the copy lacks (T31): a forged event naming it would then stand.
 - Notices (`crates/agentd/src/pipeline`):
   - A personal refusal (ban, deny, `Outside`) of an outside requester is
     one line in the conversation, the same words whatever the reason,

@@ -1686,8 +1686,9 @@ member they name. The person's own organization is a separate field,
   actor's organization only in `user_team`, `source_team` and
   `user_profile.team`[^bolt-actor]. A lookup that says another workspace,
   or that Slack answers for no user, drops the message. It never makes the
-  sender outside: an organization only the lookup named could be put in a
-  forged event's fields and match.
+  sender outside, by T31's rule that the event may not supply what Slack's
+  copy lacks: an organization only the lookup named could otherwise be put
+  in an event's fields, a forged one's for example, and match.
 
   The check reads only senders Slack itself vouches for, never what an event
   says, and never a bot: `copy_sender_is_home` skips a sender with a bot
