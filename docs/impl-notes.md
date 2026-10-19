@@ -5800,11 +5800,14 @@ files and directories (a symlink or a special file in a zip is refused; a
 clone checks symlinks out as plain files holding their targets, and a
 symlink found in any tree is refused); modes rewritten to
 `0755` for directories and `0644`, or `0755` with an execute bit, for files.
-A `.zip` is read with the `zip` crate (MIT) with only
-`deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`
-and `typed-path`: stored or deflated entries, none encrypted, each counted
-as it inflates against its declared size, so a small archive can't unpack
-past the cap. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
+A `.zip` is read entry by entry with the `zip` crate (MIT, 9.x), never
+through its `extract`, the path RUSTSEC-2026-0367 to 0369 concern (8.x let
+an archive's set-id modes and symlinks through), with only
+`deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`,
+`typed-path` and, on macOS and the BSDs only, `nix` (MIT): stored or
+deflated entries, none encrypted, each counted as it inflates against
+its declared size, so a small archive can't unpack past the cap. macOS's
+`__MACOSX/` entries are skipped. `SKILL.md` is at the
 top or in the only top-level directory (anything else, a lone file at the
 top included, is "no SKILL.md"), at most 256 KB of UTF-8; its front
 matter, at most 16 KB between `---` lines (YAML's `...` doesn't close it), is read with `serde_norway`
