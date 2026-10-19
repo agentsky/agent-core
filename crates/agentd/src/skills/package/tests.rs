@@ -234,6 +234,7 @@ fn zip_entries_that_leave_the_directory_or_hide_are_refused() {
         "a//b",
         "./a",
         "a\\..\\b",
+        "a\\",
         "a\u{202e}txt.exe",
         "a\u{fe0f}b",
         "a\u{3164}b",
