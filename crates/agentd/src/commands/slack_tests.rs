@@ -2895,6 +2895,76 @@ async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() 
     global_logs().snapshot().assert_lacks("SECRET");
 }
 
+/// Stores a routine for `member`, who must be linked.
+async fn with_routine(store: &Store, member: MemberId) {
+    let routine_id: core_types::RoutineId = "trig_01ABCdef".parse().unwrap();
+    let token =
+        core_types::RoutineToken::parse(SecretString::from("sk-ant-oat01-ROUTINE-SECRET")).unwrap();
+    let put = store
+        .put_cloud_routine(
+            &store::NewCloudRoutine {
+                member,
+                label: "agent-core",
+                routine_id: &routine_id,
+                url_origin: "https://api.anthropic.com",
+                token: &token,
+                added_by: &slack_key("U0HUMAN01"),
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(put, store::CloudRoutinePut::Added(_)), "{put:?}");
+}
+
+#[tokio::test]
+async fn a_logout_deletes_the_token_although_the_first_deletes_fail() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    fail_token_deletes(&url, 2).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(
+        reply.starts_with("Your Claude account is unlinked."),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert_eq!(failures_left(&url).await, 0);
+    assert_eq!(h.stored(alice).await, None);
+}
+
+#[tokio::test]
+async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    with_routine(&h.store, alice).await;
+    fail_token_deletes(&url, 10).await;
+
+    assert_eq!(h.slash("U0HUMAN01", "logout").await, [FAILED.to_owned()]);
+    assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
+    assert!(h.stored(alice).await.is_some());
+    assert!(
+        h.store.cloud_routines(alice).await.unwrap().is_empty(),
+        "the routines go although the token stays"
+    );
+
+    sql(&url, "UPDATE token_write_failures SET remaining = 0;").await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(reply.starts_with("No Claude account is linked."), "{reply}");
+    assert!(
+        reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert_eq!(h.stored(alice).await, None);
+}
+
 /// Creates `count` public agents of `owner`'s, with names long enough that
 /// `list` needs more Slack messages than one `response_url` takes, and
 /// returns their names.

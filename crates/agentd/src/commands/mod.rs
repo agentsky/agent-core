@@ -94,6 +94,7 @@ use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
 use crate::cloud::FireClient;
+use crate::commands::slack_tokens::retry_store;
 use crate::consents::{Consents, Decided};
 use crate::pipeline::UNCONFIRMED_TEXT;
 use crate::policy::Limits;
@@ -766,12 +767,21 @@ impl Commands {
             Some(member) => {
                 self.inner.store.invalidate_pending_logins(member).await?;
                 let unlinked = self.inner.auth.logout(member).await?;
-                let tokens = self.inner.store.delete_slack_config_tokens(member).await?;
-                if tokens > 0 {
+                let store = &self.inner.store;
+                let tokens = retry_store("deleting configuration tokens at logout", member, || {
+                    store.delete_slack_config_tokens(member)
+                })
+                .await;
+                let cloud = retry_store("deleting cloud routines at logout", member, || {
+                    store.delete_cloud_routines_of(member)
+                })
+                .await;
+                if let Ok(tokens @ 1..) = tokens {
                     tracing::info!(%member, tokens, "deleted Slack configuration tokens at logout");
                 }
-                let cloud = self.inner.store.delete_cloud_routines_of(member).await?;
-                if cloud != CloudDeleted::default() {
+                if let Ok(cloud) = cloud
+                    && cloud != CloudDeleted::default()
+                {
                     tracing::info!(
                         %member,
                         routines = cloud.routines,
@@ -779,7 +789,7 @@ impl Commands {
                         "deleted cloud routines and hand-offs at logout"
                     );
                 }
-                (unlinked, tokens, cloud)
+                (unlinked, tokens?, cloud?)
             }
             None => (false, 0, CloudDeleted::default()),
         };
