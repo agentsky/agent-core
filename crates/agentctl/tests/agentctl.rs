@@ -668,6 +668,45 @@ async fn a_stalled_acquire_gives_up_at_the_lock_timeout() {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_signal_while_giving_up_at_the_lock_timeout_exits_with_the_signal() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let releasing = Arc::new(Notify::new());
+    let accepted = releasing.clone();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+            if held.len() == 2 {
+                accepted.notify_one();
+            }
+        }
+    });
+    let dir = TempDir::new("agentctl-test");
+    let holder = agentctl(&url, "tok", dir.path())
+        .args(["lock", "--timeout", "1", "--", "true"])
+        .spawn()
+        .unwrap();
+    tokio::time::timeout(WAIT, releasing.notified())
+        .await
+        .expect("agentctl never gave the lease back");
+    terminate(&holder);
+    let out = Run::from(
+        tokio::time::timeout(WAIT, holder.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(out.code, Some(143), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "agentctl: couldn't give back the shared/ lock agentd may have granted \
+         (interrupted); it expires on its own\n"
+    );
+}
+
 #[tokio::test]
 async fn an_acquire_whose_last_answer_was_lost_gives_back_the_lease_it_may_have_been_granted() {
     let fake = FakeLock::start(30, 0, Renewals::Grant).await;

@@ -3248,7 +3248,7 @@ Acceptance, as tests named after the rules:
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`, and from T35c `Gone` for a deleted hand-off).
+  `rejected`, and from T35c `Gone` for a hand-off that isn't there).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3369,10 +3369,10 @@ gives and returns the outcome alone: `FireOutcome` is
 `FireClient::origin()` and a task `cloud::check_task` refuses (empty or
 over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
 `Rejected` with no status. That origin check compares `url_origin` with
-`FireClient::origin()` as two strings `url::Origin::ascii_serialization`
-wrote, which is correct: equal strings are equal origins, and a mismatch
-only leaves the token unsent, so it needs no parsing; parsing the stored
-origin, as T35a decided, is for T35c's check. Building the client fails with
+`FireClient::origin()` as strings, which is sound at T35b because the store
+holds only what `url::Origin::ascii_serialization` wrote; T35c replaces it
+with `FireClient::fires_for`, which parses the stored origin as T35a decided,
+so `fire` and the command share one rule. Building the client fails with
 `FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
 not at most equal, so a connection that never opened is always
 `rejected`. `Retry-After` is capped at a day. Each fire is one request on
