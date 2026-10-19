@@ -3169,13 +3169,26 @@ failed: refusing a lease too short or too long to hold, which agentd had
 certainly granted, or an answer for another lease said nothing, so the
 session couldn't tell why the next `lock` waited. Every give-back now
 adds that the lease expires within its TTL when its release fails. The
-release after a command that couldn't be started, or that was stopped
-because its lease was lost, had both gaps too: a failed release went
-unsaid, and a signal during it made `lock` exit 1 with the command's
-error. It now ends the same way as a give-back. A signal during the
-release after the command exits is different: the command's work is
-done, so agentctl reports it as a failed release and `lock` exits with
-the command's own status.
+release after a command that couldn't be started or waited for, or that
+was stopped because its lease was lost, had both gaps too: a failed
+release went unsaid, and a signal during it made `lock` exit 1 with the
+command's error. It now ends the same way as a give-back, and a signal
+during any give-back still says why `lock` failed before it exits with
+the signal, so a command that couldn't be found doesn't look like one
+that was interrupted. A signal during the release after the command
+exits is different: the command's work is done, so agentctl reports it
+as a failed release and `lock` exits with the command's own status.
+
+Review then found that a lease lost because the turn ended or the token
+was revoked was reported as maybe still held: agentd refused the release
+for the same reason as the renewal, and `lock` added that the lease
+expires within its TTL, repeating the reason. agentd had deleted the
+lease already, since ending a turn and revoking or replacing a token
+delete the session's leases, and those are the only reasons it refuses a
+release. A release refused with anything but agentd's internal error now
+counts as given back wherever agentctl releases, so only one that failed
+in transit, couldn't connect, or got the internal error says the lease
+may still be held.
 
 ### The command runs in its own process group
 
@@ -5855,8 +5868,13 @@ an archive's set-id modes and symlinks through), with only
 `deflate-flate2-zlib-rs`, which adds `flate2`, `zlib-rs` (Zlib), `crc32fast`,
 `typed-path` and, on macOS and the BSDs only, `nix` (MIT): stored or
 deflated entries, none encrypted, each counted as it inflates against
-its declared size, so a small archive can't unpack past the cap. macOS's
-`__MACOSX/` entries are skipped. `SKILL.md` is at the
+its declared size, so a small archive can't unpack past the cap. An
+entry's Unix mode is read from the high 16 bits of its external attributes
+even when it is tagged as made on MS-DOS, where `zip` 9.0.5 makes up a
+plain file's mode, so such an entry can't hide a symlink or a FIFO. An
+archive that names an entry twice, or whose local headers disagree with
+its central directory, is refused rather than unpacked with one of the
+two. macOS's `__MACOSX/` entries are skipped. `SKILL.md` is at the
 top or in the only top-level directory (anything else, a lone file at the
 top included, is "no SKILL.md"), at most 256 KB of UTF-8; its front
 matter, at most 16 KB between `---` lines (YAML's `...` doesn't close it), is read with `serde_norway`
