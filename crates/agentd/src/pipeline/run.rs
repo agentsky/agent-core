@@ -3591,6 +3591,7 @@ mod tests {
                 user: "U1".into(),
                 ..bot.clone()
             },
+            outside: None,
         };
         let answered = MsgRef {
             conv: conv.clone(),
