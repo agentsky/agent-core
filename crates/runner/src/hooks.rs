@@ -58,7 +58,9 @@ pub struct TurnRequest {
     /// from the one whose turn started the warm container stops the
     /// container, and every process left running in it, and starts another,
     /// resuming from the transcript, since the turn's credential and its
-    /// agentctl token would otherwise reach those processes. Files an
+    /// agentctl token would otherwise reach those processes. Requesters
+    /// differ when their [`key`](Requester::key)s do: a member linked
+    /// between two turns of the same key keeps the container. Files an
     /// earlier turn left in the session's directories are kept. An
     /// agent-to-agent hop runs as the requester it inherits, so it keeps a
     /// container started for that requester.
