@@ -3142,10 +3142,14 @@ the lease expires on its own. And only giving up said when the release
 failed: refusing a lease too short or too long to hold, which agentd had
 certainly granted, or an answer for another lease said nothing, so the
 session couldn't tell why the next `lock` waited. Every give-back now
-adds that the lease expires within its TTL when its release fails. A
-signal during the release after the command exits is different: the
-command's work is done, so agentctl reports it as a failed release and
-`lock` exits with the command's own status.
+adds that the lease expires within its TTL when its release fails. The
+release after a command that couldn't be started, or that was stopped
+because its lease was lost, had both gaps too: a failed release went
+unsaid, and a signal during it made `lock` exit 1 with the command's
+error. It now ends the same way as a give-back. A signal during the
+release after the command exits is different: the command's work is
+done, so agentctl reports it as a failed release and `lock` exits with
+the command's own status.
 
 ### The command runs in its own process group
 
