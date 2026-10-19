@@ -599,8 +599,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if a query fails, as when the member doesn't
-    /// exist, [`StoreError::Seal`] if the token can't be sealed.
+    /// [`StoreError::Database`] if a query fails, [`StoreError::Seal`] if
+    /// the token can't be sealed. A member who doesn't exist has no Claude
+    /// link, so is answered [`CloudRoutinePut::Unlinked`], not an error.
     pub async fn put_cloud_routine(
         &self,
         routine: &NewCloudRoutine<'_>,
@@ -805,8 +806,9 @@ impl Store {
     ///
     /// # Errors
     ///
-    /// [`StoreError::Database`] if a query fails, as when the member
-    /// doesn't exist, [`StoreError::Seal`] if the task can't be sealed.
+    /// [`StoreError::Database`] if a query fails, [`StoreError::Seal`] if
+    /// the task can't be sealed. A member who doesn't exist has no Claude
+    /// link, so is answered [`CloudBegun::Unlinked`], not an error.
     pub async fn begin_cloud_handoff(
         &self,
         handoff: &NewCloudHandoff<'_>,

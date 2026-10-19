@@ -210,8 +210,9 @@ impl Commands {
 /// Runs `op` until it succeeds or has failed [`STORE_ATTEMPTS`] times,
 /// waiting a little longer after each failure, for store work a passing
 /// error mustn't lose: a pair `tooling.tokens.rotate` returned, which
-/// used up the old refresh token, or the deletion of a departed member's
-/// token and cloud routines, whose Slack event isn't delivered again. Each
+/// used up the old refresh token, the deletion of a departed member's
+/// token and cloud routines, whose Slack event isn't delivered again, or
+/// `logout`'s deletion of the same once the member is unlinked. Each
 /// failure but the last is logged with `what`, naming the work, and
 /// `member`, an id of whose it is; the last is returned for the caller to
 /// log.
