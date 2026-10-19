@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use core_types::{
-    AgentId, ConsentId, CredentialKind, Requester, ScopeKey, SessionId, Side, ThreadKey, TurnKind,
+    AgentId, ConsentId, CredentialKind, MemberKey, ScopeKey, SessionId, Side, ThreadKey, TurnKind,
     VolumeKey,
 };
 use futures::{FutureExt, StreamExt};
@@ -158,9 +158,9 @@ struct Warm<H: TurnHooks> {
 struct Held<H: TurnHooks> {
     container: Container,
     mounts: Mounts,
-    /// The requester of the turn that started it. Only their turns run in
-    /// it: see `Inner::ensure_process`.
-    requester: Requester,
+    /// The surface identity of the requester whose turn started it. Only
+    /// their turns run in it: see `Inner::ensure_process`.
+    requester: MemberKey,
     tracked: Arc<Tracked<H>>,
     process: Option<Running<H>>,
     _scope_permit: OwnedSemaphorePermit,
@@ -739,8 +739,13 @@ impl<H: TurnHooks> Inner<H> {
     /// A container started for another requester goes, process and all,
     /// as a dead one or one with other mounts does, so nothing an earlier
     /// requester's turn left running sees this turn's credential or
-    /// agentctl token. An agent-to-agent hop runs as the requester it
-    /// inherits, so it keeps a container started for that requester.
+    /// agentctl token. Requesters are compared by their surface identity,
+    /// `Requester::key`: a key names one member at most, and only ever the
+    /// same one, so a requester whose account was linked between two turns
+    /// keeps the container, and the credential kind that changes with it
+    /// restarts only the process. An agent-to-agent hop runs as the
+    /// requester it inherits, so it keeps a container started for that
+    /// requester.
     ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
@@ -766,7 +771,7 @@ impl<H: TurnHooks> Inner<H> {
         let kind = request.credential.kind();
         if let Some(held) = &warm.held {
             let dead = held.tracked.state().dead;
-            if dead || held.mounts != mounts || held.requester != request.requester {
+            if dead || held.mounts != mounts || held.requester != request.requester.key {
                 self.release_container(warm).await?;
             }
         }
@@ -784,7 +789,7 @@ impl<H: TurnHooks> Inner<H> {
             Some(held) => warm.held.insert(held),
             None => {
                 let held = self
-                    .start_container(session, mounts, &request.requester, warm.slot.clone())
+                    .start_container(session, mounts, &request.requester.key, warm.slot.clone())
                     .await?;
                 warm.held.insert(held)
             }
@@ -850,13 +855,14 @@ impl<H: TurnHooks> Inner<H> {
         }
     }
 
-    /// Starts a container for `session` and `requester`'s turns once both
-    /// caps have room, and tracks it.
+    /// Starts a container for `session` and the turns of the requester
+    /// whose surface identity is `requester`, once both caps have room, and
+    /// tracks it.
     async fn start_container(
         &self,
         session: &Session,
         mounts: Mounts,
-        requester: &Requester,
+        requester: &MemberKey,
         slot: Weak<AsyncMutex<Warm<H>>>,
     ) -> Result<Held<H>> {
         let volume_key = session.volume();
@@ -1212,7 +1218,7 @@ async fn follow_events<H: TurnHooks>(weak: Weak<Inner<H>>) {
 
 #[cfg(test)]
 mod tests {
-    use core_types::{ConvRef, MemberKey, Requester, SurfaceKind};
+    use core_types::{ConvRef, Requester, SurfaceKind};
 
     use super::*;
 
