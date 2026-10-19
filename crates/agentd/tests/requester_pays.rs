@@ -602,6 +602,34 @@ async fn another_requester_gets_a_new_process_and_the_same_one_keeps_it() {
 }
 
 #[tokio::test]
+async fn a_requester_who_links_between_turns_moves_to_their_account_in_a_new_process() {
+    let stack = start(Duration::from_secs(86_400)).await;
+    stack
+        .command(ADMIN, &format!("admin api-key set {COMMUNITY_KEY}"))
+        .await;
+    let (_, _, first) = stack
+        .answer(stack.mention("carol", "GENERAL", "k1", None))
+        .await;
+    assert_eq!(first, community(DEFAULT_MODEL));
+    link(stack.store(), "carol", None, Duration::from_secs(86_400)).await;
+    let (_, _, second) = stack
+        .answer(stack.mention("carol", "GENERAL", "k2", Some("k1")))
+        .await;
+    assert_eq!(
+        second,
+        bearer("token-of-carol", DEFAULT_MODEL),
+        "the same requester's next turn runs on the account she linked"
+    );
+    let pids = stack.pids();
+    assert_eq!(pids.len(), 2);
+    assert_ne!(
+        pids[0], pids[1],
+        "the same requester and model on another credential kind: the process restarts"
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
 async fn without_a_community_key_an_unlinked_member_is_asked_to_link_and_nothing_runs() {
     let stack = start(Duration::from_secs(86_400)).await;
     let before = stack.agents.calls().len();
