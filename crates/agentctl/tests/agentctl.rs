@@ -919,6 +919,9 @@ enum Renewals {
     OtherLease,
     /// It grants every renewal.
     Grant,
+    /// It grants every renewal, and fails every release with agentd's
+    /// internal error.
+    FailReleases,
 }
 
 /// How [`FakeLock`] answers an acquire instead of simply granting it.
@@ -1102,6 +1105,9 @@ async fn fake_lock(
             if state.renewals == Renewals::Stall {
                 return std::future::pending().await;
             }
+            if state.renewals == Renewals::FailReleases {
+                return internal_error();
+            }
             Json(LockResponse::Released).into_response()
         }
     }
@@ -1241,6 +1247,58 @@ async fn a_lease_too_short_that_cant_be_given_back_says_so() {
     );
     assert!(!marker.exists(), "{out:?}");
     assert_eq!(fake.released(), fake.granted());
+}
+
+#[tokio::test]
+async fn a_release_that_gets_agentds_internal_error_says_the_lease_may_be_held() {
+    let fake = FakeLock::start(2, 0, Renewals::FailReleases).await;
+    let dir = TempDir::new("agentctl-test");
+    let marker = dir.join("ran");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "touch", marker.to_str().unwrap()])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(out.code, Some(1), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "agentctl: the shared/ lock's lease is too short to hold (agentd granted 2s; agentctl \
+         needs at least 3s); couldn't give back the shared/ lock's lease (agentd failed; try \
+         again); if agentd holds it, it expires within its TTL\n"
+    );
+    assert!(!marker.exists(), "{out:?}");
+    assert_eq!(fake.released(), fake.granted());
+}
+
+#[tokio::test]
+async fn a_release_after_the_command_that_gets_agentds_internal_error_is_reported() {
+    let fake = FakeLock::start(30, 0, Renewals::FailReleases).await;
+    let dir = TempDir::new("agentctl-test");
+    let out = Run::from(
+        tokio::time::timeout(
+            WAIT,
+            agentctl(&fake.url, "tok", dir.path())
+                .args(["lock", "--", "true"])
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(out.code, Some(0), "{out:?}");
+    assert_eq!(
+        out.stderr,
+        "agentctl: releasing the shared/ lock failed (agentd failed; try again); it expires on \
+         its own\n"
+    );
+    assert_eq!(fake.released(), fake.granted());
+    assert_eq!(fake.granted().len(), 1);
 }
 
 #[tokio::test]
