@@ -211,8 +211,9 @@ pub enum Refused {
     /// An attached file that is neither a `.md` nor a `.zip`.
     #[error("Attach the skill as its SKILL.md, or as a .zip holding it.")]
     FileKind,
-    /// The agent has as many skills as it may.
-    #[error("An agent may have at most {MAX_SKILLS} skills. Remove one first with `skill rm`.")]
+    /// The agent has as many skills as it may. The command's reply adds how
+    /// to remove one, as the member types it where they sent the command.
+    #[error("An agent may have at most {MAX_SKILLS} skills.")]
     TooMany,
     /// Another change to the skill is in progress.
     #[error("Another change to this skill is in progress. Try again in a moment.")]
