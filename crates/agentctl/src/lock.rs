@@ -27,21 +27,27 @@
 //! `--timeout` runs out. agentctl then gives back the lease, which an
 //! attempt whose answer was lost may have been granted, before it fails. An
 //! answer for a lease other than the one named is agentd misbehaving, and
-//! `lock` fails on it. Whenever `lock` fails after giving back a lease, as
-//! in these cases, for a lease too short or too long to hold, or when the
+//! `lock` fails on it. An acquire agentd refuses for any other reason, or
+//! one that can't connect to agentd (its name doesn't resolve, the
+//! connection is refused, or connecting takes over five seconds), fails at
+//! once, so a wrong URL or an agentd that is down is reported straight
+//! away; if an earlier attempt's answer was lost, agentctl gives back the
+//! lease first. Whenever `lock` fails after giving back a lease, as in
+//! these cases, for a lease too short or too long to hold, or when the
 //! command can't be started or waited for or the lease is lost while it
 //! runs, its error adds when that release failed too, leaving a lease
 //! agentd may hold to expire within its TTL. A release agentd refuses
 //! because the turn has ended, the token is gone, or a private task has
 //! started has nothing left to give back: agentd gives those refusals only
-//! after deleting the session's leases. Any other refusal is a failed
-//! release. An acquire that can't connect to agentd (its name doesn't
-//! resolve, the connection is refused, or connecting takes over five
-//! seconds) fails at once, so a wrong URL or an agentd that is down is
-//! reported straight away. A renewal that can't connect is
-//! retried like any other failed in transit: the command already runs under
-//! the lease, the deadline bounds the retries, and a brief outage shouldn't
-//! kill it.
+//! after deleting the session's leases, so an acquire it refuses for those
+//! reasons gives nothing back either. agentd also refuses a valid token
+//! sent from an address other than the one it is bound to, deleting
+//! nothing, but that can't happen to agentctl: it sends every request
+//! straight from its container's address, and agentd deletes a token's
+//! leases before binding that address to another token. Any other refusal
+//! is a failed release. A renewal that can't connect is retried like any
+//! other failed in transit: the command already runs under the lease, the
+//! deadline bounds the retries, and a brief outage shouldn't kill it.
 //!
 //! Each attempt is given the time left, at least seven seconds and at most
 //! thirty. Every attempt names the same lease, so one that agentd granted
@@ -198,6 +204,7 @@ async fn acquire(
     let request = LockRequest::Acquire { lease };
     let mut wait = FIRST_RETRY;
     let mut told = false;
+    let mut lost = false;
     loop {
         let sent = Instant::now();
         let limit = give_up.saturating_duration_since(sent).max(ATTEMPT_FLOOR);
@@ -233,8 +240,17 @@ async fn acquire(
                 "another command holds it".to_owned()
             }
             Err(Failure::Refused(err)) if err.code == CtlErrorCode::Internal => err.message,
-            Err(err @ (Failure::Refused(_) | Failure::Unreachable(_))) => return Err(err.into()),
-            Err(Failure::Transport(message)) => message,
+            Err(Failure::Transport(message)) => {
+                lost = true;
+                message
+            }
+            Err(Failure::Refused(err)) if lost && !dropped_with_the_lease(err.code) => {
+                return give_back(client, lease, stop, err.message).await;
+            }
+            Err(Failure::Unreachable(message)) if lost => {
+                return give_back(client, lease, stop, message).await;
+            }
+            Err(err) => return Err(err.into()),
         };
         if Instant::now() + wait > give_up {
             let why = format!(
@@ -371,8 +387,11 @@ async fn hold(
 /// comes first. The refusals agentd gives only after deleting the session's
 /// leases count as given back: no turn, once the turn the lease was taken
 /// under has ended; unauthorized, once the token is revoked or replaced;
-/// and refused, once a private task has started in its place. Any other
-/// refusal leaves the lease as it was, so it counts as a failed release.
+/// and refused, once a private task has started in its place. Unauthorized
+/// also answers a valid token from the wrong address, deleting nothing, but
+/// agentctl's requests all come from the address its token is bound to. Any
+/// other refusal leaves the lease as it was, so it counts as a failed
+/// release.
 async fn release(client: &Client, lease: LeaseId, stop: &mut Stop) -> Result<(), Unreleased> {
     let request = LockRequest::Release { lease };
     tokio::select! {
@@ -602,6 +621,26 @@ mod tests {
         assert_eq!(renew_wait(Duration::from_secs(30)), Duration::from_secs(10));
         assert_eq!(renew_wait(Duration::ZERO), MIN_RENEW_WAIT);
         assert_eq!(renew_wait(Duration::from_millis(300)), MIN_RENEW_WAIT);
+    }
+
+    #[test]
+    fn only_the_refusals_agentd_gives_after_deleting_the_lease_count_as_given_back() {
+        for code in [
+            CtlErrorCode::NoTurn,
+            CtlErrorCode::Unauthorized,
+            CtlErrorCode::Refused,
+        ] {
+            assert!(dropped_with_the_lease(code), "{code:?}");
+        }
+        for code in [
+            CtlErrorCode::Internal,
+            CtlErrorCode::BadRequest,
+            CtlErrorCode::NotFound,
+            CtlErrorCode::TooLarge,
+            CtlErrorCode::NotAvailable,
+        ] {
+            assert!(!dropped_with_the_lease(code), "{code:?}");
+        }
     }
 
     #[cfg(unix)]
