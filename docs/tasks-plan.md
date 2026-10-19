@@ -1550,7 +1550,11 @@ Deliverables:
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
   given environment and working directory, and `ip` returns `127.0.0.1`. It
-  isolates nothing, and says so in its rustdoc.
+  isolates nothing, and says so in its rustdoc. Since every running container
+  shares that address, it supports one running container at a time wherever
+  agentd binds something to an address (agentctl tokens, T15; credential
+  placeholders, T18), which revokes the other sessions' there
+  ([impl-notes](impl-notes.md#processsandbox-gives-every-container-one-address)).
 - `reap_orphans()` at startup: stop every container labeled `agentd.session`
   with this agentd's `agentd.instance`.
   Placeholder mappings and agentctl tokens don't survive a restart, so no

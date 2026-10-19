@@ -5057,6 +5057,26 @@ still use its own requester's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Killing leftover processes at turn end")
 records both, with a way to narrow the files' part.
 
+### `ProcessSandbox` gives every container one address
+
+**Issue.** Review noted that `ProcessSandbox::ip` answers `127.0.0.1` for
+every container, while agentd relies on an address holding one container
+at a time: `put_ctl_token` deletes every other token and lease bound to
+the address, and `Registry::mint` revokes other sessions' placeholders
+there. Two sessions running at once on it with real hooks would revoke
+each other's agentctl token and placeholders.
+
+**Solution.** It stays one address, and its rustdoc and the plan say it
+supports one running container at a time for those rules. Distinct
+loopback addresses per container wouldn't work end to end: its processes
+are local children that don't bind a source address, and Linux gives a
+connection to any `127.0.0.0/8` address the source `127.0.0.1`, so agentd
+would see every process at `127.0.0.1` whatever `ip` returned. T21's
+tests that run two sessions at once use fake hooks, which bind nothing to
+the address. A test that needs two live sessions with real hooks gives
+each its own address another way, as agentctl's integration tests do
+([T15](#one-token-per-container-address-too)).
+
 ### How turns queue and survive their caller
 
 **Issue.** The plan asks for a keyed queue in arrival order, and for
