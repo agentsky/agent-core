@@ -398,7 +398,7 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
             return Err(Problem::Symlink.into());
         }
         let is_dir = entry.is_dir();
-        let name = entry.name().to_owned();
+        let name = entry.name().map_err(|_| Problem::Archive)?.into_owned();
         let parts: Vec<&str> = name
             .strip_suffix('/')
             .filter(|_| is_dir)
