@@ -127,6 +127,13 @@ impl Rule {
     }
 
     /// Whether `self` and `other` name the same member, room or everyone.
+    ///
+    /// Members are compared by the identity named, not by `member`: that
+    /// relies on each member having one surface identity, which holds while
+    /// `Store::ensure_member` is the only writer of `surface_identities`.
+    /// Linking a second identity to a member would need this to compare
+    /// members: otherwise an `allow` naming one identity wouldn't lift a
+    /// `deny` naming another, and both rules would stand.
     fn same_target(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Member { key: a, .. }, Self::Member { key: b, .. }) => a == b,

@@ -2705,15 +2705,19 @@ impl Delivery<'_> {
     }
 
     /// The managed agents `posted` mentions, other than the poster and the
-    /// agents handed to or passed over already, each once: those whose bot
-    /// is active on the conversation's surface and team and that have a
-    /// place among the turn's [`MAX_HAND_OFFS`] ([`Handing::has_place`]),
-    /// and those to pass over. A mention is of an agent when any of its
-    /// bots, in any state, is the user mentioned, as the router reads it,
-    /// so an agent mentioned through a bot that isn't active is passed
-    /// over, and its hop claimed, rather than left for the platform's copy;
-    /// unless the turn asked it, when it is left for its ask post, which
-    /// mentions its active bot, so an accepted ask is never passed over.
+    /// agents handed to or passed over already, each once, in the order of
+    /// their first mention: those mentioned through a bot that is active on
+    /// the conversation's surface and team and that have a place among the
+    /// turn's [`MAX_HAND_OFFS`] ([`Handing::has_place`]), and those to pass
+    /// over. A mention is of an agent when any of its bots, in any state, is
+    /// the user mentioned, as the router reads it. All of a post's mentions
+    /// are resolved to agents first, so an agent mentioned through an active
+    /// bot is handed off whatever other bots of its the post mentions, and
+    /// in whichever order. One mentioned only through bots that aren't
+    /// active is passed over, and its hop claimed, rather than left for the
+    /// platform's copy; unless the turn asked it, when it is left for its
+    /// ask post, which mentions its active bot, so an accepted ask is never
+    /// passed over.
     ///
     /// # Errors
     ///
@@ -2724,8 +2728,7 @@ impl Delivery<'_> {
         posted: &Posted,
         handing: &Handing,
     ) -> Result<(Vec<Agent>, Vec<AgentId>), StoreError> {
-        let mut mentioned: Vec<Agent> = Vec::new();
-        let mut over = Vec::new();
+        let mut found: Vec<(AgentId, Option<Agent>)> = Vec::new();
         for user in &posted.mentions {
             let key = MemberKey {
                 surface: target.conv.surface,
@@ -2735,18 +2738,30 @@ impl Delivery<'_> {
             let Some(id) = self.store.agent_of_bot_user(&key).await? else {
                 continue;
             };
-            if id == self.agent
-                || handing.handed_to(id)
-                || handing.passed.contains(&id)
-                || mentioned.iter().any(|seen| seen.id == id)
-                || over.contains(&id)
-            {
+            if id == self.agent || handing.handed_to(id) || handing.passed.contains(&id) {
                 continue;
             }
-            match self.store.agent_for_bot(&key).await? {
-                Some((agent, _)) if agent.id == id && handing.has_place(id, &mentioned) => {
-                    mentioned.push(agent);
+            let index = match found.iter().position(|(seen, _)| *seen == id) {
+                Some(index) => index,
+                None => {
+                    found.push((id, None));
+                    found.len() - 1
                 }
+            };
+            if found[index].1.is_none() {
+                found[index].1 = self
+                    .store
+                    .agent_for_bot(&key)
+                    .await?
+                    .map(|(agent, _)| agent)
+                    .filter(|agent| agent.id == id);
+            }
+        }
+        let mut mentioned: Vec<Agent> = Vec::new();
+        let mut over = Vec::new();
+        for (id, active) in found {
+            match active {
+                Some(agent) if handing.has_place(id, &mentioned) => mentioned.push(agent),
                 _ if handing.asked.contains(&id) => {}
                 _ => over.push(id),
             }
@@ -3534,6 +3549,93 @@ mod tests {
              through, and keeps its place for its ask post"
         );
         assert!(!handing.passed.contains(&ghost));
+    }
+
+    #[tokio::test]
+    async fn a_post_mentioning_an_agents_old_and_current_bots_hands_off_in_either_order() {
+        use sqlx::Connection as _;
+        let dir = TempDir::new("agentd-hand-offs");
+        let key = store::Sealer::generate_key().unwrap();
+        let store = Store::open(&dir.db_url(), store::Sealer::from_base64(&key).unwrap())
+            .await
+            .unwrap();
+        let (poster, binding) = bot_agent(&store, "helper", "U1BOT").await;
+        let (writer, _) = bot_agent(&store, "writer", "U2").await;
+        let (old, _) = inactive_bot_agent(&store, "old", "U9").await;
+        let mut db = sqlx::SqliteConnection::connect(&dir.db_url())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_bindings SET agent_id = ? WHERE agent_id = ?")
+            .bind(writer.to_string())
+            .bind(old.to_string())
+            .execute(&mut db)
+            .await
+            .unwrap();
+        let surface = testkit::MockSurface::new();
+        for user in ["U2", "U9"] {
+            surface.name_user(user, core_types::UserId::from(user));
+        }
+        let conv = ConvRef {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            conversation: "C1".into(),
+        };
+        let bot = MemberKey {
+            surface: core_types::SurfaceKind::Slack,
+            team: "T1".into(),
+            user: "U1BOT".into(),
+        };
+        let requester = Requester {
+            member: None,
+            key: MemberKey {
+                user: "U1".into(),
+                ..bot.clone()
+            },
+        };
+        let answered = MsgRef {
+            conv: conv.clone(),
+            id: "1.1".into(),
+        };
+        let delivery = Delivery {
+            store: &store,
+            surface: &surface,
+            session: SessionId::new_v4(),
+            agent: poster,
+            requester: &requester,
+            hop: Hop::ZERO,
+            credential: CredentialRef::Community,
+            target: ReplyTarget {
+                conv: conv.clone(),
+                thread_root: Some("1.1".into()),
+            },
+            answering: Answering::Message(&answered),
+            hand_offs: Some(HandOffs {
+                conv_kind: ConvKind::Channel,
+                bot: bot.clone(),
+                binding,
+                now: time::macros::datetime!(2030-01-01 0:00 UTC),
+                holder: Holder::default(),
+            }),
+        };
+        for text in ["@U9 then @U2", "@U2 then @U9"] {
+            let turn = TurnId::new_v4();
+            let mut handing = Handing::default();
+            assert!(delivery.post(Some(turn), text, &mut handing).await.is_ok());
+            let handed: Vec<AgentId> = handing.handed.iter().map(|handed| handed.agent).collect();
+            assert_eq!(
+                handed,
+                [writer],
+                "a mention of the agent's active bot hands off, whichever comes first: {text}"
+            );
+            assert!(handing.passed.is_empty(), "{text}");
+            assert!(
+                !store
+                    .event_processed(HOP_SOURCE, &hop_key(writer, turn))
+                    .await
+                    .unwrap(),
+                "its hop isn't claimed as passed over: {text}"
+            );
+        }
     }
 
     #[test]
