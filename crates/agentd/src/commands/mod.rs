@@ -776,22 +776,32 @@ impl Commands {
                     store.delete_cloud_routines_of(member)
                 })
                 .await;
-                if let Ok(tokens @ 1..) = tokens {
-                    tracing::info!(%member, tokens, "deleted Slack configuration tokens at logout");
+                match &tokens {
+                    Ok(tokens @ 1..) => {
+                        tracing::info!(%member, tokens, "deleted Slack configuration tokens at logout");
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(%member, error = %err, "couldn't delete Slack configuration tokens at logout");
+                    }
                 }
-                if let Ok(cloud) = cloud
-                    && cloud != CloudDeleted::default()
-                {
-                    tracing::info!(
-                        %member,
-                        routines = cloud.routines,
-                        handoffs = cloud.handoffs,
-                        "deleted cloud routines and hand-offs at logout"
-                    );
+                match &cloud {
+                    Ok(cloud) if *cloud != CloudDeleted::default() => {
+                        tracing::info!(
+                            %member,
+                            routines = cloud.routines,
+                            handoffs = cloud.handoffs,
+                            "deleted cloud routines and hand-offs at logout"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        tracing::warn!(%member, error = %err, "couldn't delete cloud routines at logout");
+                    }
                 }
-                (unlinked, tokens?, cloud?)
+                (unlinked, tokens.ok(), cloud.ok())
             }
-            None => (false, 0, CloudDeleted::default()),
+            None => (false, Some(0), Some(CloudDeleted::default())),
         };
         let mut reply = if unlinked {
             format!(
@@ -801,12 +811,14 @@ impl Commands {
         } else {
             "No Claude account is linked.".to_owned()
         };
-        if tokens > 0 {
+        if tokens.is_some_and(|tokens| tokens > 0) {
             reply.push_str(
                 " I also deleted your Slack configuration token, so I can no longer create or \
                  change apps as you.",
             );
         }
+        let failed = tokens.is_none() || cloud.is_none();
+        let cloud = cloud.unwrap_or_default();
         let forgot: Vec<String> = [
             (cloud.routines > 0).then(|| cloud::routines_counted(cloud.routines)),
             (cloud.handoffs > 0).then(|| cloud::handoffs_counted(cloud.handoffs)),
@@ -822,6 +834,13 @@ impl Commands {
                 " I can't revoke a routine's token: revoke each with **Revoke** on the \
                  routine's API trigger at claude.ai/code/routines.",
             );
+        }
+        if failed {
+            reply.push_str(&format!(
+                " Something went wrong on my side before I deleted everything, so send {} again \
+                 in a minute.",
+                origin.command("logout")
+            ));
         }
         Ok(reply)
     }

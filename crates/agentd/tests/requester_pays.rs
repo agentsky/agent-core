@@ -25,7 +25,7 @@ use core_types::{
     UserId, VolumeKey,
 };
 use runner::{PoolConfig, ProcessConfig};
-use sandbox::ProcessSandbox;
+use sandbox::{ContainerId, ProcessSandbox, Sandbox as _};
 use secrecy::SecretString;
 use serde_json::{Value, json};
 use store::{AgentCreation, NewAgent, NewClaudeLink, Store, StoreError, Visibility};
@@ -80,6 +80,7 @@ struct Stack {
     manager: Arc<MockSurface>,
     fake: FakeAnthropic,
     oauth: MockServer,
+    sandbox: ProcessSandbox,
     script: PathBuf,
     pids: PathBuf,
     binding: BindingId,
@@ -238,7 +239,7 @@ async fn start(bobs_token_lifetime: Duration) -> Stack {
         env: vars,
     };
     let sandbox = ProcessSandbox::new(store.clone(), dir.path()).unwrap();
-    let turns = Turns::start(&app, Arc::new(sandbox), settings).unwrap();
+    let turns = Turns::start(&app, Arc::new(sandbox.clone()), settings).unwrap();
     let manager = Arc::new(MockSurface::new());
     let replies = Replies::new(Some(Arc::new(ManagerBot::new(
         key("manager"),
@@ -267,6 +268,7 @@ async fn start(bobs_token_lifetime: Duration) -> Stack {
         manager,
         fake,
         oauth,
+        sandbox,
         script,
         pids,
         binding,
@@ -316,6 +318,17 @@ impl Stack {
             .unwrap_or_default()
             .lines()
             .map(str::to_owned)
+            .collect()
+    }
+
+    /// The ids of the containers running now.
+    async fn containers(&self) -> Vec<ContainerId> {
+        self.sandbox
+            .list_managed()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|container| container.id)
             .collect()
     }
 
@@ -616,6 +629,8 @@ async fn a_requester_who_links_between_turns_moves_to_their_account_in_a_new_pro
         .answer(stack.mention("carol", "GENERAL", "k1", None))
         .await;
     assert_eq!(first, community(DEFAULT_MODEL));
+    let container = stack.containers().await;
+    assert_eq!(container.len(), 1);
     link(stack.store(), "carol", None, Duration::from_secs(86_400)).await;
     let (_, _, second) = stack
         .answer(stack.mention("carol", "GENERAL", "k2", Some("k1")))
@@ -630,6 +645,11 @@ async fn a_requester_who_links_between_turns_moves_to_their_account_in_a_new_pro
     assert_ne!(
         pids[0], pids[1],
         "the same requester and model on another credential kind: the process restarts"
+    );
+    assert_eq!(
+        stack.containers().await,
+        container,
+        "in the container the first turn ran in"
     );
     stack.stop().await;
 }

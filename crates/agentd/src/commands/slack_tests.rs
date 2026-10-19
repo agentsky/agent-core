@@ -3127,13 +3127,40 @@ async fn a_logout_deletes_the_token_although_the_first_deletes_fail() {
 async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() {
     let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     h.with_token(alice).await;
     with_routine(&h.store, alice).await;
     fail_token_deletes(&url, 10).await;
 
-    assert_eq!(h.slash("U0HUMAN01", "logout").await, [FAILED.to_owned()]);
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(
+        reply.starts_with("Your Claude account is unlinked."),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(
+        reply.contains("I can't revoke a routine's token: revoke each"),
+        "{reply}"
+    );
+    assert!(
+        reply.ends_with(
+            "Something went wrong on my side before I deleted everything, so send `/agent \
+             logout` again in a minute."
+        ),
+        "{reply}"
+    );
     assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
+    let logged = logs.snapshot();
+    assert!(
+        logged.contains("couldn't delete Slack configuration tokens at logout"),
+        "{logged}"
+    );
+    logged.assert_lacks("SECRET");
     assert!(h.stored(alice).await.is_some());
     assert!(
         h.store.cloud_routines(alice).await.unwrap().is_empty(),
