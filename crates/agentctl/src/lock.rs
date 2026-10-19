@@ -29,14 +29,18 @@
 //! answer for a lease other than the one named is agentd misbehaving, and
 //! `lock` fails on it. Whenever `lock` fails after giving back a lease, as
 //! in these cases, for a lease too short or too long to hold, or when the
-//! command can't be started or the lease is lost while it runs, its error
-//! adds when that release failed too, leaving the lease to expire within
-//! its TTL. An acquire that can't connect to agentd (its name doesn't
-//! resolve, the connection is refused, or connecting takes over five
-//! seconds) fails at once, so a wrong URL or an agentd that is down is
-//! reported straight away. A renewal that can't connect is retried like any
-//! other failed in transit: the command already runs under the lease, the
-//! deadline bounds the retries, and a brief outage shouldn't kill it.
+//! command can't be started or waited for or the lease is lost while it
+//! runs, its error adds when that release failed too, leaving a lease
+//! agentd may hold to expire within its TTL. A release agentd refuses with
+//! anything but its internal error has nothing left to give back: agentd
+//! refuses it only once the turn has ended or the token is gone, and those
+//! delete the session's leases. An acquire that can't connect to agentd
+//! (its name doesn't resolve, the connection is refused, or connecting
+//! takes over five seconds) fails at once, so a wrong URL or an agentd that
+//! is down is reported straight away. A renewal that can't connect is
+//! retried like any other failed in transit: the command already runs under
+//! the lease, the deadline bounds the retries, and a brief outage shouldn't
+//! kill it.
 //!
 //! Each attempt is given the time left, at least seven seconds and at most
 //! thirty. Every attempt names the same lease, so one that agentd granted
@@ -51,21 +55,21 @@
 //! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start. During an
 //! acquire, agentctl lets a request already sent finish, for up to two
 //! seconds but not past the time it was given, then gives back the lease
-//! whether or not an answer said it was granted. While the
-//! command runs, agentctl passes the signal on to the command's process
-//! group, gives it up to two seconds to exit (never past the lease's
-//! deadline), then kills the group. Either way it releases the lease and
-//! exits with 128 plus the signal. A signal that comes while agentctl gives
-//! back a lease it won't rely on, one it gave up waiting for at
-//! `--timeout`, or one whose command couldn't be started or was stopped
-//! when the lease was lost, also ends it with 128 plus the signal, the
-//! lease left to expire on its own. One that comes while agentctl releases
-//! the lease after the command has exited only cuts that release short:
-//! agentctl reports it as a failed release, and `lock` exits with the
-//! command's own status. A process that leaves the group (with `setsid`,
-//! say) escapes the kill, and one the command leaves running when it exits
-//! on its own is not stopped. An agentctl killed outright stops renewing,
-//! and the lease expires on its own.
+//! whether or not an answer said it was granted. While the command runs,
+//! agentctl passes the signal on to the command's process group, gives it
+//! up to two seconds to exit (never past the lease's deadline), then kills
+//! the group. Either way it releases the lease and exits with 128 plus the
+//! signal. A signal that comes while agentctl gives back a lease it won't
+//! rely on, one it gave up waiting for at `--timeout`, or one whose command
+//! couldn't be started or waited for or was stopped when the lease was
+//! lost, also ends it with 128 plus the signal: agentctl says why it gave
+//! the lease back and that the lease is left to expire on its own. One that
+//! comes while agentctl releases the lease after the command has exited
+//! only cuts that release short: agentctl reports it as a failed release,
+//! and `lock` exits with the command's own status. A process that leaves
+//! the group (with `setsid`, say) escapes the kill, and one the command
+//! leaves running when it exits on its own is not stopped. An agentctl
+//! killed outright stops renewing, and the lease expires on its own.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -132,8 +136,8 @@ const OTHER_LEASE: &str = "agentd answered for another lease";
 /// # Errors
 ///
 /// If the lock can't be had within `timeout` (at most [`MAX_WAIT`]), its
-/// lease is too short to hold, the command can't be started, or the lease is
-/// lost while it runs.
+/// lease is too short to hold, the command can't be started or waited for,
+/// or the lease is lost while it runs.
 pub async fn run(
     client: &Client,
     timeout: Duration,
@@ -264,18 +268,15 @@ async fn give_back(
 
 /// How `lock` fails with `why` once it has tried to give back its lease
 /// and `released` says how that went: with `why` alone, or with `why` and
-/// that the lease expires within its TTL if the release failed. A stop
-/// signal that cut the release short is returned instead, for `lock` to end
-/// with 128 plus it.
+/// [`not_given_back`] if the release failed. A stop signal that cut the
+/// release short is returned instead, for `lock` to end with 128 plus it,
+/// once both are said.
 fn gave_back(why: String, released: Result<(), Unreleased>) -> Result<i32, String> {
     match released {
         Ok(()) => Err(why),
-        Err(Unreleased::Failed(err)) => Err(format!(
-            "{why}; couldn't give back a lease agentd may have granted ({err}), so it expires \
-             within its TTL"
-        )),
+        Err(err @ Unreleased::Failed(_)) => Err(format!("{why}; {}", not_given_back(&err))),
         Err(err @ Unreleased::Stopped(signal)) => {
-            not_given_back(&err);
+            eprintln!("agentctl: {why}; {}", not_given_back(&err));
             Ok(signal)
         }
     }
@@ -285,17 +286,17 @@ fn gave_back(why: String, released: Result<(), Unreleased>) -> Result<i32, Strin
 /// agentctl hearing of it, after `signal` stopped [`acquire`].
 async fn stopped(client: &Client, lease: LeaseId, signal: i32, stop: &mut Stop) -> Acquired {
     if let Err(err) = release(client, lease, stop).await {
-        not_given_back(&err);
+        eprintln!("agentctl: {}", not_given_back(&err));
     }
     Acquired::Stopped(signal)
 }
 
-/// Tells the model that a lease agentd may have granted wasn't given back.
-fn not_given_back(err: &Unreleased) {
-    eprintln!(
-        "agentctl: couldn't give back the shared/ lock agentd may have granted ({err}); it \
-         expires on its own"
-    );
+/// What tells the model that releasing its lease failed because of `err`.
+fn not_given_back(err: &Unreleased) -> String {
+    format!(
+        "couldn't give back the shared/ lock's lease ({err}); if agentd holds it, it expires \
+         within its TTL"
+    )
 }
 
 /// Waits for `child`, renewing `lease` about three times per lease period,
@@ -366,13 +367,18 @@ async fn hold(
 }
 
 /// Gives `lease` back, within [`RELEASE_TIMEOUT`] and unless a stop signal
-/// comes first.
+/// comes first. A refusal other than agentd's internal error counts as
+/// given back: agentd refuses a release only once the turn the lease was
+/// taken under has ended or the token is revoked or replaced, and each of
+/// those deleted the session's leases.
 async fn release(client: &Client, lease: LeaseId, stop: &mut Stop) -> Result<(), Unreleased> {
     let request = LockRequest::Release { lease };
     tokio::select! {
-        released = client.send_within(&request, RELEASE_TIMEOUT) => released
-            .map(drop)
-            .map_err(|err| Unreleased::Failed(err.to_string())),
+        released = client.send_within(&request, RELEASE_TIMEOUT) => match released {
+            Ok(_) => Ok(()),
+            Err(Failure::Refused(err)) if err.code != CtlErrorCode::Internal => Ok(()),
+            Err(err) => Err(Unreleased::Failed(err.to_string())),
+        },
         signal = stop.recv() => Err(Unreleased::Stopped(signal)),
     }
 }
