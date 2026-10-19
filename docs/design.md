@@ -1113,16 +1113,18 @@ refused, and `/agent logout` deletes it as Security's row on those tokens
 promises.
 
 A member Slack reports deleted keeps their link, so a routine that a racing
-`cloud add` stores after the deletion stays until the member logs out, and
-a racing `cloud run` still writes and fires a hand-off, whose row goes at
-`retention_days`. A member only on Slack can't send `logout` once Slack
-deleted them, so their routine stays sealed at rest indefinitely, as their
-Claude link already does, and a store leaked with its master key would
-yield its token, as [Security](#security)'s row on a leaked routine token
-or store says. This is an accepted gap: it needs the member's own command
-to land in the moment Slack deletes them, and through agentd only that
-member can fire the token, from another of their identities; for a member
-only on Slack, nobody can.
+`cloud add` stores after the deletion, or that the member adds later from
+another of their identities, such as on Rocket.Chat, stays until the member
+logs out, and a racing or later `cloud run` still writes and fires a
+hand-off, whose row goes at `retention_days`. A member only on Slack can't
+send `logout` once Slack deleted them, so a routine a racing `cloud add`
+stored stays sealed at rest indefinitely, as their Claude link already
+does, and a store leaked with its master key would yield its token, as
+[Security](#security)'s row on a leaked routine token or store says. This
+is an accepted gap: for a member only on Slack it needs their own command
+to land in the moment Slack deletes them, and then nobody can fire the
+token through agentd; a member with another identity adds, fires and logs
+out from it as before, and only they can fire the token.
 
 Sealed columns use their table, column and row as associated data, like
 every sealed column. The task is kept because a member should be able to see
