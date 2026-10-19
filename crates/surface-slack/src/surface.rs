@@ -272,14 +272,16 @@ impl SlackSurface {
     /// them so. Anything else drops the message, whatever its event says: a
     /// sender `users.info` doesn't have as home, a failed lookup that says
     /// nothing about the user ([`SurfaceError::Api`],
-    /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), and a
-    /// sender keyed by another surface or workspace, which this surface
-    /// can't vouch for. A sender `users.info` doesn't have as home, or keyed
-    /// elsewhere, is warned of with that reason, the binding and the
-    /// workspace `users.info` named, at most once a minute for each binding
-    /// and reason; a failed lookup is a debug line here, since the
-    /// directory warns of it ([Who is home](crate::directory#who-is-home)).
-    /// Never the message.
+    /// [`SurfaceError::Unauthorized`], [`SurfaceError::Forbidden`]), and,
+    /// from a caller other than `confirm`, a sender keyed by another surface
+    /// or workspace, which this surface can't vouch for; `confirm` never
+    /// passes one, since [`read_back`](normalize::read_back) keys the copy's
+    /// sender by this surface's workspace. A sender `users.info` doesn't
+    /// have as home, or keyed elsewhere, is warned of with that reason, the
+    /// binding and the workspace `users.info` named, at most once a minute
+    /// for each binding and reason; a failed lookup is a debug line here,
+    /// since the directory warns of it
+    /// ([Who is home](crate::directory#who-is-home)). Never the message.
     ///
     /// The lookup's answer never becomes an
     /// [`Outside`](core_types::Outside): the pipeline lets a copy stand when
