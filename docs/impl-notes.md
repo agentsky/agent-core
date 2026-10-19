@@ -11146,8 +11146,10 @@ reconnect now covers such rooms too. The test opens the direct messages
 before agentd starts, so the manager's first listing includes them, and
 waits, with the Rocket.Chat surface logging at debug level, for the
 manager's `realtime connection ready`. That line follows sending the room
-subscriptions, not the server's answer to them; the fake's start leaves
-seconds before the first post.
+subscriptions, not the server's answer to them; the only margin before
+the first post is the fake's start, about one container start, since
+`poll` checks for its `listening on` line at once and a detached
+`docker run` returns in under a second.
 
 ### A fresh Community Edition workspace refuses posts at first
 
