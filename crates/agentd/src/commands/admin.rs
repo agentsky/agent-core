@@ -23,7 +23,7 @@ use commands::{ApiKeyCommand, UserRef};
 use core_types::MemberKey;
 use secrecy::ExposeSecret as _;
 
-use super::{Commands, Failure, now};
+use super::{Commands, Failure, Origin, banned_may_run, now};
 use crate::community::{MAX_API_KEY_BYTES, is_plausible_api_key};
 
 /// The reply to an admin command from someone who isn't an admin.
@@ -105,12 +105,13 @@ impl Commands {
 }
 
 impl Commands {
-    /// Runs `admin ban <user> [reason]` for `admin`.
+    /// Runs `admin ban <user> [reason]` for `admin`, sent from `origin`.
     pub(super) async fn ban(
         &self,
         admin: &MemberKey,
         user: &UserRef,
         reason: Option<String>,
+        origin: &Origin,
     ) -> Result<String, Failure> {
         if !self.is_admin(admin) {
             tracing::info!(member = %admin, "refused an admin command from someone who isn't an admin");
@@ -148,9 +149,10 @@ impl Commands {
         {
             tracing::info!(%admin, %member, "banned a member");
             Ok(format!(
-                "Banned {label}. Agents refuse their requests, and they can only run `me`, \
-                 `logout`, `cloud rm`, and `pause` or `delete` their agents. Undo it with \
-                 `admin unban`."
+                "Banned {label}. Agents refuse their requests, and they can only run {} their \
+                 agents. Undo it with {}.",
+                banned_may_run(origin),
+                origin.command("admin unban <user>")
             ))
         } else {
             Ok(format!("{label} is banned already."))

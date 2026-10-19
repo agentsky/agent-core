@@ -406,7 +406,7 @@ async fn a_banned_member_can_only_rm() {
     assert!(c.h.last_reply("alice").contains("`cloud rm`"));
 }
 
-const BANNED_REPLY: &str = super::super::BANNED;
+const BANNED_REPLY: &str = crate::commands::tests::BANNED;
 
 #[tokio::test]
 async fn a_task_with_invisible_characters_is_refused() {
