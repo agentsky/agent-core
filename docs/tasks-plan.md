@@ -3620,7 +3620,9 @@ its purge; review round 2 gave the relink notifier the same shape. `logout`
 runs its two deletes through `slack_tokens::retry_store`, as a departed
 member's are, and one that still fails doesn't skip the other; the reply
 says what was deleted and asks the member to send `logout` again, which
-finishes.
+finishes, and to do so before `login`. That reply leaves out the usual
+invitation to link an account again, since following it first would have
+the second `logout` unlink the new link.
 
 ## Phase 7: Slack Connect (design milestone 7)
 
