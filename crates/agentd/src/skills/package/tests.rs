@@ -328,7 +328,7 @@ fn the_unix_mode_of_an_entry_marked_as_made_on_ms_dos_still_counts() {
 }
 
 #[test]
-fn of_two_entries_with_exactly_the_same_name_the_last_unpacks() {
+fn two_entries_with_exactly_the_same_name_are_refused() {
     let dir = TempDir::new("agentd-skill");
     let mut bytes = zip_of(&[
         ("a", Some(b"first"), 0o100644),
@@ -343,9 +343,25 @@ fn of_two_entries_with_exactly_the_same_name_the_last_unpacks() {
         bytes[header + name_at] = b'a';
     }
     let out = dir.join("out");
+    assert_eq!(problem(unpack_zip(&bytes, &out)), Problem::Archive);
+    assert!(!out.exists());
+}
+
+#[test]
+fn a_streamed_zip_with_data_descriptors_unpacks() {
+    let dir = TempDir::new("agentd-skill");
+    let mut zip = ZipWriter::new_stream(Vec::new());
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    zip.start_file("SKILL.md", options).unwrap();
+    zip.write_all(SKILL.as_bytes()).unwrap();
+    zip.start_file("notes.txt", options).unwrap();
+    zip.write_all(b"notes").unwrap();
+    let bytes = zip.finish().unwrap().into_inner();
+    assert_ne!(bytes[6] & 0x08, 0, "the entries use data descriptors");
+    let out = dir.join("out");
     unpack_zip(&bytes, &out).unwrap();
-    assert_eq!(fs::read(out.join("a")).unwrap(), b"second");
-    assert!(!out.join("b").exists());
+    assert_eq!(fs::read_to_string(out.join("SKILL.md")).unwrap(), SKILL);
+    assert_eq!(fs::read(out.join("notes.txt")).unwrap(), b"notes");
 }
 
 #[test]
