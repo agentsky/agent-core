@@ -2992,6 +2992,81 @@ async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() 
     assert_eq!(h.stored(alice).await, None);
 }
 
+/// Makes every delete of a cloud routine fail, until [`NO_FORGETTING_OFF`].
+pub(super) const NO_FORGETTING: &str = "CREATE TRIGGER no_forgetting BEFORE DELETE ON \
+     cloud_routines BEGIN SELECT RAISE(FAIL, 'injected'); END;";
+/// Undoes [`NO_FORGETTING`].
+pub(super) const NO_FORGETTING_OFF: &str = "DROP TRIGGER no_forgetting;";
+
+#[tokio::test]
+async fn a_logout_whose_token_and_routine_deletes_both_keep_failing_says_to_send_it_again() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    with_routine(&h.store, alice).await;
+    fail_token_deletes(&url, 10).await;
+    sql(&url, NO_FORGETTING).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert_eq!(
+        reply,
+        "Your Claude account is unlinked. Something went wrong on my side and I couldn't \
+         delete everything, so send `/agent logout` again in a minute, before you send \
+         `/agent login`."
+    );
+    assert!(h.store.get_claude_link(alice).await.unwrap().is_none());
+    assert!(h.stored(alice).await.is_some());
+    assert_eq!(h.store.cloud_routines(alice).await.unwrap().len(), 1);
+
+    sql(
+        &url,
+        &format!("UPDATE token_write_failures SET remaining = 0; {NO_FORGETTING_OFF}"),
+    )
+    .await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(reply.starts_with("No Claude account is linked."), "{reply}");
+    assert!(
+        reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(!reply.contains("Something went wrong"), "{reply}");
+    assert_eq!(h.stored(alice).await, None);
+    assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_logout_by_a_member_with_no_link_whose_delete_fails_says_to_send_it_again() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    with_routine(&h.store, alice).await;
+    sql(&url, "DELETE FROM claude_links;").await;
+    fail_token_deletes(&url, 10).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert_eq!(
+        reply,
+        "No Claude account is linked. I also forgot your 1 routine. I can't revoke a \
+         routine's token: revoke each with *Revoke* on the routine's API trigger at \
+         claude.ai/code/routines. Something went wrong on my side and I couldn't delete \
+         everything, so send `/agent logout` again in a minute, before you send `/agent login`."
+    );
+    assert!(h.stored(alice).await.is_some());
+    assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
+
+    sql(&url, "UPDATE token_write_failures SET remaining = 0;").await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert_eq!(
+        reply,
+        "No Claude account is linked. I also deleted your Slack configuration token, so I can \
+         no longer create or change apps as you."
+    );
+    assert_eq!(h.stored(alice).await, None);
+}
+
 /// Creates `count` public agents of `owner`'s, with names long enough that
 /// `list` needs more Slack messages than one `response_url` takes, and
 /// returns their names.

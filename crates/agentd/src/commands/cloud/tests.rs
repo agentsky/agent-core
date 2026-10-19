@@ -17,8 +17,8 @@ use crate::cloud::FireClient;
 use crate::commands::rocketchat::command_in;
 use crate::commands::slack::dm_command;
 use crate::commands::slack_tests::{
-    Running, SlackHarness, dm_event, file_store, identity, json_body, link, slack_channel,
-    slack_harness, slack_harness_on, slack_key, sql,
+    NO_FORGETTING, NO_FORGETTING_OFF, Running, SlackHarness, dm_event, file_store, identity,
+    json_body, link, slack_channel, slack_harness, slack_harness_on, slack_key, sql,
 };
 use crate::commands::tests::{Harness, conv, dm_room, harness, key, serve};
 use crate::config::CloudConfig;
@@ -1640,12 +1640,7 @@ async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_aga
         .await
         .unwrap()
         .unwrap();
-    sql(
-        &url,
-        "CREATE TRIGGER no_forgetting BEFORE DELETE ON cloud_routines \
-         BEGIN SELECT RAISE(FAIL, 'injected'); END;",
-    )
-    .await;
+    sql(&url, NO_FORGETTING).await;
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
     assert_eq!(
         reply,
@@ -1655,7 +1650,7 @@ async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_aga
     );
     assert!(h.store.get_claude_link(alice).await.unwrap().is_none());
     assert_eq!(h.store.cloud_routines(alice).await.unwrap().len(), 1);
-    sql(&url, "DROP TRIGGER no_forgetting;").await;
+    sql(&url, NO_FORGETTING_OFF).await;
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
     assert!(reply.starts_with("No Claude account is linked."), "{reply}");
     assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
