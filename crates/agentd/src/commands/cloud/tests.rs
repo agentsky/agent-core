@@ -1646,7 +1646,17 @@ async fn a_logout_that_failed_after_unlinking_forgets_the_routines_when_sent_aga
          BEGIN SELECT RAISE(FAIL, 'injected'); END;",
     )
     .await;
-    assert_eq!(h.slash("U0HUMAN01", "logout").await, [FAILED.to_owned()]);
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(
+        reply.starts_with("Your Claude account is unlinked."),
+        "{reply}"
+    );
+    assert!(!reply.contains("forgot"), "{reply}");
+    assert!(!reply.contains("revoke"), "{reply}");
+    assert!(
+        reply.ends_with("so send `/agent logout` again in a minute."),
+        "{reply}"
+    );
     assert!(h.store.get_claude_link(alice).await.unwrap().is_none());
     assert_eq!(h.store.cloud_routines(alice).await.unwrap().len(), 1);
     sql(&url, "DROP TRIGGER no_forgetting;").await;
