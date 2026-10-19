@@ -3253,7 +3253,7 @@ Acceptance, as tests named after the rules:
 - `a_handoff_task_is_sealed_to_its_row`.
 - `routines_of_a_member_are_deleted_by_member_id`.
 - `a_handoff_finishes_from_sending_and_late_from_unknown` (`fired` and
-  `rejected`, and from T35c `Gone` for a deleted hand-off).
+  `rejected`, and from T35c `Gone` for a hand-off that isn't there).
 - `recording_an_outcome_marks_its_notice_done`.
 - `stale_sending_handoffs_become_unknown`.
 - `a_handoff_notice_is_claimed_once_and_backs_off`.
@@ -3374,10 +3374,10 @@ gives and returns the outcome alone: `FireOutcome` is
 `FireClient::origin()` and a task `cloud::check_task` refuses (empty or
 over `cloud::MAX_TASK_BYTES`, 65,536 bytes) are not sent and come back
 `Rejected` with no status. That origin check compares `url_origin` with
-`FireClient::origin()` as two strings `url::Origin::ascii_serialization`
-wrote, which is correct: equal strings are equal origins, and a mismatch
-only leaves the token unsent, so it needs no parsing; parsing the stored
-origin, as T35a decided, is for T35c's check. Building the client fails with
+`FireClient::origin()` as strings, which is sound at T35b because the store
+holds only what `url::Origin::ascii_serialization` wrote; T35c replaces it
+with `FireClient::fires_for`, which parses the stored origin as T35a decided,
+so `fire` and the command share one rule. Building the client fails with
 `FireClientError`. `connect_timeout_secs` must be below `timeout_secs`,
 not at most equal, so a connection that never opened is always
 `rejected`. `Retry-After` is capped at a day. Each fire is one request on
@@ -3618,12 +3618,14 @@ written or sent; that transaction also checks the routine is still the
 member's, so a `logout` racing a `cloud run` either comes first or deletes
 the row, and `finish_cloud_handoff` says when the row is gone. On Slack,
 replies name `/agent cloud add` even in a DM. `logout` unlinks before it
-deletes routines, so a failed `logout` sent again still says to revoke
-tokens. One row's store failure no longer ends a notifier pass or skips its
-purge; review round 2 gave the relink notifier the same shape. `logout`
+deletes routines, and the reply that forgets them says to revoke their
+tokens, whether that is the first `logout` or one sent again after a
+failure. One row's store failure no longer ends a notifier pass or skips
+its purge; review round 2 gave the relink notifier the same shape. `logout`
 runs its two deletes through `slack_tokens::retry_store`, as a departed
 member's are, and one that still fails doesn't skip the other; the reply
-says something went wrong, and a `logout` sent again finishes.
+says what was deleted and asks the member to send `logout` again, which
+finishes.
 
 ## Phase 7: Slack Connect (design milestone 7)
 
