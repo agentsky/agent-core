@@ -25,11 +25,14 @@
 //! An acquire that failed on agentd's side, or whose answer was lost (it
 //! timed out, was cut off, or couldn't be read), is retried until
 //! `--timeout` runs out. agentctl then gives back the lease, which an
-//! attempt whose answer was lost may have been granted, before it fails.
-//! An answer for a lease other than the one named is agentd misbehaving,
-//! and `lock` fails on it. One that can't connect to agentd (its name
-//! doesn't resolve, the connection is refused, or connecting takes over
-//! five seconds) fails at once, so a wrong URL or an agentd that is down is
+//! attempt whose answer was lost may have been granted, before it fails. An
+//! answer for a lease other than the one named is agentd misbehaving, and
+//! `lock` fails on it. Whenever `lock` fails after giving back a lease, as
+//! in these cases or for a lease too short or too long to hold, its error
+//! adds when that release failed too, leaving the lease to expire within
+//! its TTL. An acquire that can't connect to agentd (its name doesn't
+//! resolve, the connection is refused, or connecting takes over five
+//! seconds) fails at once, so a wrong URL or an agentd that is down is
 //! reported straight away. A renewal that can't connect is retried like any
 //! other failed in transit: the command already runs under the lease, the
 //! deadline bounds the retries, and a brief outage shouldn't kill it.
@@ -54,10 +57,13 @@
 //! exits with 128 plus the signal. A signal that comes while agentctl gives
 //! back a lease it won't rely on, or one it gave up waiting for at
 //! `--timeout`, also ends it with 128 plus the signal, the lease left to
-//! expire on its own. A process that leaves the group (with `setsid`, say)
-//! escapes the kill, and one the command leaves running when it exits on
-//! its own is not stopped. An agentctl killed outright stops renewing, and
-//! the lease expires on its own.
+//! expire on its own. One that comes while agentctl releases the lease
+//! after the command has exited only cuts that release short: agentctl
+//! reports it as a failed release, and `lock` exits with the command's own
+//! status. A process that leaves the group (with `setsid`, say) escapes the
+//! kill, and one the command leaves running when it exits on its own is not
+//! stopped. An agentctl killed outright stops renewing, and the lease
+//! expires on its own.
 
 use std::ffi::OsString;
 use std::fmt;
@@ -196,26 +202,20 @@ async fn acquire(
         };
         let why = match answer {
             Ok(LockResponse::Held { lease: granted, .. }) if granted != lease => {
-                return give_back(client, lease, stop, |_| {
-                    format!("couldn't hold the shared/ lock ({OTHER_LEASE})")
-                })
-                .await;
+                let why = format!("couldn't hold the shared/ lock ({OTHER_LEASE})");
+                return give_back(client, lease, stop, why).await;
             }
             Ok(LockResponse::Held { seconds_left, .. }) => {
                 let Some(deadline) = reliable_until(sent, seconds_left) else {
-                    return give_back(client, lease, stop, |_| {
-                        format!("couldn't hold the shared/ lock ({TOO_LONG})")
-                    })
-                    .await;
+                    let why = format!("couldn't hold the shared/ lock ({TOO_LONG})");
+                    return give_back(client, lease, stop, why).await;
                 };
                 if deadline.saturating_duration_since(Instant::now()) < MIN_TIME_LEFT {
-                    return give_back(client, lease, stop, |_| {
-                        format!(
-                            "the shared/ lock's lease is too short to hold (agentd granted \
-                             {seconds_left}s; agentctl needs at least 3s)"
-                        )
-                    })
-                    .await;
+                    let why = format!(
+                        "the shared/ lock's lease is too short to hold (agentd granted \
+                         {seconds_left}s; agentctl needs at least 3s)"
+                    );
+                    return give_back(client, lease, stop, why).await;
                 }
                 return Ok(Acquired::Held { deadline });
             }
@@ -227,20 +227,11 @@ async fn acquire(
             Err(Failure::Transport(message)) => message,
         };
         if Instant::now() + wait > give_up {
-            return give_back(client, lease, stop, |failure| {
-                let why = match failure {
-                    None => why,
-                    Some(err) => format!(
-                        "{why}; couldn't give back a lease agentd may have granted ({err}), so \
-                         it expires within its TTL"
-                    ),
-                };
-                format!(
-                    "gave up waiting for the shared/ lock after the {}s timeout; {why}",
-                    timeout.as_secs()
-                )
-            })
-            .await;
+            let why = format!(
+                "gave up waiting for the shared/ lock after the {}s timeout; {why}",
+                timeout.as_secs()
+            );
+            return give_back(client, lease, stop, why).await;
         }
         if !told {
             eprintln!("agentctl: waiting for the shared/ lock");
@@ -254,18 +245,22 @@ async fn acquire(
     }
 }
 
-/// Gives back `lease`, which agentctl won't rely on, and fails with what
-/// `failed` makes of why giving it back failed, if it did. A stop signal
-/// that comes first stops [`acquire`] instead, as one during it would.
+/// Gives back `lease`, which agentctl won't rely on, and fails with `why`,
+/// adding that the lease wasn't given back if giving it back failed. A stop
+/// signal that comes first stops [`acquire`] instead, as one during it
+/// would.
 async fn give_back(
     client: &Client,
     lease: LeaseId,
     stop: &mut Stop,
-    failed: impl FnOnce(Option<String>) -> String,
+    why: String,
 ) -> Result<Acquired, String> {
     match release(client, lease, stop).await {
-        Ok(()) => Err(failed(None)),
-        Err(Unreleased::Failed(err)) => Err(failed(Some(err))),
+        Ok(()) => Err(why),
+        Err(Unreleased::Failed(err)) => Err(format!(
+            "{why}; couldn't give back a lease agentd may have granted ({err}), so it expires \
+             within its TTL"
+        )),
         Err(err @ Unreleased::Stopped(signal)) => {
             not_given_back(&err);
             Ok(Acquired::Stopped(signal))
