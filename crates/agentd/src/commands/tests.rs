@@ -40,6 +40,9 @@ const ADMIN: &str = "root";
 /// `me`'s usage line for someone nothing was billed to.
 const NO_USAGE: &str = "Usage billed to you today: 0 turns, 0 tokens. This month: 0 turns, \
                         0 tokens (days start at midnight UTC).";
+/// The reply to a banned member's commands in a Rocket.Chat DM.
+const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
+                      can still run `me`, `logout`, and `pause` or `delete` your agents.";
 
 /// What `me` answers `status`, the line on the Claude account, followed by
 /// the usage line for someone nothing was billed to.
@@ -172,6 +175,20 @@ impl Harness {
         self.commands
             .handle_text(&key(user), text, &origin, &[])
             .await;
+    }
+
+    /// The reply to `/agent <text>` sent as `user` in a Slack channel.
+    async fn slash(&self, user: &str, text: &str) -> String {
+        let origin = Origin::SlackSlash {
+            response_url: SecretString::from("https://hooks.slack.test/r"),
+            conv: ConvRef {
+                surface: SurfaceKind::Slack,
+                team: TeamId::new("T0TEAM"),
+                conversation: "C0GENERAL".into(),
+            },
+        };
+        let command = commands::parse(text).unwrap();
+        self.commands.run(&key(user), command, &origin, &[]).await.0
     }
 
     /// Sends `!agent <text>` as `user` in a channel.
@@ -2141,7 +2158,7 @@ async fn a_session_whose_sandbox_wont_stop_is_not_reset() {
     assert_eq!(
         replies[1],
         "`!agent reset helper here` couldn't reset 1 of `helper`'s 3 sessions; the other 2 are \
-         reset. Please send it again in a minute."
+         reset. Please send it again in a minute, in the conversation you sent it in."
     );
     assert!(!h.is_reset(&s.thread).await);
     assert!(h.is_reset(&s.other_thread).await);
@@ -2155,7 +2172,7 @@ async fn a_session_whose_sandbox_wont_stop_is_not_reset() {
     assert_eq!(
         h.last_reply("alice"),
         "`!agent reset helper here` couldn't reset `helper`'s session. Please send it again in \
-         a minute."
+         a minute, in the conversation you sent it in."
     );
     assert!(!h.is_reset(&s.elsewhere).await);
 
@@ -2535,6 +2552,12 @@ async fn allow_and_deny_change_the_owners_rules() {
          only your allowed targets use it, send `allow helper everyone` first, then allow them \
          again."
     );
+    assert_eq!(
+        h.slash("alice", "allow helper <@DAVE>").await,
+        "Only you may use `helper`. `everyone` is denied, which wins over any allow: to let \
+         only your allowed targets use it, send `/agent allow helper everyone` first, then allow \
+         them again."
+    );
     h.dm("alice", "allow helper everyone").await;
     assert_eq!(h.last_reply("alice"), "Everyone may use `helper`.");
     assert_eq!(policy().await, router::AgentPolicy::default());
@@ -2620,6 +2643,11 @@ async fn unreadable_rules_are_cleared_by_allow_everyone() {
         "I can't read `helper`'s rules, so it refuses everyone, you too. Send `allow helper \
          everyone` to clear them."
     );
+    assert_eq!(
+        h.slash("alice", "deny helper <@BOB>").await,
+        "I can't read `helper`'s rules, so it refuses everyone, you too. Send `/agent allow \
+         helper everyone` to clear them."
+    );
     h.dm("alice", "allow helper everyone").await;
     assert_eq!(h.last_reply("alice"), "Everyone may use `helper`.");
     assert_eq!(
@@ -2641,16 +2669,27 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
     assert_eq!(
         h.last_reply(ADMIN),
         "Banned `@BOB`. Agents refuse their requests, and they can only run `me`, `logout`, \
-         and `pause` or `delete` their agents. Undo it with `admin unban`."
+         and `pause` or `delete` their agents. Undo it with `admin unban <user>`."
     );
     let ban = h.store.ban(bob).await.unwrap().unwrap();
     assert_eq!(ban.banned_by, key(ADMIN));
     assert_eq!(ban.reason.as_deref(), Some("posts spam\nall day"));
     h.dm(ADMIN, "admin ban <@BOB>").await;
     assert_eq!(h.last_reply(ADMIN), "`@BOB` is banned already.");
+    assert_eq!(
+        h.slash(ADMIN, "admin ban <@CAROL>").await,
+        "Banned `@CAROL`. Agents refuse their requests, and they can only run `/agent me`, \
+         `/agent logout`, and `/agent pause` or `/agent delete` their agents. Undo it with \
+         `/agent admin unban <user>`."
+    );
 
     h.dm("BOB", "list").await;
     assert_eq!(h.last_reply("BOB"), BANNED);
+    assert_eq!(
+        h.slash("BOB", "list").await,
+        "A community admin banned you, so agents won't take your requests. You can still run \
+         `/agent me`, `/agent logout`, and `/agent pause` or `/agent delete` your agents."
+    );
     h.dm("BOB", "login").await;
     assert_eq!(h.last_reply("BOB"), BANNED);
     h.dm("BOB", "me").await;
