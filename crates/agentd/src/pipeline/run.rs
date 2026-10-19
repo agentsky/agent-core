@@ -2684,7 +2684,10 @@ impl Delivery<'_> {
     /// active is passed over, and its hop claimed, rather than left for the
     /// platform's copy; unless the turn asked it, when it is left for its
     /// ask post, which mentions its active bot, so an accepted ask is never
-    /// passed over.
+    /// passed over. Places go in the same order, each agent's at its first
+    /// mention through whichever bot: with one place left, a post
+    /// mentioning A's old bot, then B's, then A's active one hands off to A
+    /// and passes B over.
     ///
     /// # Errors
     ///
