@@ -20,7 +20,10 @@
 //!   set-id, sticky or group- or world-writable files.
 //! - A `.zip` holds stored or deflated entries only, none encrypted, and
 //!   each entry's bytes are counted as they are inflated, so a small
-//!   archive can't unpack past the limits.
+//!   archive can't unpack past the limits. An archive whose headers
+//!   disagree, a local header with its central directory or two entries
+//!   on a path, including two under exactly the same name, is refused
+//!   rather than unpacked with one of the two.
 //! - `SKILL.md` is at most [`MAX_SKILL_MD_BYTES`] of UTF-8, and its front
 //!   matter at most [`MAX_FRONT_MATTER_BYTES`]; the YAML parser refuses
 //!   alias expansion past its own limits, so a "billion laughs" document
