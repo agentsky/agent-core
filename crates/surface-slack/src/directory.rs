@@ -90,7 +90,12 @@ pub(crate) const DROP_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) enum DropReason {
     /// `users.info` doesn't have the sender as home.
     NotHome,
-    /// The sender is keyed by another surface or workspace.
+    /// The sender is keyed by another surface or workspace. Confirmation
+    /// never meets this, since [`read_back`](crate::normalize::read_back)
+    /// keys the copy's sender by the directory's own workspace; it is
+    /// another caller of
+    /// [`copy_sender_is_home`](crate::SlackSurface::copy_sender_is_home)
+    /// that can pass such an event.
     Elsewhere,
 }
 
