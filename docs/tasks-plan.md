@@ -2357,8 +2357,13 @@ Deliverables:
   - `users.info`, `users.list` (paginated), `bots.info`, `auth.test`.
   - The file upload flow: `files.getUploadURLExternal`, then upload, then
     `files.completeUploadExternal` with `channel_id` and `thread_ts`.
-- Rate limits: on 429, honor `Retry-After`. Each method is tagged with its tier
-  for a simple per-token limiter.
+- Rate limits: each method is tagged with its tier for a simple limiter per
+  token and method (and channel, for `chat.postMessage`). A 429 (or `ok:
+  false` with `ratelimited`) doesn't say which limit it hit, so it holds
+  every call to that method with that token, in any channel, until
+  `Retry-After` has passed; the call retries after it, at most three times
+  and while the wait is within the client's maximum, and fails with
+  `RateLimited` otherwise.
 - `response_url` helper for private command replies (`response_type:
   ephemeral`).
 - `SlackSurface`, implementing `Surface`. Its `Caps` have a `message_limit`
