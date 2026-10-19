@@ -3143,13 +3143,26 @@ failed: refusing a lease too short or too long to hold, which agentd had
 certainly granted, or an answer for another lease said nothing, so the
 session couldn't tell why the next `lock` waited. Every give-back now
 adds that the lease expires within its TTL when its release fails. The
-release after a command that couldn't be started, or that was stopped
-because its lease was lost, had both gaps too: a failed release went
-unsaid, and a signal during it made `lock` exit 1 with the command's
-error. It now ends the same way as a give-back. A signal during the
-release after the command exits is different: the command's work is
-done, so agentctl reports it as a failed release and `lock` exits with
-the command's own status.
+release after a command that couldn't be started or waited for, or that
+was stopped because its lease was lost, had both gaps too: a failed
+release went unsaid, and a signal during it made `lock` exit 1 with the
+command's error. It now ends the same way as a give-back, and a signal
+during any give-back still says why `lock` failed before it exits with
+the signal, so a command that couldn't be found doesn't look like one
+that was interrupted. A signal during the release after the command
+exits is different: the command's work is done, so agentctl reports it
+as a failed release and `lock` exits with the command's own status.
+
+Review then found that a lease lost because the turn ended or the token
+was revoked was reported as maybe still held: agentd refused the release
+for the same reason as the renewal, and `lock` added that the lease
+expires within its TTL, repeating the reason. agentd had deleted the
+lease already, since ending a turn and revoking or replacing a token
+delete the session's leases, and those are the only reasons it refuses a
+release. A release refused with anything but agentd's internal error now
+counts as given back wherever agentctl releases, so only one that failed
+in transit, couldn't connect, or got the internal error says the lease
+may still be held.
 
 ### The command runs in its own process group
 
