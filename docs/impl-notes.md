@@ -3075,8 +3075,9 @@ so `--timeout 1` took 30 seconds and the default could run past the Bash
 tool's 2 minutes. Each acquire is now given the time left, at least seven
 seconds and at most thirty. The floor lets `--timeout 0` take a free lock,
 and outlasts agentd's five-second SQLite busy timeout, so the common slow
-answer isn't abandoned. The default 100 seconds plus the floor stays under
-2 minutes.
+answer isn't abandoned. The default 100 seconds plus the floor, plus the
+two seconds giving the lease back may take after it, stays under 2
+minutes.
 
 ### The acquire is idempotent
 
@@ -3103,10 +3104,10 @@ that lands after agentctl released the lease is still orphaned: say an
 attempt is held up in agentd for over 30 seconds, a later attempt is
 granted, the command runs and the lease is released, and then the first
 attempt lands. The same goes for a grant landing after a stop signal's
-release, or after agentctl gave back a lease too short or too long to
-hold. Nobody renews such a lease, so it holds the lock for at most its
-TTL, 30 seconds by default. This was already so before the id; it is
-just not solved by it.
+release, after agentctl gave back a lease too short or too long to hold,
+or after it gave up at `--timeout`. Nobody renews such a lease, so it
+holds the lock for at most its TTL, 30 seconds by default. This was
+already so before the id; it is just not solved by it.
 
 An acquire that failed with agentd's internal error (a busy database,
 say), or whose answer was lost (it timed out, was cut off, or couldn't be
@@ -3119,9 +3120,18 @@ away. A renewal that can't connect is still retried until the deadline,
 since the command already runs under the lease and a brief outage
 shouldn't kill it. Any other refusal also fails at once. When `lock`
 gives up after the timeout, it names the last attempt's reason: busy,
-agentd's internal error, or the lost answer. Only after a lost answer
-does it add that a lease agentd granted anyway expires within its TTL,
-since no later attempt is left to pick it up.
+agentd's internal error, or the lost answer.
+
+Review found that giving up after a lost answer left the lease alone,
+although the likeliest lost answer is a grant that landed just after the
+last attempt stopped waiting, and no later attempt is left to pick it up:
+every session on the volume then waited out the TTL. agentctl now gives
+back the lease whenever it gives up, within the two seconds a release may
+take, and says the lease expires within its TTL only when that release
+fails. It also checks that a grant or renewal names the lease it asked
+for: an answer for another lease is agentd misbehaving, so an acquire
+gives back its own lease and fails, and a renewal is treated as a lost
+lease.
 
 ### The command runs in its own process group
 
