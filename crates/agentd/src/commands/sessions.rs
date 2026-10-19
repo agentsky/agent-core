@@ -98,8 +98,10 @@ fn sessions_word(count: usize) -> &'static str {
 }
 
 /// What the owner is told when some of the resets `asked` for `name`'s
-/// sessions failed; `None` when none did.
-fn failed_resets(resets: &Resets, name: &str, asked: &str) -> Option<String> {
+/// sessions failed; `None` when none did. It comes in a direct message,
+/// where no agent answers, so a reset sent `here` is to be sent again in
+/// its own conversation.
+fn failed_resets(resets: &Resets, name: &str, asked: &str, here: bool) -> Option<String> {
     let what = match *resets {
         Resets { failed: 0, .. } => return None,
         Resets { done: 0, failed: 1 } => format!("`{name}`'s session"),
@@ -110,8 +112,13 @@ fn failed_resets(resets: &Resets, name: &str, asked: &str) -> Option<String> {
             if done == 1 { "is" } else { "are" }
         ),
     };
+    let place = if here {
+        ", in the conversation you sent it in"
+    } else {
+        ""
+    };
     Some(format!(
-        "{asked} couldn't reset {what}. Please send it again in a minute."
+        "{asked} couldn't reset {what}. Please send it again in a minute{place}."
     ))
 }
 
@@ -281,7 +288,7 @@ impl Commands {
                 failed = resets.failed,
                 "reset an agent's sessions"
             );
-            if let Some(notice) = failed_resets(&resets, &name, &asked)
+            if let Some(notice) = failed_resets(&resets, &name, &asked, here)
                 && let Err(error) = commands.inner.replies.dm(&owner, &notice).await
             {
                 tracing::warn!(member = %owner, %error, "couldn't tell an owner a reset failed");
@@ -442,8 +449,9 @@ fn reset_here(surface: SurfaceKind, name: &str) -> String {
 /// conversation to reset: the direct message with the manager bot.
 fn here_elsewhere(surface: SurfaceKind, name: &str, origin: &Origin) -> String {
     format!(
-        "`reset {name} here` resets the conversation it is sent in, and no agent answers in \
-         this one. Send {} in the conversation to reset, or {} here to reset them all.",
+        "{} resets the conversation it is sent in, and no agent answers in this one. Send {} in \
+         the conversation to reset, or {} here to reset them all.",
+        origin.command(&format!("reset {name} here")),
         reset_here(surface, name),
         origin.command(&format!("reset {name}")),
     )

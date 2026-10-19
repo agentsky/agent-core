@@ -159,10 +159,13 @@ pub enum Problem {
     /// A device, socket or FIFO.
     #[error("The skill holds something that is neither a file nor a directory.")]
     SpecialFile,
-    /// Not a zip agentd can read.
+    /// Not a zip agentd can read: one whose entries are encrypted or
+    /// compressed some other way, whose local headers disagree with its
+    /// central directory or overlap, or that names an entry twice, which
+    /// `zip` doesn't tell apart from the rest.
     #[error(
         "That isn't a .zip I can read: it must be an unencrypted zip of stored or deflated \
-         files."
+         files, each named once."
     )]
     Archive,
 }
@@ -378,11 +381,6 @@ fn new_file(path: &Path, mode: u32) -> Result<fs::File, CheckError> {
 
 /// Unpacks the zip archive `bytes` into `dir`, a new directory.
 ///
-/// Entries with exactly the same name reach it as one: `zip` keeps only the
-/// last of them, at the first one's place, so such an archive unpacks with
-/// that last entry's contents. Names that differ but land on the same path,
-/// such as `x` and `x/`, are refused.
-///
 /// # Errors
 ///
 /// The [`Problem`] with the archive, or an I/O failure.
@@ -391,6 +389,9 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
     if archive.len() > MAX_FILES {
         return Err(Problem::TooLarge.into());
     }
+    archive
+        .validate_header_consistency()
+        .map_err(|_| Problem::Archive)?;
     fs::create_dir(dir).map_err(io("creating a skill's directory"))?;
     let mut budget = Budget::default();
     let mut seen = HashSet::new();
@@ -464,10 +465,11 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
 
 /// An entry's Unix mode: the high 16 bits of its external attributes
 /// whenever any is set, whatever system the entry says made it, as `zip`
-/// 8.x read them; else `zip`'s own reading, or `0644`. `zip` 9.x ignores
-/// those bits in an entry marked as made on MS-DOS and makes up a plain
-/// file's mode, which would let such an entry hide a symlink or a FIFO, or
-/// drop its execute bit.
+/// 8.x read them; else `zip`'s own reading, or `0644`. `zip` 9.0.5 ignores
+/// those bits in an entry marked as made on MS-DOS and makes up
+/// `S_IFREG | 0664`, or `S_IFDIR | 0775` when the entry's DOS directory
+/// attribute (`0x10`) is set, which would let such an entry hide a symlink
+/// or a FIFO, or drop its execute bit.
 fn entry_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> u32 {
     match entry.external_attributes() >> 16 {
         0 => entry.unix_mode().unwrap_or(0o644),

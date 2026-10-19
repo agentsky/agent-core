@@ -2037,7 +2037,7 @@ async fn a_session_whose_sandbox_wont_stop_is_not_reset() {
     assert_eq!(
         replies[1],
         "`!agent reset helper here` couldn't reset 1 of `helper`'s 3 sessions; the other 2 are \
-         reset. Please send it again in a minute."
+         reset. Please send it again in a minute, in the conversation you sent it in."
     );
     assert!(!h.is_reset(&s.thread).await);
     assert!(h.is_reset(&s.other_thread).await);
@@ -2051,7 +2051,7 @@ async fn a_session_whose_sandbox_wont_stop_is_not_reset() {
     assert_eq!(
         h.last_reply("alice"),
         "`!agent reset helper here` couldn't reset `helper`'s session. Please send it again in \
-         a minute."
+         a minute, in the conversation you sent it in."
     );
     assert!(!h.is_reset(&s.elsewhere).await);
 
