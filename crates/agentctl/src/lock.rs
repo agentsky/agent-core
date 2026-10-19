@@ -24,9 +24,12 @@
 //!
 //! An acquire that failed on agentd's side, or whose answer was lost (it
 //! timed out, was cut off, or couldn't be read), is retried until
-//! `--timeout` runs out. One that can't connect to agentd (its name doesn't
-//! resolve, the connection is refused, or connecting takes over five
-//! seconds) fails at once, so a wrong URL or an agentd that is down is
+//! `--timeout` runs out. agentctl then gives back the lease, which an
+//! attempt whose answer was lost may have been granted, before it fails.
+//! An answer for a lease other than the one named is agentd misbehaving,
+//! and `lock` fails on it. One that can't connect to agentd (its name
+//! doesn't resolve, the connection is refused, or connecting takes over
+//! five seconds) fails at once, so a wrong URL or an agentd that is down is
 //! reported straight away. A renewal that can't connect is retried like any
 //! other failed in transit: the command already runs under the lease, the
 //! deadline bounds the retries, and a brief outage shouldn't kill it.
@@ -37,9 +40,9 @@
 //! instead of holding the lock against it. A grant can still land after
 //! agentctl has released the lease: a request held up in agentd past a
 //! later attempt that was granted, landing once the command ended, or once
-//! a lease too short or too long to hold, or a stop signal, made agentctl
-//! give it back. Nobody renews that lease, so it holds the lock for at most
-//! its TTL, thirty seconds by default.
+//! a lease too short or too long to hold, a stop signal, or giving up at
+//! `--timeout` made agentctl give it back. Nobody renews that lease, so it
+//! holds the lock for at most its TTL, thirty seconds by default.
 //!
 //! `SIGTERM`, `SIGINT` and `SIGHUP` are handled from the start. During an
 //! acquire, agentctl lets a request already sent finish, for up to two
@@ -92,7 +95,9 @@ const ACQUIRE_GRACE: Duration = Duration::from_secs(2);
 /// `store::BUSY_TIMEOUT` (five seconds) waiting for a busy database, so the
 /// common slow answer isn't abandoned. A grant later still isn't lost
 /// either: the next attempt names the same lease and gets it back. With the
-/// default `--timeout`, it keeps `lock` under the Bash tool's two minutes.
+/// default `--timeout` and the [`RELEASE_TIMEOUT`] of giving the lease back
+/// after the last attempt, it keeps `lock` under the Bash tool's two
+/// minutes.
 const ATTEMPT_FLOOR: Duration = Duration::from_secs(7);
 /// How long the command may take to exit after agentctl passes a stop
 /// signal on to it, before its process group is killed.
@@ -106,6 +111,9 @@ const RELEASE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Why a lease whose `seconds_left` the clock can't hold isn't relied on.
 const TOO_LONG: &str = "agentd granted a lease longer than the clock can hold";
+/// Why an answer that names a lease other than the one asked for isn't
+/// relied on.
+const OTHER_LEASE: &str = "agentd answered for another lease";
 
 /// Runs `command` under the lock and returns its exit status.
 ///
@@ -183,6 +191,10 @@ async fn acquire(
             }
         };
         let why = match answer {
+            Ok(LockResponse::Held { lease: granted, .. }) if granted != lease => {
+                let _ = release(client, lease, stop).await;
+                return Err(format!("couldn't hold the shared/ lock ({OTHER_LEASE})"));
+            }
             Ok(LockResponse::Held { seconds_left, .. }) => {
                 let Some(deadline) = reliable_until(sent, seconds_left) else {
                     let _ = release(client, lease, stop).await;
@@ -202,12 +214,16 @@ async fn acquire(
             }
             Err(Failure::Refused(err)) if err.code == CtlErrorCode::Internal => err.message,
             Err(err @ (Failure::Refused(_) | Failure::Unreachable(_))) => return Err(err.into()),
-            Err(Failure::Transport(message)) => format!(
-                "{message}; a lease agentd granted after agentctl stopped waiting expires \
-                 within its TTL"
-            ),
+            Err(Failure::Transport(message)) => message,
         };
         if Instant::now() + wait > give_up {
+            let why = match release(client, lease, stop).await {
+                None => why,
+                Some(err) => format!(
+                    "{why}; couldn't give back a lease agentd may have granted ({err}), so it \
+                     expires within its TTL"
+                ),
+            };
             return Err(format!(
                 "gave up waiting for the shared/ lock after the {}s timeout; {why}",
                 timeout.as_secs()
@@ -274,6 +290,9 @@ async fn hold(
                 .take()
                 .unwrap_or_else(|| "agentd didn't renew it in time".to_owned()),
             (sent, renewed) = renewal => match renewed {
+                Ok(LockResponse::Held { lease: held, .. }) if held != lease => {
+                    OTHER_LEASE.to_owned()
+                }
                 Ok(LockResponse::Held { seconds_left, .. }) => match reliable_until(sent, seconds_left) {
                     Some(until) => {
                         deadline = until;
@@ -492,7 +511,7 @@ mod tests {
     fn an_acquire_outlasts_agentds_busy_timeout_and_the_default_stays_under_two_minutes() {
         assert!(ATTEMPT_FLOOR > store::BUSY_TIMEOUT);
         let default = Duration::from_secs(crate::DEFAULT_LOCK_TIMEOUT_SECS);
-        assert!(default + ATTEMPT_FLOOR < Duration::from_secs(120));
+        assert!(default + ATTEMPT_FLOOR + RELEASE_TIMEOUT < Duration::from_secs(120));
     }
 
     #[test]

@@ -3075,8 +3075,9 @@ so `--timeout 1` took 30 seconds and the default could run past the Bash
 tool's 2 minutes. Each acquire is now given the time left, at least seven
 seconds and at most thirty. The floor lets `--timeout 0` take a free lock,
 and outlasts agentd's five-second SQLite busy timeout, so the common slow
-answer isn't abandoned. The default 100 seconds plus the floor stays under
-2 minutes.
+answer isn't abandoned. The default 100 seconds plus the floor, plus the
+two seconds giving the lease back may take after it, stays under 2
+minutes.
 
 ### The acquire is idempotent
 
@@ -3103,10 +3104,10 @@ that lands after agentctl released the lease is still orphaned: say an
 attempt is held up in agentd for over 30 seconds, a later attempt is
 granted, the command runs and the lease is released, and then the first
 attempt lands. The same goes for a grant landing after a stop signal's
-release, or after agentctl gave back a lease too short or too long to
-hold. Nobody renews such a lease, so it holds the lock for at most its
-TTL, 30 seconds by default. This was already so before the id; it is
-just not solved by it.
+release, after agentctl gave back a lease too short or too long to hold,
+or after it gave up at `--timeout`. Nobody renews such a lease, so it
+holds the lock for at most its TTL, 30 seconds by default. This was
+already so before the id; it is just not solved by it.
 
 An acquire that failed with agentd's internal error (a busy database,
 say), or whose answer was lost (it timed out, was cut off, or couldn't be
@@ -3119,9 +3120,18 @@ away. A renewal that can't connect is still retried until the deadline,
 since the command already runs under the lease and a brief outage
 shouldn't kill it. Any other refusal also fails at once. When `lock`
 gives up after the timeout, it names the last attempt's reason: busy,
-agentd's internal error, or the lost answer. Only after a lost answer
-does it add that a lease agentd granted anyway expires within its TTL,
-since no later attempt is left to pick it up.
+agentd's internal error, or the lost answer.
+
+Review found that giving up after a lost answer left the lease alone,
+although the likeliest lost answer is a grant that landed just after the
+last attempt stopped waiting, and no later attempt is left to pick it up:
+every session on the volume then waited out the TTL. agentctl now gives
+back the lease whenever it gives up, within the two seconds a release may
+take, and says the lease expires within its TTL only when that release
+fails. It also checks that a grant or renewal names the lease it asked
+for: an answer for another lease is agentd misbehaving, so an acquire
+gives back its own lease and fails, and a renewal is treated as a lost
+lease.
 
 ### The command runs in its own process group
 
@@ -4431,15 +4441,24 @@ credential, or act through `agentctl`, while B's turn runs. Restarting the
 process on a credential kind change doesn't help: the leftover isn't the CLI,
 and two members' subscriptions are the same kind.
 
-**Solution.** `Held` records the `Requester` whose turn started the container,
+**Solution.** `Held` records the requester whose turn started the container,
 and `ensure_process` stops the whole container, as it does a dead one or one
 with other mounts, when a turn's requester differs, before it looks at the
 process. Stopping the container ends its PID namespace and every process in
 it; stopping only the CLI would leave the leftovers running. It compares the
-full `Requester`, not the `CredentialRef`: a community-key turn of another
-requester also gets the agentctl token, so it gets a new container too. An
+requester, not the `CredentialRef`: a community-key turn of another requester
+also gets the agentctl token, so it gets a new container too. An
 agent-to-agent hop runs as the requester it inherits, so it keeps a container
-started for that requester. The cost is a container start and a `--resume` of
+started for that requester.
+
+Review noted that comparing the full `Requester` recycled the container when
+the requester's account was linked between two turns, flipping `member` from
+`None` to `Some`. It now compares `Requester::key` alone, which is as safe: a
+`MemberKey` names one member at most (`surface_identities` is keyed by it),
+and only ever the same one, since nothing rewrites or deletes an identity's
+member, so the key alone names the person. The credential that changes with a
+link, the community key to the member's subscription, changes the credential
+kind, and the fit check restarts the process in the kept container for it. The cost is a container start and a `--resume` of
 the transcript whenever consecutive turns of one session come from different
 requesters, as in a busy channel thread; a requester's own run of turns keeps
 the warm process. Only one requester's turns now share a warm process, so the
@@ -4447,7 +4466,9 @@ case the T20 note on `total_cost_usd` gives, of other members' turns on a
 shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
 no longer arises. `a_requester_change_replaces_the_container` checks that
 another requester's turn, a community-key one included, replaces the
-container, and that the same requester and a hop carrying it keep it.
+container, and that the same requester and a hop carrying it keep it;
+`a_requester_linked_between_turns_keeps_the_container` that a key gaining a
+member between turns keeps the container and restarts only the process.
 
 It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
 are the session's `home/`, `tmp/` and `claude/` on its volume, the working
@@ -4462,6 +4483,26 @@ a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 still use its own requester's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Processes a turn leaves running")
 records both, with a way to narrow the files' part.
+
+### `ProcessSandbox` gives every container one address
+
+**Issue.** Review noted that `ProcessSandbox::ip` answers `127.0.0.1` for
+every container, while agentd relies on an address holding one container
+at a time: `put_ctl_token` deletes every other token and lease bound to
+the address, and `Registry::mint` revokes other sessions' placeholders
+there. Two sessions running at once on it with real hooks would revoke
+each other's agentctl token and placeholders.
+
+**Solution.** It stays one address, and its rustdoc and the plan say it
+supports one running container at a time for those rules. Distinct
+loopback addresses per container wouldn't work end to end: its processes
+are local children that don't bind a source address, and Linux gives a
+connection to any `127.0.0.0/8` address the source `127.0.0.1`, so agentd
+would see every process at `127.0.0.1` whatever `ip` returned. T21's
+tests that run two sessions at once use fake hooks, which bind nothing to
+the address. A test that needs two live sessions with real hooks gives
+each its own address another way, as agentctl's integration tests do
+([T15](#one-token-per-container-address-too)).
 
 ### How turns queue and survive their caller
 
