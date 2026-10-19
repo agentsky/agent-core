@@ -152,7 +152,7 @@ pub enum Problem {
          `\\`, or a control or invisible character."
     )]
     BadName,
-    /// Two entries with the same name, or a file where a directory goes.
+    /// Two entries for the same path, or a file where a directory goes.
     #[error("The archive names the same path twice.")]
     Duplicate,
     /// A symlink.
@@ -354,6 +354,11 @@ fn new_file(path: &Path, mode: u32) -> Result<fs::File, CheckError> {
 
 /// Unpacks the zip archive `bytes` into `dir`, a new directory.
 ///
+/// Entries with exactly the same name reach it as one: `zip` keeps only the
+/// last of them, at the first one's place, so such an archive unpacks with
+/// that last entry's contents. Names that differ but land on the same path,
+/// such as `x` and `x/`, are refused.
+///
 /// # Errors
 ///
 /// The [`Problem`] with the archive, or an I/O failure.
@@ -370,7 +375,9 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
         if entry.encrypted() {
             return Err(Problem::Archive.into());
         }
-        if entry.is_symlink() {
+        let mode = entry_mode(&entry);
+        let kind = mode & 0o170_000;
+        if kind == 0o120_000 {
             return Err(Problem::Symlink.into());
         }
         let is_dir = entry.is_dir();
@@ -392,8 +399,6 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
         if !seen.insert(joined) {
             return Err(Problem::Duplicate.into());
         }
-        let mode = entry.unix_mode().unwrap_or(0o644);
-        let kind = mode & 0o170_000;
         if !is_dir && kind != 0 && kind != 0o100_000 {
             return Err(Problem::SpecialFile.into());
         }
@@ -431,6 +436,19 @@ pub fn unpack_zip(bytes: &[u8], dir: &Path) -> Result<(), CheckError> {
         }
     }
     Ok(())
+}
+
+/// An entry's Unix mode: the high 16 bits of its external attributes
+/// whenever any is set, whatever system the entry says made it, as `zip`
+/// 8.x read them; else `zip`'s own reading, or `0644`. `zip` 9.x ignores
+/// those bits in an entry marked as made on MS-DOS and makes up a plain
+/// file's mode, which would let such an entry hide a symlink or a FIFO, or
+/// drop its execute bit.
+fn entry_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> u32 {
+    match entry.external_attributes() >> 16 {
+        0 => entry.unix_mode().unwrap_or(0o644),
+        mode => mode,
+    }
 }
 
 /// Checks the tree at `root`, a directory agentd just wrote, against the
