@@ -4474,15 +4474,16 @@ the requester's account was linked between two turns, flipping `member` from
 and only ever the same one, since nothing rewrites or deletes an identity's
 member, so the key alone names the person. The credential that changes with a
 link, the community key to the member's subscription, changes the credential
-kind, and the fit check restarts the process in the kept container for it. The cost is a container start and a `--resume` of
-the transcript whenever consecutive turns of one session come from different
-requesters, as in a busy channel thread; a requester's own run of turns keeps
-the warm process. Only one requester's turns now share a warm process, so the
-case the T20 note on `total_cost_usd` gives, of other members' turns on a
-shared warm process ([T20](#total_cost_usd-is-the-processs-running-total)),
-no longer arises. `a_requester_change_replaces_the_container` checks that
-another requester's turn, a community-key one included, replaces the
-container, and that the same requester and a hop carrying it keep it;
+kind, and the fit check restarts the process in the kept container for it.
+The cost is a container start and a `--resume` of the transcript whenever
+consecutive turns of one session come from different requesters, as in a
+busy channel thread; a requester's own run of turns keeps the warm process.
+Only one requester's turns now share a warm process, so the case the T20
+note on `total_cost_usd` gives, of other members' turns on a shared warm
+process ([T20](#total_cost_usd-is-the-processs-running-total)), no longer
+arises. `a_requester_change_replaces_the_container` checks that another
+requester's turn, a community-key one included, replaces the container, and
+that the same requester and a hop carrying it keep it;
 `a_requester_linked_between_turns_keeps_the_container` that a key gaining a
 member between turns keeps the container and restarts only the process.
 
@@ -6023,11 +6024,12 @@ confirmation fenced out after its move doesn't undo it: whoever holds the
 lease now owns the name, and putting the old skill back could put it under
 their row, so the moved files stay live for the roll forward below. Unlike
 a crash, which leaves the skill they replaced in the work directory for
-startup's purge, the work directory's guard removes it at once. `LEASE_TTL` is two minutes: a change makes two store calls,
-each of which may wait the pool's 30-second acquire timeout and then the
-5-second busy timeout, about 70 seconds at worst, and a lease a crash left
-keeps the name busy for those two minutes. The sweeper deletes ended
-leases, so names nothing changes again don't keep rows.
+startup's purge, the work directory's guard removes it at once. `LEASE_TTL`
+is two minutes: a change makes two store calls, each of which may wait the
+pool's 30-second acquire timeout and then the 5-second busy timeout, about
+70 seconds at worst, and a lease a crash left keeps the name busy for those
+two minutes. The sweeper deletes ended leases, so names nothing changes
+again don't keep rows.
 
 With changes serialized, `confirm` checks the pending directory in place
 and moves it straight into the live one; the move into a work
