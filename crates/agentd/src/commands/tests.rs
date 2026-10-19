@@ -185,7 +185,7 @@ impl Harness {
     }
 
     /// The reply to `/agent <text>` sent as `user` in a Slack channel.
-    async fn slash(&self, user: &str, text: &str) -> String {
+    pub(super) async fn slash(&self, user: &str, text: &str) -> String {
         let origin = Origin::SlackSlash {
             response_url: SecretString::from("https://hooks.slack.test/r"),
             conv: ConvRef {

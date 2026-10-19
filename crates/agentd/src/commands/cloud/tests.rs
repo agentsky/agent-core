@@ -327,6 +327,12 @@ async fn cloud_add_and_run_are_refused_without_cloud_config() {
         "Cloud hand-off is off on this agentd, so I didn't start anything. `cloud list` and \
          `cloud rm` still work."
     );
+    assert_eq!(
+        h.slash("alice", &format!("cloud run {LABEL} Fix the flaky test"))
+            .await,
+        "Cloud hand-off is off on this agentd, so I didn't start anything. `/agent cloud list` \
+         and `/agent cloud rm` still work."
+    );
     assert!(handoffs(&h.store, alice).await.is_empty());
 
     h.dm("alice", "cloud list").await;
