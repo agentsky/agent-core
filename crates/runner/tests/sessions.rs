@@ -2018,6 +2018,7 @@ async fn a_record_changed_under_a_warm_container_recycles_it() {
     assert_eq!(h.sandbox.clears(), [true, true, true]);
     assert!(none_exist(&left), "files of unknown requesters are cleared");
 
+    let left = leave_files(&h, &session);
     h.store
         .set_session_files_requesters(id, &[key("U2")])
         .await
@@ -2029,6 +2030,12 @@ async fn a_record_changed_under_a_warm_container_recycles_it() {
         h.events().contains(&Event::ContainerStopped(id)),
         "a container U1's turns ran in never serves U2, whatever the record says"
     );
-    assert_eq!(h.sandbox.clears(), [true, true, true, false]);
+    assert_eq!(
+        h.sandbox.clears(),
+        [true, true, true, true],
+        "what U1's processes could still write there is cleared too"
+    );
+    assert!(none_exist(&left));
+    assert_eq!(h.files_requesters(id).await, [key("U2")]);
     assert_eq!(h.transcript(&session), ["1", "2", "3", "4"]);
 }
