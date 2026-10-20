@@ -51,7 +51,7 @@ pub use docker::{
     CONTAINER_PERSONA_DIR, CONTAINER_VOLUME_DIR, DockerSandbox, LABEL_AGENT, LABEL_INSTANCE,
     LABEL_SCOPE, LABEL_SESSION, container_config,
 };
-pub use layout::{SESSION_SUBDIRS, VOLUMES_DIR, scope_dir_name, volume_rel_path};
+pub use layout::{SESSION_SUBDIRS, VOLUMES_DIR, remove_tree, scope_dir_name, volume_rel_path};
 pub use process::ProcessSandbox;
 
 /// The persona file's name inside the agent's persona directory.
