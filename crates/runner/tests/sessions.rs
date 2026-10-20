@@ -162,13 +162,14 @@ impl TurnHooks for Hooks {
 }
 
 /// A [`ProcessSandbox`] that logs starts and stops, and whether each start
-/// cleared the session's files, counts running containers, can fail stops
-/// or return from them late, and can hide deaths from its event stream and
-/// then break the stream.
+/// cleared the session's files, counts running containers, can fail the
+/// starts that clear and the stops, or return from stops late, and can hide
+/// deaths from its event stream and then break the stream.
 struct TestSandbox {
     inner: ProcessSandbox,
     log: Log,
     clears: Mutex<Vec<bool>>,
+    fail_clears: AtomicBool,
     running: Mutex<HashSet<ContainerId>>,
     most: AtomicU32,
     sessions: Mutex<BTreeMap<ContainerId, SessionId>>,
@@ -196,6 +197,12 @@ impl Sandbox for TestSandbox {
     }
 
     async fn start(&self, spec: &SessionSpec) -> sandbox::Result<Container> {
+        if spec.clear_files && self.fail_clears.load(Ordering::SeqCst) {
+            return Err(SandboxError::Io {
+                what: "removing a directory tree",
+                source: std::io::Error::other("the removal ran out of time"),
+            });
+        }
         let container = self.inner.start(spec).await?;
         self.clears.lock().unwrap().push(spec.clear_files);
         push(&self.log, Event::ContainerStarted(spec.session));
@@ -340,6 +347,7 @@ impl Harness {
             running: Mutex::default(),
             most: AtomicU32::new(0),
             sessions: Mutex::default(),
+            fail_clears: AtomicBool::new(false),
             fail_stops: AtomicBool::new(false),
             failed_stops: AtomicU32::new(0),
             stop_delay_ms: AtomicU64::new(0),
@@ -2148,6 +2156,38 @@ async fn a_failed_record_of_a_member_joining_the_files_fails_the_turn_and_stops_
     assert!(!h.manager.is_warm(id));
     assert_eq!(h.files_requesters(id).await, [key("U1")]);
     assert_eq!(h.transcript(&session), ["1"]);
+}
+
+#[tokio::test]
+async fn a_failed_clear_fails_the_turn_and_keeps_the_record() {
+    let h = Harness::new(&[Turn::reply("a"), Turn::reply("b")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request_by("1", "U1")).await);
+    let left = leave_files(&h, &session);
+    h.sandbox.fail_clears.store(true, Ordering::SeqCst);
+    let err = h
+        .manager
+        .run_turn(id, request_by("2", "U2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunnerError::Sandbox(_)), "{err}");
+    assert_eq!(h.sandbox.running(), 0);
+    assert!(!h.manager.is_warm(id));
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
+    assert!(all_exist(&left));
+
+    h.sandbox.fail_clears.store(false, Ordering::SeqCst);
+    let report = h.run(id, request_by("3", "U2")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert_eq!(
+        h.sandbox.clears(),
+        [true, true],
+        "the next turn clears again"
+    );
+    assert!(none_exist(&left));
+    assert_eq!(h.files_requesters(id).await, [key("U2")]);
+    assert_eq!(h.transcript(&session), ["1", "3"]);
 }
 
 #[tokio::test]
