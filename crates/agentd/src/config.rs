@@ -478,7 +478,7 @@ pub struct RunnerConfig {
     /// a member may be listed once. A key that matches no member is
     /// accepted and groups no one. A Slack Connect member of another
     /// organization is keyed under the workspace agentd serves, as
-    /// [`MemberKey`](core_types::MemberKey) says. Default none.
+    /// [`MemberKey`] says. Default none.
     pub requester_groups: RequesterGroups,
     /// `working_emoji`: the reaction an agent's bot puts on the message it
     /// is answering while the turn runs, and takes off after. A short name
