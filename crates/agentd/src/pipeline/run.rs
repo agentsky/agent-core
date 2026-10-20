@@ -1821,6 +1821,7 @@ mod tests {
             created_at: event.received_at,
             last_turn_at: None,
             reset_at: None,
+            files_requester: None,
         };
         let requester = Requester {
             member: None,
