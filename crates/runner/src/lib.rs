@@ -82,7 +82,7 @@ mod transcript;
 pub use config::{
     ConfigError, DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP,
     DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_SCOPE_CONTAINER_CAP, DEFAULT_TURN_TIMEOUT_SECS, PoolConfig,
-    ProcessConfig,
+    ProcessConfig, RequesterGroups,
 };
 pub use hooks::{HookError, ProcessEnv, TurnHooks, TurnRequest};
 pub use launch::{LaunchSpec, SessionStart};
