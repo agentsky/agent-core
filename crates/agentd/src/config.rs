@@ -51,6 +51,7 @@ use router::ModelPolicy;
 use runner::{
     DEFAULT_CLAUDE_BIN, DEFAULT_GLOBAL_CONTAINER_CAP, DEFAULT_IDLE_TIMEOUT_SECS,
     DEFAULT_SCOPE_CONTAINER_CAP, DEFAULT_TURN_TIMEOUT_SECS, PoolConfig, ProcessConfig,
+    RequesterGroups,
 };
 use sandbox::SandboxConfig;
 use secrecy::SecretString;
@@ -418,6 +419,12 @@ pub struct RunnerConfig {
     /// `global_container_cap`: how many containers may run at once in all,
     /// from 1 to 4096. Default 32.
     pub global_container_cap: usize,
+    /// `requester_groups`: groups of requesters, by member key, who share a
+    /// session's warm container and its `home/`, `tmp/` and `claude/`
+    /// files, so only requesters who trust each other with their
+    /// credentials. A group needs two members or more, and a member may be
+    /// listed once. Default none.
+    pub requester_groups: RequesterGroups,
     /// `working_emoji`: the reaction an agent's bot puts on the message it
     /// is answering while the turn runs, and takes off after. A short name
     /// such as `eyes`, without colons. Default `hourglass_flowing_sand`.
@@ -436,6 +443,7 @@ impl Default for RunnerConfig {
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             scope_container_cap: DEFAULT_SCOPE_CONTAINER_CAP,
             global_container_cap: DEFAULT_GLOBAL_CONTAINER_CAP,
+            requester_groups: RequesterGroups::default(),
             working_emoji: crate::pipeline::DEFAULT_WORKING_EMOJI.to_owned(),
             models: None,
         }
@@ -460,6 +468,7 @@ impl RunnerConfig {
             idle_timeout_secs: self.idle_timeout_secs,
             scope_container_cap: self.scope_container_cap,
             global_container_cap: self.global_container_cap,
+            requester_groups: self.requester_groups.clone(),
         }
     }
 
@@ -1423,6 +1432,46 @@ data_dir = "/nonexistent/agentd"
         ] {
             let err = file_err(&format!("{MINIMAL}\n[runner]\n{section}\n"));
             assert_eq!(err.key(), Some(key), "{section}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_runner_section_sets_the_requester_groups() {
+        let config = with(
+            &format!(
+                "{MINIMAL}\n[runner]\nrequester_groups = [\
+                 [\"slack:T1:U1\", \"slack:T1:U2\"], \
+                 [\"rocketchat:chat.example.com:a\", \"rocketchat:chat.example.com:b\", \
+                 \"slack:T1:U3\"]]\n"
+            ),
+            env(),
+        )
+        .unwrap();
+        let groups = config.runner.pool().requester_groups;
+        let key = |text: &str| text.parse::<core_types::MemberKey>().unwrap();
+        assert!(groups.same_party(&key("slack:T1:U1"), &key("slack:T1:U2")));
+        assert!(groups.same_party(&key("slack:T1:U3"), &key("rocketchat:chat.example.com:a")));
+        assert!(!groups.same_party(&key("slack:T1:U1"), &key("slack:T1:U3")));
+        assert_eq!(
+            with(MINIMAL, env()).unwrap().runner.pool().requester_groups,
+            RequesterGroups::default()
+        );
+
+        for groups in [
+            "[[\"slack:T1:U1\", \"teams:T1:U2\"]]",
+            "[[\"slack:T1:U1\"]]",
+            "[[]]",
+            "[[\"slack:T1:U1\", \"slack:T1:U1\"]]",
+            "[[\"slack:T1:U1\", \"slack:T1:U2\"], [\"slack:T1:U2\", \"slack:T1:U3\"]]",
+        ] {
+            let err = file_err(&format!(
+                "{MINIMAL}\n[runner]\nrequester_groups = {groups}\n"
+            ));
+            assert_eq!(
+                err.key(),
+                Some("runner.requester_groups"),
+                "{groups}: {err}"
+            );
         }
     }
 
