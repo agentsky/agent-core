@@ -1003,22 +1003,32 @@ async fn remove_stale(dir: &Path, age: Duration) -> Result<(), SkillError> {
     if OffsetDateTime::now_utc() - changed < age {
         return Ok(());
     }
-    let path = dir.to_owned();
-    blocking(move || sandbox::remove_tree(&path))
-        .await?
-        .map_err(|err| io("removing a stale skill directory")(std::io::Error::other(err)))?;
+    remove_tree(dir, "removing a stale skill directory").await?;
     tracing::info!(path = %dir.display(), "removed a skill directory no row records");
     Ok(())
 }
 
 /// Removes the directory `dir` and everything in it, without following
-/// symlinks. Returns whether it existed.
+/// symlinks. Returns whether it existed; anything else there is an error.
 async fn remove_dir(dir: &Path) -> Result<bool, SkillError> {
-    match tokio::fs::remove_dir_all(dir).await {
-        Ok(()) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(io("removing a skill directory")(err)),
+    let what = "removing a skill directory";
+    match tokio::fs::symlink_metadata(dir).await {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err(io(what)(std::io::ErrorKind::NotADirectory.into())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(io(what)(err)),
     }
+    remove_tree(dir, what).await?;
+    Ok(true)
+}
+
+/// Removes `path`, whatever it is, with [`sandbox::remove_tree`] in a
+/// blocking task.
+async fn remove_tree(path: &Path, what: &'static str) -> Result<(), SkillError> {
+    let path = path.to_owned();
+    blocking(move || sandbox::remove_tree(&path))
+        .await?
+        .map_err(|err| io(what)(std::io::Error::other(err)))
 }
 
 async fn is_dir(dir: &Path) -> Result<bool, SkillError> {

@@ -2214,3 +2214,35 @@ async fn a_record_changed_under_a_warm_container_recycles_it() {
     assert_eq!(h.files_requesters(id).await, [key("U2")]);
     assert_eq!(h.transcript(&session), ["1", "2", "3", "4"]);
 }
+
+#[tokio::test]
+async fn a_recycle_for_the_held_party_resets_the_record_to_the_requester() {
+    let h = Harness::with(&[Turn::reply("a"), Turn::reply("b")], |_, pool| {
+        pool.requester_groups = RequesterGroups::new(vec![vec![key("U2"), key("U3")]]);
+    })
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request_by("1", "U1")).await);
+    assert!(h.manager.is_warm(id));
+
+    let left = leave_files(&h, &session);
+    h.store
+        .set_session_files_requesters(id, &[key("U2"), key("U3")])
+        .await
+        .unwrap();
+    h.clear();
+    let report = h.run(id, request_by("2", "U2")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert!(
+        h.events().contains(&Event::ContainerStopped(id)),
+        "U1's container never serves U2's group"
+    );
+    assert_eq!(h.sandbox.clears(), [true, true]);
+    assert!(none_exist(&left));
+    assert_eq!(
+        h.files_requesters(id).await,
+        [key("U2")],
+        "U3 used no files since the clear"
+    );
+}
