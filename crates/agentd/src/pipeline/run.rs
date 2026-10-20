@@ -2173,7 +2173,7 @@ mod tests {
             created_at: event.received_at,
             last_turn_at: None,
             reset_at: None,
-            files_requester: None,
+            files_requesters: Vec::new(),
         };
         let requester = Requester {
             member: None,

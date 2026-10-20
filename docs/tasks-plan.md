@@ -1914,11 +1914,14 @@ Deliverables:
   requester
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
   The members of a group in `PoolConfig::requester_groups` count as one
-  requester. A container started for a requester other than the one the
-  session's files were last cleared for (`sessions.files_requester`, added
-  by `…_session_files_requester.sql`; none clears too) first empties
-  `home/` and `tmp/` and removes everything in `claude/` but the
-  transcript, and the requester is recorded before any process starts
+  requester. `sessions.files_requesters` (added by
+  `…_session_files_requesters.sql`) records the requesters whose turns have
+  used the session's files since they were last cleared. A turn whose
+  requester isn't the same party as every one of them (an empty or
+  unparsable record included) gets a container that first empties `home/`
+  and `tmp/` and removes everything in `claude/` but the transcript, and
+  the record becomes that requester alone; a group member missing from it
+  is added. Either write comes before any process gets the turn
   ([impl-notes](impl-notes.md#a-requester-change-clears-the-sessions-files)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
