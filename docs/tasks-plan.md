@@ -1982,6 +1982,13 @@ Acceptance:
     or a restart too; the same requester's doesn't, and a member of its
     group keeps the warm container and the files. A failure to record the
     requester fails the turn and stops the container.
+  - Once a group is removed, the first member's turn clears what the
+    second member's left, whether the second used the first's warm
+    container or a new one after an idle reap. A failure to add a joining
+    member to the record fails its turn and stops the container.
+  - A record changed under a warm container (to another party, or NULL)
+    recycles the container and clears the files; another party's turn
+    gets a new container even when the record names it.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
@@ -4212,19 +4219,23 @@ Not scheduled. Each needs a decision before it becomes a task.
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
   What remains:
   - A process left behind can still spend the credentials of its own
-    requester's later turns while they run, and act through `agentctl` on
-    them, and it can use the egress allowlist between turns. Killing what
-    a turn leaves behind has no clean boundary: the CLI stays running
-    between turns, the Bash tool's background shells are its children, a
-    job started with `&` is reparented to the container's init once its
-    shell exits, and the Docker sandbox kills a process by its pid alone.
-  - Files outlive the container in part. On a requester change T21
+    party's later turns while they run (a requester's, or a
+    `requester_groups` group's), and act through `agentctl` on them, and
+    it can use the egress allowlist between turns. Killing what a turn
+    leaves behind has no clean boundary: the CLI stays running between
+    turns, the Bash tool's background shells are its children, a job
+    started with `&` is reparented to the container's init once its shell
+    exits, and the Docker sandbox kills a process by its pid alone.
+  - Files outlive the container in part. When the party changes T21
     clears the session's `home/`, `tmp/` and everything in `claude/` but
-    the transcript (a `.bashrc` the Bash tool's shells source, a
-    `CLAUDE.md` the CLI loads as user memory), unless `requester_groups`
-    puts both requesters in one group. What a turn leaves in `work/` or
-    `shared/`, such as a git hook, or in the transcript still runs or
-    instructs code in a later requester's process.
+    the transcript file and its directory (a `.bashrc` the Bash tool's
+    shells source, a `CLAUDE.md` the CLI loads as user memory). What a
+    turn leaves in `work/` or `shared/`, such as a git hook, or in the
+    kept transcript files still runs or instructs code in a later
+    requester's process. During a blue-green overlap of two agentd
+    instances, the other instance's warm container of a session, and what
+    is left running in it, can also write to the session's files after a
+    clear.
 - **Metering at the credential proxy.** T27's meter and thread token
   budget read tokens and cost from the CLI's output, and the agent runs as
   the CLI's user, so it can print its own `assistant` and `result` lines
