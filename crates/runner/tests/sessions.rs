@@ -13,8 +13,9 @@ use core_types::{
 };
 use futures::stream::{BoxStream, StreamExt};
 use runner::{
-    CostUnknown, HookError, PoolConfig, ProcessConfig, ProcessEnv, RunnerError, Session,
-    SessionConfig, SessionManager, SessionStart, TurnHooks, TurnOutcome, TurnReport, TurnRequest,
+    CostUnknown, HookError, PoolConfig, ProcessConfig, ProcessEnv, RequesterGroups, RunnerError,
+    Session, SessionConfig, SessionManager, SessionStart, TurnHooks, TurnOutcome, TurnReport,
+    TurnRequest,
 };
 use sandbox::{
     ChildIo, Container, ContainerEvent, ContainerId, ManagedContainer, ProcessSandbox, Sandbox,
@@ -160,12 +161,14 @@ impl TurnHooks for Hooks {
     }
 }
 
-/// A [`ProcessSandbox`] that logs starts and stops, counts running
-/// containers, can fail stops or return from them late, and can hide deaths
-/// from its event stream and then break the stream.
+/// A [`ProcessSandbox`] that logs starts and stops, and whether each start
+/// cleared the session's files, counts running containers, can fail stops
+/// or return from them late, and can hide deaths from its event stream and
+/// then break the stream.
 struct TestSandbox {
     inner: ProcessSandbox,
     log: Log,
+    clears: Mutex<Vec<bool>>,
     running: Mutex<HashSet<ContainerId>>,
     most: AtomicU32,
     sessions: Mutex<BTreeMap<ContainerId, SessionId>>,
@@ -180,6 +183,10 @@ impl TestSandbox {
     fn running(&self) -> usize {
         self.running.lock().unwrap().len()
     }
+
+    fn clears(&self) -> Vec<bool> {
+        self.clears.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -190,6 +197,7 @@ impl Sandbox for TestSandbox {
 
     async fn start(&self, spec: &SessionSpec) -> sandbox::Result<Container> {
         let container = self.inner.start(spec).await?;
+        self.clears.lock().unwrap().push(spec.clear_files);
         push(&self.log, Event::ContainerStarted(spec.session));
         let mut running = self.running.lock().unwrap();
         running.insert(container.id().clone());
@@ -266,6 +274,29 @@ impl Sandbox for TestSandbox {
     }
 }
 
+fn manager(
+    store: &Store,
+    sandbox: &Arc<TestSandbox>,
+    log: &Log,
+    script: &std::path::Path,
+    faults: &Arc<Faults>,
+    config: SessionConfig,
+) -> SessionManager<Hooks> {
+    let hooks = Hooks {
+        log: Arc::clone(log),
+        script: script.to_owned(),
+        next: AtomicU32::new(0),
+        faults: Arc::clone(faults),
+    };
+    SessionManager::new(
+        store.clone(),
+        Arc::clone(sandbox) as Arc<dyn Sandbox>,
+        hooks,
+        config,
+    )
+    .unwrap()
+}
+
 struct Harness {
     _dir: TempDir,
     store: Store,
@@ -273,6 +304,8 @@ struct Harness {
     anthropic: FakeAnthropic,
     log: Log,
     manager: SessionManager<Hooks>,
+    config: SessionConfig,
+    script: PathBuf,
     agent: AgentId,
     faults: Arc<Faults>,
     logs: &'static Logs,
@@ -303,6 +336,7 @@ impl Harness {
         let sandbox = Arc::new(TestSandbox {
             inner: ProcessSandbox::new(store.clone(), dir.path().to_owned()).unwrap(),
             log: Arc::clone(&log),
+            clears: Mutex::default(),
             running: Mutex::default(),
             most: AtomicU32::new(0),
             sessions: Mutex::default(),
@@ -320,24 +354,13 @@ impl Harness {
         let mut pool = PoolConfig::default();
         change(&mut process, &mut pool);
         let faults = Arc::new(Faults::default());
-        let hooks = Hooks {
-            log: Arc::clone(&log),
-            script,
-            next: AtomicU32::new(0),
-            faults: Arc::clone(&faults),
+        let config = SessionConfig {
+            process,
+            pool,
+            image: "unused".into(),
+            data_dir: dir.path().to_owned(),
         };
-        let manager = SessionManager::new(
-            store.clone(),
-            Arc::clone(&sandbox) as Arc<dyn Sandbox>,
-            hooks,
-            SessionConfig {
-                process,
-                pool,
-                image: "unused".into(),
-                data_dir: dir.path().to_owned(),
-            },
-        )
-        .unwrap();
+        let manager = manager(&store, &sandbox, &log, &script, &faults, config.clone());
         Self {
             _dir: dir,
             store,
@@ -345,10 +368,36 @@ impl Harness {
             anthropic,
             log,
             manager,
+            config,
+            script,
             agent,
             faults,
             logs,
         }
+    }
+
+    /// Replaces the manager with a new one over the same store and sandbox,
+    /// as a restart of agentd does, with `change` made to the pool's
+    /// settings.
+    fn restart(&mut self, change: impl FnOnce(&mut PoolConfig)) {
+        change(&mut self.config.pool);
+        self.manager = manager(
+            &self.store,
+            &self.sandbox,
+            &self.log,
+            &self.script,
+            &self.faults,
+            self.config.clone(),
+        );
+    }
+
+    async fn files_requester(&self, session: SessionId) -> Option<MemberKey> {
+        self.store
+            .session(session)
+            .await
+            .unwrap()
+            .unwrap()
+            .files_requester
     }
 
     fn events(&self) -> Vec<Event> {
@@ -478,7 +527,7 @@ async fn eventually(what: &str, check: impl Fn() -> bool) {
     }
 }
 
-fn projects_dir(h: &Harness, session: &Session) -> PathBuf {
+fn session_dir(h: &Harness, session: &Session) -> PathBuf {
     let volume = VolumeKey {
         agent: h.agent,
         scope: session.scope.clone(),
@@ -487,7 +536,43 @@ fn projects_dir(h: &Harness, session: &Session) -> PathBuf {
         .join(sandbox::volume_rel_path(&volume))
         .join("sessions")
         .join(session.id.to_string())
-        .join("claude/projects")
+}
+
+fn projects_dir(h: &Harness, session: &Session) -> PathBuf {
+    session_dir(h, session).join("claude/projects")
+}
+
+/// Leaves a `.bashrc` in the session's `home/` and a `CLAUDE.md` in its
+/// `claude/`, as a turn could, and returns their paths.
+fn leave_files(h: &Harness, session: &Session) -> [PathBuf; 2] {
+    let dir = session_dir(h, session);
+    let left = [dir.join("home/.bashrc"), dir.join("claude/CLAUDE.md")];
+    for path in &left {
+        std::fs::write(path, "left by a turn").unwrap();
+    }
+    left
+}
+
+fn all_exist(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|path| path.is_file())
+}
+
+fn none_exist(paths: &[PathBuf]) -> bool {
+    paths.iter().all(|path| !path.exists())
+}
+
+fn key(user: &str) -> MemberKey {
+    MemberKey {
+        surface: SurfaceKind::Slack,
+        team: "T1".into(),
+        user: user.into(),
+    }
+}
+
+fn request_by(message: &str, user: &str) -> TurnRequest {
+    let mut request = request(message);
+    request.requester.key = key(user);
+    request
 }
 
 fn position(events: &[Event], wanted: &Event) -> usize {
@@ -1850,4 +1935,134 @@ async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn_instead_of_reru
     );
     let stored = h.store.session(session.id).await.unwrap().unwrap();
     assert!(stored.started, "{stored:?}");
+}
+
+#[tokio::test]
+async fn another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restart() {
+    let mut h = Harness::with(
+        &[
+            Turn::reply("a"),
+            Turn::reply("b"),
+            Turn::reply("c"),
+            Turn::reply("d"),
+        ],
+        |_, pool| pool.idle_timeout_secs = 1,
+    )
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    assert_eq!(h.files_requester(id).await, None);
+    reply(&h.run(id, request_by("1", "U1")).await);
+    assert_eq!(h.sandbox.clears(), [true], "a new session is cleared");
+    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+    let left = leave_files(&h, &session);
+    eventually("the idle container is reaped", || !h.manager.is_warm(id)).await;
+
+    reply(&h.run(id, request_by("2", "U1")).await);
+    assert_eq!(h.sandbox.clears(), [true, false]);
+    assert!(all_exist(&left), "the same requester keeps their files");
+    eventually("the idle container is reaped", || !h.manager.is_warm(id)).await;
+
+    let report = h.run(id, request_by("3", "U2")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert_eq!(h.sandbox.clears(), [true, false, true]);
+    assert!(
+        none_exist(&left),
+        "another requester's turn after a reap clears"
+    );
+    assert_eq!(h.files_requester(id).await, Some(key("U2")));
+
+    let left = leave_files(&h, &session);
+    h.manager.stop(id).await;
+    h.restart(|_| {});
+    let report = h.run(id, request_by("4", "U1")).await;
+    assert_eq!(reply(&report), "d");
+    assert_eq!(h.sandbox.clears(), [true, false, true, true]);
+    assert!(
+        none_exist(&left),
+        "another requester's turn after a restart clears"
+    );
+    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+    assert_eq!(h.transcript(&session), ["1", "2", "3", "4"]);
+}
+
+#[tokio::test]
+async fn a_trusted_group_shares_the_warm_container_and_the_files() {
+    let mut h = Harness::with(
+        &[
+            Turn::reply("a"),
+            Turn::reply("b"),
+            Turn::reply("c"),
+            Turn::reply("d"),
+            Turn::reply("e"),
+        ],
+        |_, pool| {
+            pool.requester_groups = RequesterGroups::new(vec![vec![key("U1"), key("U2")]]);
+        },
+    )
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request_by("1", "U1")).await);
+    let left = leave_files(&h, &session);
+    let report = h.run(id, request_by("2", "U2")).await;
+    assert_eq!(
+        report.process_start, None,
+        "a member of the group keeps the warm container and process"
+    );
+    assert_eq!(h.sandbox.clears(), [true]);
+    assert!(all_exist(&left));
+    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+
+    h.manager.stop(id).await;
+    reply(&h.run(id, request_by("3", "U2")).await);
+    assert_eq!(h.sandbox.clears(), [true, false]);
+    assert!(all_exist(&left), "a member's new container keeps the files");
+    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+
+    h.manager.stop(id).await;
+    h.restart(|pool| pool.requester_groups = RequesterGroups::default());
+    reply(&h.run(id, request_by("4", "U2")).await);
+    assert_eq!(h.sandbox.clears(), [true, false, true]);
+    assert!(
+        none_exist(&left),
+        "without the group, U2 is another requester"
+    );
+    assert_eq!(h.files_requester(id).await, Some(key("U2")));
+
+    let left = leave_files(&h, &session);
+    h.clear();
+    let report = h.run(id, request_by("5", "U3")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert!(h.events().contains(&Event::ContainerStopped(id)));
+    assert_eq!(h.sandbox.clears(), [true, false, true, true]);
+    assert!(none_exist(&left));
+    assert_eq!(h.transcript(&session), ["1", "2", "3", "4", "5"]);
+}
+
+#[tokio::test]
+async fn a_failed_record_of_whose_files_they_are_fails_the_turn_and_stops_the_container() {
+    let h = Harness::new(&[Turn::reply("never")]).await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    let mut db = sqlx::SqliteConnection::connect(&h._dir.db_url())
+        .await
+        .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER files_requester_fails BEFORE UPDATE OF files_requester ON sessions \
+         BEGIN SELECT RAISE(ABORT, 'recording fails'); END",
+    )
+    .execute(&mut db)
+    .await
+    .unwrap();
+    let err = h.manager.run_turn(id, request("one")).await.unwrap_err();
+    assert!(matches!(err, RunnerError::Store(_)), "{err}");
+    assert_eq!(
+        h.events(),
+        [Event::ContainerStarted(id), Event::ContainerStopped(id)]
+    );
+    assert_eq!(h.sandbox.clears(), [true]);
+    assert_eq!(h.sandbox.running(), 0);
+    assert!(!h.manager.is_warm(id));
+    assert_eq!(h.files_requester(id).await, None);
 }
