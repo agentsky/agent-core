@@ -155,7 +155,7 @@ impl Drop for Outbox {
 /// logging a failure other than its absence.
 pub(crate) fn remove_dir(dir: &Path) {
     if let Err(err) = sandbox::remove_tree(dir) {
-        tracing::warn!(error = %err, "removing an agentctl staging directory failed");
+        tracing::warn!(dir = %dir.display(), error = %err, "removing a directory failed");
     }
 }
 
