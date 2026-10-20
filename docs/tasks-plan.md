@@ -2947,12 +2947,12 @@ Not scheduled. Each needs a decision before it becomes a task.
     clears the session directory's stray entries, `home/`, `tmp/` and
     everything in `claude/` but the transcript file and its directory (a
     `.bashrc` the Bash tool's shells source, a `CLAUDE.md` the CLI loads
-    as user memory). What a turn leaves in `work/` or `shared/`, such as a git hook, or in the
-    kept transcript files still runs or instructs code in a later
-    requester's process. During a blue-green overlap of two agentd
-    instances, the other instance's warm container of a session, and what
-    is left running in it, can also write to the session's files after a
-    clear.
+    as user memory). What a turn leaves in `work/` or `shared/`, such as
+    a git hook, or in the kept transcript files still runs or instructs
+    code in a later requester's process. During a blue-green overlap of
+    two agentd instances, the other instance's warm container of a
+    session, and what is left running in it, can also write to the
+    session's files after a clear.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
