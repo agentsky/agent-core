@@ -3928,12 +3928,13 @@ every process a turn left running
 process left from turn N spends only the credentials of its own party's
 later turns while they run (a requester's, or a configured group's). Killing
 what a turn leaves behind has no clean boundary. Some files outlive the
-container, though. T21 clears `home/`, `tmp/` and `claude/`, keeping only the
-transcript file and its directory, when the party changes, but what a turn
-leaves in the session's `work/`, in `shared/`, or in the transcript can run
-or instruct code in a later requester's process, which then spends that
-requester's credential. The plan's Deferred work ("Processes a turn leaves
-running") records both.
+container, though. When the party changes T21 clears the session
+directory's stray entries, `home/`, `tmp/`, and everything in `claude/` but
+the transcript file and its directory, but what a turn leaves in the
+session's `work/`, in `shared/`, or in the transcript can run or instruct
+code in a later requester's process, which then spends that requester's
+credential. The plan's Deferred work ("Processes a turn leaves running")
+records both.
 
 ### Headers the proxy changes besides the credential
 
@@ -4161,7 +4162,7 @@ sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
 "Processes a turn leaves running" entry records it; T21 recycles the
-container on a requester change, not at turn end, so the process keeps it
+container on a change of party, not at turn end, so the process keeps it
 until the container goes). Resolving the name with a trailing dot also
 skips `/etc/hosts` on glibc, so an operator can't pin an allowed host to a
 fixed address there; pin it in DNS instead.
@@ -4521,11 +4522,12 @@ and two members' subscriptions are the same kind.
 
 **Solution.** `Held` records the requester whose turn started the container,
 and `ensure_process` stops the whole container, as it does a dead one or one
-with other mounts, when a turn's requester differs, before it looks at the
-process. Stopping the container ends its PID namespace and every process in
-it; stopping only the CLI would leave the leftovers running. It compares the
-requester, not the `CredentialRef`: a community-key turn of another requester
-also gets the agentctl token, so it gets a new container too. An
+with other mounts, when a turn's requester isn't the same party, before it
+looks at the process. Stopping the container ends its PID namespace and
+every process in it; stopping only the CLI would leave the leftovers
+running. It compares the requester, not the `CredentialRef`: a
+community-key turn of another requester also gets the agentctl token, so it
+gets a new container too. An
 agent-to-agent hop runs as the requester it inherits, so it keeps a container
 started for that requester.
 
@@ -4563,7 +4565,7 @@ a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 `work/` or `shared/`, or text in the transcript. A leftover process can also
 still use its own party's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Processes a turn leaves running")
-records both; the next note clears `home/`, `tmp/` and `claude/`.
+records both; the next note clears the session's files.
 
 ### A requester change clears the session's files
 
@@ -6426,7 +6428,7 @@ through `fake-claude`, which records the pid of the `claude` process that
 ran each turn. A change of credential kind or model shows as a new pid.
 A test with two linked members on one model shows a new pid for the
 second member's turn, with each turn's own bearer token upstream, since
-T21 recycles the container when the requester changes
+T21 recycles the container when the party changes
 ([T21](#another-requesters-turn-gets-a-new-container)), and the same pid
 for that member's next turn.
 
@@ -9463,10 +9465,10 @@ posted again in that case.
 - A background process left from an earlier turn can also run
   `ask-agent` or post mentions while a later turn runs, starting hops
   attributed to that turn's requester. T21 recycles the container on a
-  requester change, which ends such a process before another requester's
-  turn, so the hops it starts are only ever attributed to the requester
-  whose turn left it, or to the members of their group in
-  `requester_groups`, during their later turns in the session. Killing
+  change of party, which ends such a process before another party's turn,
+  so the hops it starts are only ever attributed to the requester whose
+  turn left it, or to the members of their group in `requester_groups`,
+  during their later turns in the session. Killing
   what a turn leaves behind would close that too; the "Processes a turn
   leaves running" bullet in [Deferred work](tasks-plan.md#deferred-work)
   says why it is deferred.

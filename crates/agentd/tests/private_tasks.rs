@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -36,7 +36,7 @@ use store::{
     Visibility,
 };
 use testkit::{
-    Call, FakeAnthropic, MockSurface, TempDir, Turn, agentctl_path, fake_anthropic,
+    Call, FakeAnthropic, MockSurface, TempDir, Turn, agentctl_path, deep_tree, fake_anthropic,
     fake_claude_path,
 };
 use time::OffsetDateTime;
@@ -1490,17 +1490,6 @@ async fn a_store_failure_before_the_task_runs_is_retried() {
     assert_eq!(row.work_failures, 1);
     assert!(row.private_session.is_some());
     stack.stop().await;
-}
-
-fn deep_tree(top: &Path, depth: usize) {
-    use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC;
-    std::fs::create_dir_all(top).unwrap();
-    let mut level = rustix::fs::open(top, flags, Mode::empty()).unwrap();
-    for _ in 0..depth {
-        rustix::fs::mkdirat(&level, "d", Mode::from_raw_mode(0o755)).unwrap();
-        level = rustix::fs::openat(&level, "d", flags, Mode::empty()).unwrap();
-    }
 }
 
 #[tokio::test]

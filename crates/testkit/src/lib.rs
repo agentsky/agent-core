@@ -19,7 +19,8 @@
 //!   [`proxy::assert_proxied_only_elsewhere`].
 //! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 //! - [`slack`]: Slack request signing and payload fixtures.
-//! - [`TempDir`]: a directory for one test, removed when the test ends.
+//! - [`TempDir`]: a directory for one test, removed when the test ends,
+//!   and [`deep_tree`], a chain of directories too deep for one path.
 
 #![warn(missing_docs)]
 
@@ -41,4 +42,4 @@ pub use held::{Held, Hold};
 pub use logs::{Logged, Logs};
 pub use proxy::FakeProxy;
 pub use surface::{Call, MockSurface, Op, UploadedFile};
-pub use temp_dir::TempDir;
+pub use temp_dir::{TempDir, deep_tree};
