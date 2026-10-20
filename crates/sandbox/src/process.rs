@@ -140,6 +140,7 @@ impl Sandbox for ProcessSandbox {
                 &spec.volume,
                 spec.session,
                 SkillsEntry::Link(spec.skills_dir.clone()),
+                spec.clear_files,
             )
             .await?;
         let paths = SessionPaths {
