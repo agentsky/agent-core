@@ -660,6 +660,42 @@ async fn startup_clears_work_expired_and_unrecorded_skills() {
     );
 }
 
+fn deep_tree(top: &Path, depth: usize) {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC;
+    std::fs::create_dir_all(top).unwrap();
+    let mut level = rustix::fs::open(top, flags, Mode::empty()).unwrap();
+    for _ in 0..depth {
+        rustix::fs::mkdirat(&level, "d", Mode::from_raw_mode(0o755)).unwrap();
+        level = rustix::fs::openat(&level, "d", flags, Mode::empty()).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn trees_deeper_than_recursion_allows_leave_no_work_behind() {
+    const DEPTH: usize = 16_000;
+    let h = harness().await;
+
+    let work = h.skills.work_dir().await.unwrap();
+    let clone = work.0.join("clone");
+    deep_tree(&clone.join(".git"), DEPTH);
+    package::check_tree(&clone).unwrap();
+    assert!(!clone.join(".git").exists());
+    deep_tree(&work.0.join("left"), DEPTH);
+    drop(work);
+    assert!(
+        h.work_is_empty(),
+        "a work directory goes when its guard drops"
+    );
+
+    deep_tree(&h.data.join(WORK_DIR).join("left-over"), DEPTH);
+    h.skills.purge_older_than(Duration::ZERO).await.unwrap();
+    assert!(
+        h.work_is_empty(),
+        "the purge removes a stale work directory"
+    );
+}
+
 #[tokio::test]
 async fn replacing_a_skill_takes_its_hosts_away_even_if_its_files_cant_move() {
     let h = harness().await;

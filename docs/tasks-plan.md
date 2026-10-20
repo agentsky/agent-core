@@ -1904,9 +1904,10 @@ Deliverables:
     ([impl-notes](impl-notes.md#mounts-come-from-the-turns-side)).
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
-  If the next turn's requester differs from the one whose turn started the
-  container, stop the container, which ends every process a turn left running
-  in it, and start a new one, whose process starts with `--resume`.
+  If the next turn's requester isn't the same party as the one whose turn
+  started the container, stop the container, which ends every process a turn
+  left running in it, and start a new one, whose process starts with
+  `--resume`.
   Requesters are compared by `MemberKey`, so a requester whose account is
   linked between two turns keeps the container. An agent-to-agent hop runs as
   the requester it inherits, so it keeps a container started for that
@@ -1917,10 +1918,13 @@ Deliverables:
   `…_session_files_requesters.sql`) records the requesters whose turns have
   used the session's files since they were last cleared. A turn whose
   requester isn't the same party as every one of them (an empty or
-  unparsable record included) gets a container that first empties `home/`
-  and `tmp/` and removes everything in `claude/` but the transcript, and
-  the record becomes that requester alone; a group member missing from it
-  is added. Either write comes before any process gets the turn
+  unparsable record included), or whose warm container was started for
+  another party, gets a container that first removes every stray entry of
+  the session directory but its four subdirectories, empties `home/` and
+  `tmp/`, and removes everything in `claude/` but the transcript file and
+  its directory, which are kept whole. The record becomes that requester
+  alone; a group member missing from it is added. Either write comes
+  before any process gets the turn
   ([impl-notes](impl-notes.md#a-requester-change-clears-the-sessions-files)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
@@ -3137,7 +3141,7 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Processes a turn leaves running.** T18 unpoints the placeholder when a
   turn ends, so a background process the model left running can't spend
   credentials between turns, and T21 recycles the session's container when
-  the requester changes, which ends every process running in it
+  the party changes, which ends every process running in it
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
   What remains:
   - A process left behind can still spend the credentials of its own
@@ -3149,10 +3153,10 @@ Not scheduled. Each needs a decision before it becomes a task.
     started with `&` is reparented to the container's init once its shell
     exits, and the Docker sandbox kills a process by its pid alone.
   - Files outlive the container in part. When the party changes T21
-    clears the session's `home/`, `tmp/` and everything in `claude/` but
-    the transcript file and its directory (a `.bashrc` the Bash tool's
-    shells source, a `CLAUDE.md` the CLI loads as user memory). What a
-    turn leaves in `work/` or `shared/`, such as a git hook, or in the
+    clears the session directory's stray entries, `home/`, `tmp/` and
+    everything in `claude/` but the transcript file and its directory (a
+    `.bashrc` the Bash tool's shells source, a `CLAUDE.md` the CLI loads
+    as user memory). What a turn leaves in `work/` or `shared/`, such as a git hook, or in the
     kept transcript files still runs or instructs code in a later
     requester's process. During a blue-green overlap of two agentd
     instances, the other instance's warm container of a session, and what
