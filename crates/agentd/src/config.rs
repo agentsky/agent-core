@@ -456,9 +456,11 @@ pub struct RunnerConfig {
     pub global_container_cap: usize,
     /// `requester_groups`: groups of requesters, by member key, who share a
     /// session's warm container and its `home/`, `tmp/` and `claude/`
-    /// files, so only requesters who trust each other with their
-    /// credentials. A group needs two members or more, and a member may be
-    /// listed once. Default none.
+    /// files. What one member's turn leaves there can run with another's
+    /// credential, so a group should hold only requesters who trust each
+    /// other with their credentials. A group needs two members or more, and
+    /// a member may be listed once. A key that matches no member is
+    /// accepted and groups no one. Default none.
     pub requester_groups: RequesterGroups,
     /// `working_emoji`: the reaction an agent's bot puts on the message it
     /// is answering while the turn runs, and takes off after. A short name
