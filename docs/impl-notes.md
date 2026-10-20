@@ -3616,9 +3616,9 @@ to that handle, with `O_NOFOLLOW | O_DIRECTORY`. `settings.json` and
 its path: a new file is created with `O_EXCL | O_NOFOLLOW`, given away
 with `fchown`, and renamed over `settings.json` within the same
 directory, which replaces a symlink instead of following it. A directory
-in its place is renamed aside to a random name first, then removed. So a
-`claude` swapped after its repair only means agentd writes into the
-directory it repaired.
+in its place is removed first, as the next note describes. So a `claude`
+swapped after its repair only means agentd writes into the directory it
+repaired.
 
 The agent can also `chmod` what it owns. With `claude` at `555`, or the
 session directory at `0`, agentd running as the sandbox user (without
@@ -3631,9 +3631,50 @@ permission on the directory itself. Linux has no `fchmod` on an
 `O_PATH` handle (`fchmodat2` with `AT_EMPTY_PATH` needs Linux 6.6), so
 modes are set through `/proc/self/fd/<handle>`, which the kernel
 resolves to the handle's directory, not to what its path names now;
-owners are changed, and the aside directory removed, the same way. agentd therefore needs
-`/proc`, which every container has. `ProcessSandbox` links `claude/skills`
-through the same handle.
+owners are changed the same way. agentd therefore needs `/proc`, which
+every container has. `ProcessSandbox` links `claude/skills` through the
+same handle.
+
+### Removing a tree the agent left
+
+**Issue.** A directory the agent leaves where `settings.json` or
+`claude/skills` belongs has to go, and so do the trees agentd keeps of
+what an agent wrote. `std::fs::remove_dir_all` recurses, with a stack
+frame and an open directory per level: a tree some 12,000 to 15,000
+levels deep aborts agentd with a stack overflow, a shallower one fails
+with `EMFILE` once its levels outnumber the open-file limit, and agentd,
+running as the sandbox user without root's override of file modes, gets
+`EACCES` on a directory the agent made `0` or `0555`.
+
+**Solution.** `remove_tree_at` works through handles and never follows a
+symlink: each entry is looked up with `AT_SYMLINK_NOFOLLOW` and opened
+with `O_NOFOLLOW` relative to its parent, and each directory gets mode
+`0700` through its handle before it is read or moved. It goes depth first
+without recursion: files are unlinked and empty directories removed as
+they are read, and the first directory found with something in it is
+renamed into the top directory as `.removing-<uuid>-<n>`, `n` its level,
+and emptied next. Only a count of the levels is kept, so a tree of any
+depth takes a handful of file descriptors and constant memory beyond the
+read positions below. A directory is read as a stream, a few entries at a
+time, and when the remover comes back up to a level its listing goes on
+from the position where it stopped, kept for the deepest 1,024 levels;
+reading a directory of a million entries from the start again after
+every subdirectory would make the work quadratic. A directory read to the
+end is removed, and read again from the start if it is found not empty:
+something added an entry, or the filesystem's positions count entries
+(tmpfs before Linux 6.6 does), so a resumed listing skipped as many live
+entries as had been removed before it.
+
+The moves use plain `renameat`; `renameat2` flags such as
+`RENAME_NOREPLACE` fail on NFS, and the names are unique anyway. Any step
+that finds its entry missing counts it as removed, so two removals of one
+tree, as two agentd instances can make, both succeed. A removal, or all
+the removals of one clear, gives up after a minute, so a process that
+keeps adding entries can't hold a blocking thread, and the session start
+waiting for it, for ever; what was removed by then stays removed, so the
+next attempt goes on from there. The sandbox crate exports the same
+remover as `remove_tree` for agentd's own directories that hold what an
+agent wrote.
 
 ### Several agentd, or test runs, on one Docker host
 
@@ -3924,7 +3965,7 @@ left to clear.
 
 T21 recycles the session's container when the party changes, which ends
 every process a turn left running
-([T21](#another-requesters-turn-gets-a-new-container)), so a background
+([T21](#another-partys-turn-gets-a-new-container)), so a background
 process left from turn N spends only the credentials of its own party's
 later turns while they run (a requester's, or a configured group's). Killing
 what a turn leaves behind has no clean boundary. Some files outlive the
@@ -4509,7 +4550,7 @@ Every other volume mounts `shared/` read-write and no `memory/`. A turn
 whose mounts differ from the warm container's stops the container, like a
 credential kind or model change stops the process.
 
-### Another requester's turn gets a new container
+### Another party's turn gets a new container
 
 **Issue.** A warm container is reused across turns of one session, and a
 background process a turn leaves running, such as a `&` job or a Bash-tool
@@ -4567,7 +4608,7 @@ still use its own party's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Processes a turn leaves running")
 records both; the next note clears the session's files.
 
-### A requester change clears the session's files
+### A change of party clears the session's files
 
 **Issue.** Recycling ends processes, not the files a turn leaves in `home/`,
 `tmp/` and `claude/`, and `Held::requester` lives in memory only, so after an
@@ -4595,7 +4636,11 @@ turn's requester alone. A group member not yet in it, in a warm container or a
 new one, is added. Either write comes before any process gets the turn; if it
 fails, the container is stopped and the turn fails, since otherwise a later
 turn could skip the clear it needs. A crash between a clear and its record
-costs one extra clear.
+costs one extra clear. A clear that fails, as one that runs out of time
+against a process still writing does (T17's remover gives a clear a
+minute), fails the start and so the turn with a `Sandbox` error and leaves
+the record as it was; what it removed stays removed, and the next start
+clears again and goes on from there.
 
 The warm container's own requester (`Held::requester`) is still checked as
 well: the record says whose turns used the files, and the held requester whose
@@ -4618,7 +4663,8 @@ party, so the next turn of any of them clears what the others left. One
 requester alone wouldn't show that a second member had used the files.
 
 The record keeps a restart or an idle reap from skipping a clear for one
-agentd instance, which stops every container the old instance left at startup.
+agentd instance; a restart relies on agentd stopping the old instance's
+containers at startup.
 During a blue-green overlap the other instance's warm container of the same
 session, and anything left running in it, can still write to the session's
 files after this instance cleared them, until a turn on the other instance
@@ -5994,7 +6040,8 @@ sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
 directory exists as the container starts. Sandboxes mount the agent's
 skills directory itself (the process backend links it), so a skill added,
 replaced or removed changes in running sandboxes at once: a removal's
-`remove_dir_all` takes the files away from a running conversation too.
+`sandbox::remove_tree` takes the files away from a running conversation
+too.
 What a running Claude Code has already loaded is up to it, so the replies
 say only that a conversation already running may not see the change until
 its process next starts, unlike a persona, which is read at start.
