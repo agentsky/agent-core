@@ -185,6 +185,18 @@ idle_timeout_secs = 900
 scope_container_cap = 4
 global_container_cap = 32
 
+# Groups of requesters who share a session's warm container and the files
+# its turns leave in the session's home/, tmp/ and claude/, each a list of
+# member keys: "slack:<team id>:<user id>" or "rocketchat:<host>:<user id>".
+# Another requester's turn gets a new container, which ends every process an
+# earlier turn left running, and starts with those files cleared. Within a
+# group neither happens, so what one member's turn leaves can run with
+# another member's credential: group only requesters who trust each other
+# with their credentials. A member may be listed once, and a group needs two
+# members or more. Default none, as here; for example
+# [["slack:T0123:U0123", "slack:T0123:U0456"]].
+requester_groups = []
+
 # The reaction an agent's bot puts on the message it is answering while the
 # turn runs, and takes off after: a short emoji name without colons.
 working_emoji = "hourglass_flowing_sand"

@@ -1910,6 +1910,13 @@ Deliverables:
   the requester it inherits, so it keeps a container started for that
   requester
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
+  The members of a group in `PoolConfig::requester_groups` count as one
+  requester. A container started for a requester other than the one the
+  session's files were last cleared for (`sessions.files_requester`, added
+  by `…_session_files_requester.sql`; none clears too) first empties
+  `home/` and `tmp/` and removes everything in `claude/` but the
+  transcript, and the requester is recorded before any process starts
+  ([impl-notes](impl-notes.md#a-requester-change-clears-the-sessions-files)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
   its exit being confirmed. Call `process_stopping` and stop the container
@@ -1933,6 +1940,10 @@ Acceptance:
   - Another requester's turn replaces the container; a turn of the same
     requester, and an agent-to-agent hop carrying it, keep it, as does one
     whose requester was linked to a member since.
+  - Another requester's turn clears the session's files, after an idle reap
+    or a restart too; the same requester's doesn't, and a member of its
+    group keeps the warm container and the files. A failure to record the
+    requester fails the turn and stops the container.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
@@ -2950,17 +2961,13 @@ Not scheduled. Each needs a decision before it becomes a task.
     between turns, the Bash tool's background shells are its children, a
     job started with `&` is reparented to the container's init once its
     shell exits, and the Docker sandbox kills a process by its pid alone.
-  - Files outlive the container. A turn can leave something in the
-    session's `home/`, `tmp/` or `claude/` (a `.bashrc` the Bash tool's
-    shells source, a `CLAUDE.md` the CLI loads as user memory;
-    `settings.json` is rewritten before each start), in `work/` or
-    `shared/`, such as a git hook, or in the transcript, that runs or
-    instructs code in a later requester's process. Clearing `home/`,
-    `tmp/` and everything in `claude/` but the transcript and
-    `settings.json` on a requester change would close the first three,
-    and putting `HOME` and `TMPDIR` on a tmpfs of the container's own
-    would close `home/` and `tmp/`; `work/`, `shared/` and the transcript
-    would still carry over.
+  - Files outlive the container in part. On a requester change T21
+    clears the session's `home/`, `tmp/` and everything in `claude/` but
+    the transcript (a `.bashrc` the Bash tool's shells source, a
+    `CLAUDE.md` the CLI loads as user memory), unless `requester_groups`
+    puts both requesters in one group. What a turn leaves in `work/` or
+    `shared/`, such as a git hook, or in the transcript still runs or
+    instructs code in a later requester's process.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
