@@ -250,6 +250,8 @@ impl Ctl {
         self.inner.surfaces.as_ref()
     }
 
+    /// The outboxes of running turns. An entry taken out is dropped once the
+    /// guard is, since dropping its outbox removes its staging directory.
     fn outboxes(&self) -> MutexGuard<'_, HashMap<TokenHash, Entry>> {
         self.inner
             .outboxes
@@ -258,19 +260,23 @@ impl Ctl {
     }
 
     /// Deletes every token and scope lock, every outbox, and the staging
-    /// directory, as agentd does at startup.
+    /// directory, as agentd does at startup. A staging directory that can't
+    /// be removed, as one too big to remove in the remover's time, is
+    /// logged and left to the next start, so it never keeps agentd from
+    /// starting; each outbox stages in a directory of its own in it.
     ///
     /// # Errors
     ///
-    /// If the store fails, or the staging directory can't be removed.
+    /// If the store fails.
     pub async fn purge(&self) -> Result<CtlPurged, HookError> {
         let purged = self.store().purge_ctl().await?;
-        drop(std::mem::take(&mut *self.outboxes()));
+        let outboxes = std::mem::take(&mut *self.outboxes());
         let staging = self.settings().staging_dir.clone();
-        tokio::task::spawn_blocking(move || sandbox::remove_tree(&staging))
-            .await
-            .map_err(std::io::Error::other)?
-            .map_err(std::io::Error::other)?;
+        let _ = tokio::task::spawn_blocking(move || {
+            drop(outboxes);
+            outbox::remove_dir(&staging);
+        })
+        .await;
         Ok(purged)
     }
 
@@ -299,11 +305,14 @@ impl Ctl {
                 container_ip: process.container_ip,
             })
             .await?;
-        let mut outboxes = self.outboxes();
-        for hash in replaced {
-            outboxes.remove(&hash);
-        }
-        drop(outboxes);
+        let removed: Vec<Entry> = {
+            let mut outboxes = self.outboxes();
+            replaced
+                .iter()
+                .filter_map(|hash| outboxes.remove(hash))
+                .collect()
+        };
+        drop(removed);
         tracing::debug!(session = %process.session, "issued an agentctl token");
         Ok(token)
     }
@@ -376,15 +385,20 @@ impl Ctl {
     pub async fn revoke_process_token(&self, token: &ProcessToken) -> Result<(), HookError> {
         let hash = token.hash();
         self.store().delete_ctl_token(&hash).await?;
-        self.outboxes().remove(&hash);
+        let removed = self.outboxes().remove(&hash);
+        drop(removed);
         Ok(())
     }
 
     fn remove_outbox(&self, hash: &TokenHash, turn: TurnId) {
         let mut outboxes = self.outboxes();
-        if outboxes.get(hash).is_some_and(|e| e.outbox.turn() == turn) {
-            outboxes.remove(hash);
-        }
+        let removed = if outboxes.get(hash).is_some_and(|e| e.outbox.turn() == turn) {
+            outboxes.remove(hash)
+        } else {
+            None
+        };
+        drop(outboxes);
+        drop(removed);
     }
 
     /// Runs `add` on the caller's turn's outbox, or refuses with
