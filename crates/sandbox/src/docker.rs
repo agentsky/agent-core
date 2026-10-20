@@ -499,7 +499,7 @@ impl Sandbox for DockerSandbox {
             SkillsEntry::Untouched
         };
         self.layout
-            .prepare_session_dirs(&spec.volume, spec.session, skills)
+            .prepare_session_dirs(&spec.volume, spec.session, skills, spec.clear_files)
             .await?;
         let created = self
             .docker
