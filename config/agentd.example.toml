@@ -218,7 +218,12 @@ global_container_cap = 32
 
 # Groups of requesters who share a session's warm container and the files
 # its turns leave in the session's home/, tmp/ and claude/, each a list of
-# member keys: "slack:<team id>:<user id>" or "rocketchat:<host>:<user id>".
+# member keys: "slack:<team id>:<user id>", or "rocketchat:<team>:<user id>"
+# where <team> is the [rocketchat] team below. A Slack Connect member of
+# another organization is keyed under the workspace agentd serves, not
+# their own: "slack:<served team id>:<user id>". A `:`, `%` or `/` inside a
+# part is written %3A, %25 or %2F. A key is not checked against any member:
+# one that matches nobody is accepted and simply groups no one.
 # Another requester's turn gets a new container, which ends every process an
 # earlier turn left running, and starts with those files cleared. Within a
 # group neither happens, so what one member's turn leaves can run with
