@@ -391,13 +391,26 @@ impl Harness {
         );
     }
 
-    async fn files_requester(&self, session: SessionId) -> Option<MemberKey> {
+    async fn files_requesters(&self, session: SessionId) -> Vec<MemberKey> {
         self.store
             .session(session)
             .await
             .unwrap()
             .unwrap()
-            .files_requester
+            .files_requesters
+    }
+
+    async fn fail_files_records(&self) {
+        let mut db = sqlx::SqliteConnection::connect(&self._dir.db_url())
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER files_requesters_fail BEFORE UPDATE OF files_requesters ON sessions \
+             BEGIN SELECT RAISE(ABORT, 'recording fails'); END",
+        )
+        .execute(&mut db)
+        .await
+        .unwrap();
     }
 
     fn events(&self) -> Vec<Event> {
@@ -1950,10 +1963,10 @@ async fn another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restar
     .await;
     let session = h.thread_session("1.1").await;
     let id = session.id;
-    assert_eq!(h.files_requester(id).await, None);
+    assert!(h.files_requesters(id).await.is_empty());
     reply(&h.run(id, request_by("1", "U1")).await);
     assert_eq!(h.sandbox.clears(), [true], "a new session is cleared");
-    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
     let left = leave_files(&h, &session);
     eventually("the idle container is reaped", || !h.manager.is_warm(id)).await;
 
@@ -1969,7 +1982,7 @@ async fn another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restar
         none_exist(&left),
         "another requester's turn after a reap clears"
     );
-    assert_eq!(h.files_requester(id).await, Some(key("U2")));
+    assert_eq!(h.files_requesters(id).await, [key("U2")]);
 
     let left = leave_files(&h, &session);
     h.manager.stop(id).await;
@@ -1981,7 +1994,7 @@ async fn another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restar
         none_exist(&left),
         "another requester's turn after a restart clears"
     );
-    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
     assert_eq!(h.transcript(&session), ["1", "2", "3", "4"]);
 }
 
@@ -2011,13 +2024,17 @@ async fn a_trusted_group_shares_the_warm_container_and_the_files() {
     );
     assert_eq!(h.sandbox.clears(), [true]);
     assert!(all_exist(&left));
-    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+    assert_eq!(
+        h.files_requesters(id).await,
+        [key("U1"), key("U2")],
+        "a member who used the files is added to the record"
+    );
 
     h.manager.stop(id).await;
     reply(&h.run(id, request_by("3", "U2")).await);
     assert_eq!(h.sandbox.clears(), [true, false]);
     assert!(all_exist(&left), "a member's new container keeps the files");
-    assert_eq!(h.files_requester(id).await, Some(key("U1")));
+    assert_eq!(h.files_requesters(id).await, [key("U1"), key("U2")]);
 
     h.manager.stop(id).await;
     h.restart(|pool| pool.requester_groups = RequesterGroups::default());
@@ -2027,7 +2044,7 @@ async fn a_trusted_group_shares_the_warm_container_and_the_files() {
         none_exist(&left),
         "without the group, U2 is another requester"
     );
-    assert_eq!(h.files_requester(id).await, Some(key("U2")));
+    assert_eq!(h.files_requesters(id).await, [key("U2")]);
 
     let left = leave_files(&h, &session);
     h.clear();
@@ -2044,16 +2061,7 @@ async fn a_failed_record_of_whose_files_they_are_fails_the_turn_and_stops_the_co
     let h = Harness::new(&[Turn::reply("never")]).await;
     let session = h.thread_session("1.1").await;
     let id = session.id;
-    let mut db = sqlx::SqliteConnection::connect(&h._dir.db_url())
-        .await
-        .unwrap();
-    sqlx::query(
-        "CREATE TRIGGER files_requester_fails BEFORE UPDATE OF files_requester ON sessions \
-         BEGIN SELECT RAISE(ABORT, 'recording fails'); END",
-    )
-    .execute(&mut db)
-    .await
-    .unwrap();
+    h.fail_files_records().await;
     let err = h.manager.run_turn(id, request("one")).await.unwrap_err();
     assert!(matches!(err, RunnerError::Store(_)), "{err}");
     assert_eq!(
@@ -2063,5 +2071,81 @@ async fn a_failed_record_of_whose_files_they_are_fails_the_turn_and_stops_the_co
     assert_eq!(h.sandbox.clears(), [true]);
     assert_eq!(h.sandbox.running(), 0);
     assert!(!h.manager.is_warm(id));
-    assert_eq!(h.files_requester(id).await, None);
+    assert!(h.files_requesters(id).await.is_empty());
+}
+
+async fn removing_the_group_clears_for_the_member_whose_turn_cleared(reap: bool) {
+    let mut h = Harness::with(
+        &[Turn::reply("a"), Turn::reply("b"), Turn::reply("c")],
+        |_, pool| {
+            pool.idle_timeout_secs = 1;
+            pool.requester_groups = RequesterGroups::new(vec![vec![key("U1"), key("U2")]]);
+        },
+    )
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request_by("1", "U1")).await);
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
+    if reap {
+        eventually("the idle container is reaped", || !h.manager.is_warm(id)).await;
+    }
+    let report = h.run(id, request_by("2", "U2")).await;
+    assert_eq!(report.process_start.is_some(), reap);
+    assert_eq!(
+        h.sandbox.clears(),
+        if reap { vec![true, false] } else { vec![true] }
+    );
+    assert_eq!(h.files_requesters(id).await, [key("U1"), key("U2")]);
+    let left = leave_files(&h, &session);
+
+    h.manager.stop(id).await;
+    h.restart(|pool| pool.requester_groups = RequesterGroups::default());
+    reply(&h.run(id, request_by("3", "U1")).await);
+    assert_eq!(h.sandbox.clears().last(), Some(&true));
+    assert!(
+        none_exist(&left),
+        "U2 used the files, so U1 no longer gets them once the group is gone"
+    );
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
+    assert_eq!(h.transcript(&session), ["1", "2", "3"]);
+}
+
+#[tokio::test]
+async fn removing_the_group_clears_for_the_first_member_after_the_second_used_the_warm_container() {
+    removing_the_group_clears_for_the_member_whose_turn_cleared(false).await;
+}
+
+#[tokio::test]
+async fn removing_the_group_clears_for_the_first_member_after_the_second_used_the_files_after_a_reap()
+ {
+    removing_the_group_clears_for_the_member_whose_turn_cleared(true).await;
+}
+
+#[tokio::test]
+async fn a_failed_record_of_a_member_joining_the_files_fails_the_turn_and_stops_the_container() {
+    let h = Harness::with(&[Turn::reply("a"), Turn::reply("never")], |_, pool| {
+        pool.requester_groups = RequesterGroups::new(vec![vec![key("U1"), key("U2")]]);
+    })
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request_by("1", "U1")).await);
+    h.fail_files_records().await;
+    h.clear();
+    let err = h
+        .manager
+        .run_turn(id, request_by("2", "U2"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunnerError::Store(_)), "{err}");
+    assert_eq!(
+        h.events(),
+        [Event::ProcessStopping(id, 1), Event::ContainerStopped(id)],
+        "the turn never reached the process"
+    );
+    assert_eq!(h.sandbox.running(), 0);
+    assert!(!h.manager.is_warm(id));
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
+    assert_eq!(h.transcript(&session), ["1"]);
 }
