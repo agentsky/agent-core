@@ -2,8 +2,8 @@
 //! tasks' sessions.
 
 use core_types::{
-    AgentId, ConsentId, ConvRef, ConversationId, MessageId, ScopeKey, SessionId, SurfaceKind,
-    TeamId, ThreadKey, VolumeKey,
+    AgentId, ConsentId, ConvRef, ConversationId, MemberKey, MessageId, ScopeKey, SessionId,
+    SurfaceKind, TeamId, ThreadKey, VolumeKey,
 };
 use sqlx::SqliteConnection;
 use time::OffsetDateTime;
@@ -21,7 +21,8 @@ pub const RESETS_AT_ONCE: usize = 2;
 macro_rules! columns {
     () => {
         "id, agent_id, surface, team_id, conversation, thread_root, scope_key, kind, \
-         consent_id, started, maybe_started, created_at, last_turn_at, reset_at"
+         consent_id, started, maybe_started, created_at, last_turn_at, reset_at, \
+         files_requester"
     };
 }
 
@@ -77,6 +78,11 @@ pub struct Session {
     pub last_turn_at: Option<OffsetDateTime>,
     /// When it was reset. A reset session takes no more turns.
     pub reset_at: Option<OffsetDateTime>,
+    /// The requester its `home/`, `tmp/` and `claude/` files were last
+    /// cleared for, so whose turns, with those of the requesters they
+    /// trust, may have left what is there. `None` until they are first
+    /// cleared.
+    pub files_requester: Option<MemberKey>,
 }
 
 impl Session {
@@ -122,6 +128,7 @@ struct Row {
     created_at: i64,
     last_turn_at: Option<i64>,
     reset_at: Option<i64>,
+    files_requester: Option<String>,
 }
 
 fn corrupt(column: &'static str) -> StoreError {
@@ -171,6 +178,10 @@ impl Row {
             reset_at: self
                 .reset_at
                 .map(|at| from_unix(at, TABLE, "reset_at"))
+                .transpose()?,
+            files_requester: self
+                .files_requester
+                .map(|key| parse_column(&key, TABLE, "files_requester"))
                 .transpose()?,
         })
     }
@@ -487,6 +498,25 @@ impl Store {
     /// [`StoreError::Database`] if the query fails.
     pub async fn mark_session_unstarted(&self, id: SessionId) -> Result<()> {
         sqlx::query("UPDATE sessions SET started = 0, maybe_started = 0 WHERE id = ?")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Records that session `id`'s files were cleared for `requester`:
+    /// [`Session::files_requester`].
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn set_session_files_requester(
+        &self,
+        id: SessionId,
+        requester: &MemberKey,
+    ) -> Result<()> {
+        sqlx::query("UPDATE sessions SET files_requester = ? WHERE id = ?")
+            .bind(requester.to_string())
             .bind(id.to_string())
             .execute(&self.pool)
             .await?;
@@ -949,6 +979,49 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn the_files_requester_is_recorded_and_not_carried_to_a_replacement() {
+        let store = memory_store().await;
+        let session = store
+            .session_for_thread(AgentId::new_v4(), &dm(), &ScopeKey::Private, at(1))
+            .await
+            .unwrap()
+            .session;
+        assert_eq!(session.files_requester, None);
+        let key: MemberKey = "slack:T1:U%3A1".parse().unwrap();
+        store
+            .set_session_files_requester(session.id, &key)
+            .await
+            .unwrap();
+        let stored = store.session(session.id).await.unwrap().unwrap();
+        assert_eq!(stored.files_requester.as_ref(), Some(&key));
+        let other: MemberKey = "rocketchat:chat.example.com:u2".parse().unwrap();
+        store
+            .set_session_files_requester(session.id, &other)
+            .await
+            .unwrap();
+        let stored = store.session(session.id).await.unwrap().unwrap();
+        assert_eq!(stored.files_requester, Some(other));
+        let replacement = store
+            .reset_session(session.id, at(2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement.files_requester, None);
+        sqlx::query("UPDATE sessions SET files_requester = 'nonsense' WHERE id = ?")
+            .bind(session.id.to_string())
+            .execute(&store.pool)
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.session(session.id).await,
+            Err(StoreError::Corrupt {
+                table: "sessions",
+                column: "files_requester"
+            })
+        ));
     }
 
     #[tokio::test]
