@@ -2882,11 +2882,11 @@ Not scheduled. Each needs a decision before it becomes a task.
   only killing the processes a turn leaves behind in the container when it
   ends removes that. When the party changes T21 also clears the session
   directory's stray entries, `home/`, `tmp/` and everything in `claude/` but
-  the transcript file and its directory (a `.bashrc` the Bash tool's shells source, a `CLAUDE.md`
-  the CLI loads as user memory). Files still outlive the container in
-  `work/` and `shared/`, and in the kept transcript files: a turn can leave
-  something there that runs or instructs code in a later requester's
-  process. During a blue-green overlap of two agentd instances, the other
+  the transcript file and its directory (a `.bashrc` the Bash tool's shells
+  source, a `CLAUDE.md` the CLI loads as user memory). Files still outlive
+  the container in `work/` and `shared/`, and in the kept transcript files:
+  a turn can leave something there that runs or instructs code in a later
+  requester's process. During a blue-green overlap of two agentd instances, the other
   instance's warm container of a session, and what is left running in it,
   can also write to the session's files after a clear.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
