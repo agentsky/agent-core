@@ -6535,9 +6535,14 @@ earlier container is stopped before another starts. A `--resume` in a
 container an earlier process ran in (after a crash, a kill, or a
 credential kind or model change) counts its first turn's cost as unknown.
 A runner test resumes in such a container and gets no cost; before this
-it got the turn's cost. T21 stops the container when the requester
-changes ([T21](#another-requesters-turn-gets-a-new-container)), so only a
-requester's own later turns resume in a used one. Stopping the container
+it got the turn's cost. T21 stops the container when the party changes
+([T21](#another-requesters-turn-gets-a-new-container)), so only the same
+party's later turns resume in a used one: a requester's own, or, with
+`requester_groups`, another member of its group whose credential kind or
+model differs, which restarts only the process in the kept container. That
+member's first turn is counted as unknown too (`CostUnknown::ReusedContainer`),
+so a process one member left can't bill another through the restored total
+either. Stopping the container
 before every resume would keep that cost known at a container start's
 price, and would also end the agent's leftover processes on every resume
 (Deferred work's "Processes a turn leaves running").
