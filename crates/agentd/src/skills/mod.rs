@@ -880,14 +880,13 @@ impl Skills {
     }
 }
 
-/// A work directory, removed on drop.
+/// A work directory, removed on drop with [`sandbox::remove_tree`], since
+/// it holds a tree the owner's repository chose.
 struct WorkDir(PathBuf);
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_dir_all(&self.0)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
+        if let Err(err) = sandbox::remove_tree(&self.0) {
             tracing::warn!(dir = %self.0.display(), error = %err, "couldn't remove a skill work directory");
         }
     }
@@ -990,7 +989,8 @@ async fn move_into(from: &Path, to: &Path, aside: &Path) -> Result<(), SkillErro
 
 /// Removes `dir` unless it changed within `age`, going by its status
 /// change time, which creating it, or adding or removing an entry in it,
-/// updates.
+/// updates. A directory may hold a work directory's tree, which the
+/// owner's repository chose, so it goes with [`sandbox::remove_tree`].
 async fn remove_stale(dir: &Path, age: Duration) -> Result<(), SkillError> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = match tokio::fs::symlink_metadata(dir).await {
@@ -1003,13 +1003,10 @@ async fn remove_stale(dir: &Path, age: Duration) -> Result<(), SkillError> {
     if OffsetDateTime::now_utc() - changed < age {
         return Ok(());
     }
-    if meta.is_dir() {
-        remove_dir(dir).await?;
-    } else {
-        tokio::fs::remove_file(dir)
-            .await
-            .map_err(io("removing a stray file"))?;
-    }
+    let path = dir.to_owned();
+    blocking(move || sandbox::remove_tree(&path))
+        .await?
+        .map_err(|err| io("removing a stale skill directory")(std::io::Error::other(err)))?;
     tracing::info!(path = %dir.display(), "removed a skill directory no row records");
     Ok(())
 }
