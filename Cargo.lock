@@ -2496,6 +2496,7 @@ dependencies = [
  "chacha20poly1305",
  "core-types",
  "secrecy",
+ "serde_json",
  "sqlx",
  "testkit",
  "thiserror",
