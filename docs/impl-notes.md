@@ -3589,9 +3589,9 @@ to that handle, with `O_NOFOLLOW | O_DIRECTORY`. `settings.json` and
 its path: a new file is created with `O_EXCL | O_NOFOLLOW`, given away
 with `fchown`, and renamed over `settings.json` within the same
 directory, which replaces a symlink instead of following it. A directory
-in its place is renamed aside to a random name first, then removed. So a
-`claude` swapped after its repair only means agentd writes into the
-directory it repaired.
+in its place is removed first, as the next note describes. So a `claude`
+swapped after its repair only means agentd writes into the directory it
+repaired.
 
 The agent can also `chmod` what it owns. With `claude` at `555`, or the
 session directory at `0`, agentd running as the sandbox user (without
@@ -3604,9 +3604,50 @@ permission on the directory itself. Linux has no `fchmod` on an
 `O_PATH` handle (`fchmodat2` with `AT_EMPTY_PATH` needs Linux 6.6), so
 modes are set through `/proc/self/fd/<handle>`, which the kernel
 resolves to the handle's directory, not to what its path names now;
-owners are changed, and the aside directory removed, the same way. agentd therefore needs
-`/proc`, which every container has. `ProcessSandbox` links `claude/skills`
-through the same handle.
+owners are changed the same way. agentd therefore needs `/proc`, which
+every container has. `ProcessSandbox` links `claude/skills` through the
+same handle.
+
+### Removing a tree the agent left
+
+**Issue.** A directory the agent leaves where `settings.json` or
+`claude/skills` belongs has to go, and so do the trees agentd keeps of
+what an agent wrote. `std::fs::remove_dir_all` recurses, with a stack
+frame and an open directory per level: a tree some 12,000 to 15,000
+levels deep aborts agentd with a stack overflow, a shallower one fails
+with `EMFILE` once its levels outnumber the open-file limit, and agentd,
+running as the sandbox user without root's override of file modes, gets
+`EACCES` on a directory the agent made `0` or `0555`.
+
+**Solution.** `remove_tree_at` works through handles and never follows a
+symlink: each entry is looked up with `AT_SYMLINK_NOFOLLOW` and opened
+with `O_NOFOLLOW` relative to its parent, and each directory gets mode
+`0700` through its handle before it is read or moved. It goes depth first
+without recursion: files are unlinked and empty directories removed as
+they are read, and the first directory found with something in it is
+renamed into the top directory as `.removing-<uuid>-<n>`, `n` its level,
+and emptied next. Only a count of the levels is kept, so a tree of any
+depth takes a handful of file descriptors and constant memory beyond the
+read positions below. A directory is read as a stream, a few entries at a
+time, and when the remover comes back up to a level its listing goes on
+from the position where it stopped, kept for the deepest 1,024 levels;
+reading a directory of a million entries from the start again after
+every subdirectory would make the work quadratic. A directory read to the
+end is removed, and read again from the start if it is found not empty:
+something added an entry, or the filesystem's positions count entries
+(tmpfs before Linux 6.6 does), so a resumed listing skipped as many live
+entries as had been removed before it.
+
+The moves use plain `renameat`; `renameat2` flags such as
+`RENAME_NOREPLACE` fail on NFS, and the names are unique anyway. Any step
+that finds its entry missing counts it as removed, so two removals of one
+tree, as two agentd instances can make, both succeed. A removal, or all
+the removals of one clear, gives up after a minute, so a process that
+keeps adding entries can't hold a blocking thread, and the session start
+waiting for it, for ever; what was removed by then stays removed, so the
+next attempt goes on from there. The sandbox crate exports the same
+remover as `remove_tree` for agentd's own directories that hold what an
+agent wrote.
 
 ### Several agentd, or test runs, on one Docker host
 
