@@ -3901,11 +3901,12 @@ every process a turn left running
 process left from turn N spends only the credentials of its own party's
 later turns while they run (a requester's, or a configured group's). Only
 killing the processes a turn leaves behind when it ends removes that. Some
-files outlive the container, though. T21 clears `home/`, `tmp/` and
-`claude/`, keeping only the transcript file and its directory, when the
-party changes, but what a turn leaves in the session's `work/`, in
-`shared/`, or in the transcript can run or instruct code in a later
-requester's process, which then spends that requester's credential.
+files outlive the container, though. When the party changes T21 clears the
+session directory's stray entries, `home/`, `tmp/`, and everything in
+`claude/` but the transcript file and its directory, but what a turn leaves
+in the session's `work/`, in `shared/`, or in the transcript can run or
+instruct code in a later requester's process, which then spends that
+requester's credential.
 The plan's Deferred work has an entry for both.
 
 ### Headers the proxy changes besides the credential
@@ -4492,11 +4493,12 @@ and two members' subscriptions are the same kind.
 
 **Solution.** `Held` records the requester whose turn started the container,
 and `ensure_process` stops the whole container, as it does a dead one or one
-with other mounts, when a turn's requester differs, before it looks at the
-process. Stopping the container ends its PID namespace and every process in
-it; stopping only the CLI would leave the leftovers running. It compares the
-requester, not the `CredentialRef`: a community-key turn of another requester
-also gets the agentctl token, so it gets a new container too. An
+with other mounts, when a turn's requester isn't the same party, before it
+looks at the process. Stopping the container ends its PID namespace and
+every process in it; stopping only the CLI would leave the leftovers
+running. It compares the requester, not the `CredentialRef`: a
+community-key turn of another requester also gets the agentctl token, so it
+gets a new container too. An
 agent-to-agent hop runs as the requester it inherits, so it keeps a container
 started for that requester.
 
@@ -4534,7 +4536,7 @@ a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 `work/` or `shared/`, or text in the transcript. A leftover process can also
 still use its own party's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Killing leftover processes at turn end")
-records both; the next note clears `home/`, `tmp/` and `claude/`.
+records both; the next note clears the session's files.
 
 ### A requester change clears the session's files
 
