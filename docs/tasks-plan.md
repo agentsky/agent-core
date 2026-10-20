@@ -1913,7 +1913,7 @@ Deliverables:
   linked between two turns keeps the container. An agent-to-agent hop runs as
   the requester it inherits, so it keeps a container started for that
   requester
-  ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
+  ([impl-notes](impl-notes.md#another-partys-turn-gets-a-new-container)).
   The members of a group in `PoolConfig::requester_groups` count as one
   requester. `sessions.files_requesters` (added by
   `…_session_files_requesters.sql`) records the requesters whose turns have
@@ -1926,7 +1926,7 @@ Deliverables:
   its directory, which are kept whole. The record becomes that requester
   alone; a group member missing from it is added. Either write comes
   before any process gets the turn
-  ([impl-notes](impl-notes.md#a-requester-change-clears-the-sessions-files)).
+  ([impl-notes](impl-notes.md#a-change-of-party-clears-the-sessions-files)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
   its exit being confirmed. Call `process_stopping` and stop the container
@@ -3033,7 +3033,7 @@ Not scheduled. Each needs a decision before it becomes a task.
   turn ends, so a background process the model left running can't spend
   credentials between turns, and T21 recycles the session's container when
   the party changes, which ends every process running in it
-  ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
+  ([impl-notes](impl-notes.md#another-partys-turn-gets-a-new-container)).
   What remains:
   - A process left behind can still spend the credentials of its own
     party's later turns while they run (a requester's, or a
