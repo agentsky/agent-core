@@ -3069,7 +3069,9 @@ Not scheduled. Each needs a decision before it becomes a task.
   CLI's real result is then read as the next turn's, so the requester's
   next turn in the session gets this turn's reply and is billed its cost.
   Another requester's turn gets a new container (T21), so it never reads
-  that result. Reading turns from a channel the agent can't write would
+  that result, unless `requester_groups` puts the two requesters in one
+  group, whose members share the warm process and so the result too.
+  Reading turns from a channel the agent can't write would
   close that as well. It would also bill the turns T27 records with an
   unknown cost, such as every resumed process's first turn once a long
   thread's transcript passes 5 MiB.

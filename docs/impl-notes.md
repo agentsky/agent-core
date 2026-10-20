@@ -6621,8 +6621,9 @@ too: a forged `result` line ends the turn early with the agent's text as
 the reply, and the CLI's real result for the turn is then read as the
 next turn's, so the requester's next turn in the session gets this turn's
 reply and pays its cost and tokens. Another requester's turn gets a new
-container (T21), so it never reads that result. Reading turns from a
-channel the agent can't write closes both.
+container (T21), so it never reads that result, unless `requester_groups`
+puts the two requesters in one group, whose members share the warm
+process. Reading turns from a channel the agent can't write closes both.
 
 ### One table counts threads and agents
 
