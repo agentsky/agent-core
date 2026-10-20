@@ -250,16 +250,20 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 ///
 /// Stopping ends running processes only, so the files earlier turns left in
 /// the session's directories, which every container of the session mounts,
-/// are cleared too ([`SessionSpec::clear_files`]): a container started for a
-/// turn whose requester isn't the same party as the session's
-/// [`Session::files_requester`], or for a session that has none, starts with
-/// `home/` and `tmp/` emptied and everything in `claude/` but the transcript
-/// removed. The record is read from the store with the session's slot held,
-/// and written once the files are cleared, before any process starts, so an
-/// idle reap or a restart doesn't skip a clear. If writing it fails, the
-/// container is stopped and the turn fails with [`RunnerError::Store`].
-/// `work/`, `shared/` and the transcript carry over, as does everything
-/// between members of one group. A process that
+/// are cleared too ([`SessionSpec::clear_files`]). The store records the
+/// requesters whose turns have used the files since they were last cleared
+/// ([`Session::files_requesters`]). Unless every one of them is the same
+/// party as the turn's requester, the turn gets a new container that starts
+/// with `home/` and `tmp/` emptied and everything in `claude/` but the
+/// transcript removed, and the record becomes the turn's requester alone; an
+/// empty record, or one that doesn't parse, clears too. A member of the
+/// group not yet in the record is added to it, in a warm container or a new
+/// one. The record is read from the store with the session's slot held, and
+/// written before any process gets the turn, so an idle reap, a restart or a
+/// group removed from the configuration doesn't skip a clear. If writing it
+/// fails, the container is stopped and the turn fails with
+/// [`RunnerError::Store`]. `work/`, `shared/` and the transcript carry over,
+/// as does everything between members of one group. A process that
 /// crashed, timed out or refused its `--resume` is stopped after the turn;
 /// if it wasn't seen to exit, its container is stopped too before the next
 /// process starts, so two processes never write one transcript. A container
@@ -742,10 +746,12 @@ impl<H: TurnHooks> Inner<H> {
     /// runs as the requester it inherits, so it keeps a container started
     /// for that requester.
     ///
-    /// A container it starts clears the session's files unless the
-    /// session's `files_requester` is the same party as the turn's
-    /// requester, and then records the turn's requester there before any
-    /// process starts. A failure to record it stops the container.
+    /// The session's files go to the turn only if every requester in
+    /// `files_requesters` is the same party as the turn's: otherwise the
+    /// container goes too, and the new one clears them and records the
+    /// turn's requester alone. A requester missing from the record is added
+    /// to it. Either write happens before any process gets the turn, and a
+    /// failed one stops the container.
     ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
@@ -769,9 +775,19 @@ impl<H: TurnHooks> Inner<H> {
     ) -> Result<Option<SessionStart>> {
         let mounts = Mounts::for_turn(&session.scope, request.side);
         let kind = request.credential.kind();
+        let requester = &request.requester.key;
+        let files_shared = !session.files_requesters.is_empty()
+            && session
+                .files_requesters
+                .iter()
+                .all(|holder| self.same_party(holder, request));
         if let Some(held) = &warm.held {
             let dead = held.tracked.state().dead;
-            if dead || held.mounts != mounts || !self.same_party(&held.requester, request) {
+            if dead
+                || held.mounts != mounts
+                || !files_shared
+                || !self.same_party(&held.requester, request)
+            {
                 self.release_container(warm).await?;
             }
         }
@@ -785,30 +801,37 @@ impl<H: TurnHooks> Inner<H> {
                 self.release_container(warm).await?;
             }
         }
-        let held = match warm.held.take() {
-            Some(held) => warm.held.insert(held),
-            None => {
-                let requester = &request.requester.key;
-                let clear_files = !session
-                    .files_requester
-                    .as_ref()
-                    .is_some_and(|holder| self.same_party(holder, request));
-                let held = self
-                    .start_container(session, mounts, requester, clear_files, warm.slot.clone())
-                    .await?;
-                let held = warm.held.insert(held);
-                if clear_files
-                    && let Err(error) = self
-                        .store
-                        .set_session_files_requester(session.id, requester)
-                        .await
-                {
-                    tracing::warn!(session = %session.id, %error, "recording whose files the session holds failed; stopping the container");
-                    self.release_container(warm).await.ok();
-                    return Err(error.into());
-                }
-                held
-            }
+        if warm.held.is_none() {
+            let held = self
+                .start_container(session, mounts, requester, !files_shared, warm.slot.clone())
+                .await?;
+            warm.held = Some(held);
+        }
+        let record = if !files_shared {
+            Some(vec![requester.clone()])
+        } else if !session.files_requesters.contains(requester) {
+            Some(
+                [
+                    session.files_requesters.as_slice(),
+                    std::slice::from_ref(requester),
+                ]
+                .concat(),
+            )
+        } else {
+            None
+        };
+        if let Some(record) = record
+            && let Err(error) = self
+                .store
+                .set_session_files_requesters(session.id, &record)
+                .await
+        {
+            tracing::warn!(session = %session.id, %error, "recording whose turns used the session's files failed; stopping the container");
+            self.release_container(warm).await.ok();
+            return Err(error.into());
+        }
+        let Some(held) = warm.held.as_mut() else {
+            return Err(RunnerError::NotRunning);
         };
         if held.process.is_some() {
             return Ok(None);
@@ -1262,7 +1285,7 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             last_turn_at: None,
             reset_at: None,
-            files_requester: None,
+            files_requesters: Vec::new(),
         }
     }
 
