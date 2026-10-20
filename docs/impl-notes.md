@@ -9421,7 +9421,8 @@ posted again in that case.
   attributed to that turn's requester. T21 recycles the container on a
   requester change, which ends such a process before another requester's
   turn, so the hops it starts are only ever attributed to the requester
-  whose turn left it, during their later turns in the session. Killing
+  whose turn left it, or to the members of their group in
+  `requester_groups`, during their later turns in the session. Killing
   what a turn leaves behind would close that too; the "Processes a turn
   leaves running" bullet in [Deferred work](tasks-plan.md#deferred-work)
   says why it is deferred.
