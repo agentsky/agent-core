@@ -490,7 +490,8 @@ fn entry_mode<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> u32 {
 pub fn check_tree(root: &Path) -> Result<(), CheckError> {
     let git = root.join(".git");
     if fs::symlink_metadata(&git).is_ok_and(|meta| meta.is_dir()) {
-        fs::remove_dir_all(&git).map_err(io("removing a clone's .git"))?;
+        sandbox::remove_tree(&git)
+            .map_err(|err| io("removing a clone's .git")(std::io::Error::other(err)))?;
     }
     let mut budget = Budget::default();
     let mut stack = vec![(root.to_owned(), 0usize, 0usize)];
