@@ -3895,8 +3895,8 @@ placeholder revoked by `process_stopping` before the turn's `turn_finished`
 runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
-T21 recycles the session's container when the requester changes, which
-ends every process a turn left running
+T21 recycles the session's container when the party changes, which ends
+every process a turn left running
 ([T21](#another-requesters-turn-gets-a-new-container)), so a background
 process left from turn N spends only the credentials of its own party's
 later turns while they run (a requester's, or a configured group's). Only
@@ -5154,8 +5154,11 @@ costs one extra clear.
 The warm container's own requester (`Held::requester`) is still checked as
 well: the record says whose turns used the files, and the held requester whose
 processes may still run in the container. They agree while one agentd instance
-writes the record, but not when another rewrites it, as below, and then only
-the held requester keeps another party out of the container.
+writes the record, but not when another rewrites it, as below. Then only the
+held requester keeps another party out of the container, and since that
+party's processes may have written to the files after the other instance
+cleared them, a recycle for it clears too and records the turn's requester
+alone.
 
 `PoolConfig::requester_groups` lists groups of `MemberKey`s. Validation
 refuses a group of fewer than two and a member listed twice, so `same_party`
@@ -5172,8 +5175,9 @@ The record keeps a restart or an idle reap from skipping a clear for one
 agentd instance, which stops every container the old instance left at startup.
 During a blue-green overlap the other instance's warm container of the same
 session, and anything left running in it, can still write to the session's
-files after this instance cleared them, so a clear holds only once one
-instance serves the session.
+files after this instance cleared them, until a turn on the other instance
+recycles that container, which clears them again, so a clear holds only once
+one instance serves the session.
 `another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restart`,
 `a_trusted_group_shares_the_warm_container_and_the_files`,
 `a_record_changed_under_a_warm_container_recycles_it` and the

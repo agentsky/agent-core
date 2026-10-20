@@ -342,15 +342,28 @@ pub(crate) fn settings_json(cleanup_period_days: u32) -> String {
 }
 
 /// Removes every entry of the directory `dir` that `keep` doesn't keep,
-/// given its name and type, with [`remove_tree_at`].
+/// given its name and type, with [`remove_tree_at`]. It reads
+/// [`REMOVAL_BATCH`] names at a time until a batch has nothing to remove,
+/// so `keep` must keep fewer entries than a batch holds, and it fails past
+/// [`MAX_REMOVED_ENTRIES`] removals, as the remover does.
 fn clear_dir(dir: &File, keep: impl Fn(&OsStr, FileType) -> bool) -> Result<()> {
-    for name in list_dir(dir)? {
-        match kind_at(dir, &name)? {
-            Some(kind) if !keep(&name, kind) => remove_tree_at(dir, &name)?,
-            _ => {}
+    let mut budget = MAX_REMOVED_ENTRIES;
+    loop {
+        let mut removed = false;
+        for name in read_batch(dir)? {
+            match kind_at(dir, &name)? {
+                Some(kind) if !keep(&name, kind) => {
+                    budget = budget.checked_sub(1).ok_or_else(too_many_entries)?;
+                    remove_tree_at(dir, &name)?;
+                    removed = true;
+                }
+                _ => {}
+            }
+        }
+        if !removed {
+            return Ok(());
         }
     }
-    Ok(())
 }
 
 /// Creates the directory `path` if it's missing. An existing entry must be
@@ -497,10 +510,7 @@ fn remove_tree_at(parent: &File, name: &OsStr) -> Result<()> {
         let read_to_end = batch.len() < REMOVAL_BATCH;
         let count = batch.len();
         for (index, entry) in batch.into_iter().enumerate() {
-            budget = budget.checked_sub(1).ok_or_else(|| SandboxError::Io {
-                what,
-                source: io::Error::other("the tree has more entries than one removal handles"),
-            })?;
+            budget = budget.checked_sub(1).ok_or_else(too_many_entries)?;
             match kind_at(&current, &entry)? {
                 None => {}
                 Some(FileType::Directory) => {
@@ -533,6 +543,14 @@ fn remove_tree_at(parent: &File, name: &OsStr) -> Result<()> {
     }
     drop(top);
     rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(errno(what))
+}
+
+/// The error for a tree with more than [`MAX_REMOVED_ENTRIES`] entries.
+fn too_many_entries() -> SandboxError {
+    SandboxError::Io {
+        what: "removing a directory tree",
+        source: io::Error::other("the tree has more entries than one removal handles"),
+    }
 }
 
 /// Opens the directory `name` in `parent` as a handle and gives its owner
@@ -1288,15 +1306,6 @@ mod fs_tests {
         assert_eq!(owned(&session_dir), (me.uid(), me.gid()));
     }
 
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<_> = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
-    }
-
     /// Builds at `root` what an agent or a build can leave: `0555`
     /// directories holding `0444` files (as Go's module cache is), a mode
     /// `0` directory, a `0500` one, and a symlink to `outside`.
@@ -1458,7 +1467,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let settings = session_dir.join("claude/settings.json");
@@ -1474,7 +1483,7 @@ mod fs_tests {
             }
         }
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert_eq!(names(&session_dir.join("claude")), ["settings.json"]);

@@ -253,24 +253,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// are cleared too ([`SessionSpec::clear_files`]). The store records the
 /// requesters whose turns have used the files since they were last cleared
 /// ([`Session::files_requesters`]). Unless every one of them is the same
-/// party as the turn's requester, the turn gets a new container that starts
-/// with the session's files cleared: everything in the session directory but
-/// its four subdirectories, everything in `home/` and `tmp/`, and everything
-/// in `claude/` but the transcript file and its directory, which are kept
-/// whole. The record then becomes the turn's requester alone; an empty
-/// record, or one that doesn't parse, clears too. A member of the group not
-/// yet in the record is added to it, in a warm container or a new one. The
-/// record is read from the store with the session's slot held, and written
-/// before any process gets the turn, so an idle reap, a restart (which stops
-/// the old instance's containers) or a group removed from the configuration
-/// doesn't skip a clear; a warm container of another agentd instance during
-/// a blue-green overlap can still write to the files after it. If writing it
+/// party as the turn's requester, and the warm container, if any, holds the
+/// same party, the turn gets a new container that starts with the session's
+/// files cleared: everything in the session directory but its four
+/// subdirectories, everything in `home/` and `tmp/`, and everything in
+/// `claude/` but the transcript file and its directory, which are kept whole.
+/// The record then becomes the turn's requester alone; an empty record, or
+/// one that doesn't parse, clears too. A member of the group not yet in the
+/// record is added to it, in a warm container or a new one. The record is
+/// read from the store with the session's slot held, and written before any
+/// process gets the turn, so an idle reap, a restart (which stops the old
+/// instance's containers) or a group removed from the configuration doesn't
+/// skip a clear; a warm container of another agentd instance during a
+/// blue-green overlap can still write to the files after it, until a turn on
+/// that instance recycles the container, which clears them. If writing it
 /// fails, the container is stopped and the turn fails with
 /// [`RunnerError::Store`]. `work/`, `shared/` and the transcript files carry
-/// over,
-/// as does everything between members of one group. A process that
-/// crashed, timed out or refused its `--resume` is stopped after the turn;
-/// if it wasn't seen to exit, its container is stopped too before the next
+/// over, as does everything between members of one group. A process that
+/// crashed, timed out or refused its `--resume` is stopped after the turn; if
+/// it wasn't seen to exit, its container is stopped too before the next
 /// process starts, so two processes never write one transcript. A container
 /// the sandbox fails to stop stays the session's, marked dead: the session's
 /// turns fail until a later stop succeeds, rather than start another process
@@ -744,9 +745,9 @@ impl<H: TurnHooks> Inner<H> {
     /// for that requester.
     ///
     /// The session's files go to the turn only if every requester in
-    /// `files_requesters` is the same party as the turn's: otherwise the
-    /// container goes too, and the new one clears them and records the
-    /// turn's requester alone. A requester missing from the record is added
+    /// `files_requesters` is the same party as the turn's, and no container
+    /// started for another party goes: otherwise the container goes too, and
+    /// the new one clears them and records the turn's requester alone. A requester missing from the record is added
     /// to it. Either write happens before any process gets the turn, and a
     /// failed one stops the container.
     ///
@@ -778,13 +779,14 @@ impl<H: TurnHooks> Inner<H> {
                 .files_requesters
                 .iter()
                 .all(|holder| self.same_party(holder, request));
+        let held_by_another_party = warm
+            .held
+            .as_ref()
+            .is_some_and(|held| !self.same_party(&held.requester, request));
+        let clear_files = !files_shared || held_by_another_party;
         if let Some(held) = &warm.held {
             let dead = held.tracked.state().dead;
-            if dead
-                || held.mounts != mounts
-                || !files_shared
-                || !self.same_party(&held.requester, request)
-            {
+            if dead || held.mounts != mounts || clear_files {
                 self.release_container(warm).await?;
             }
         }
@@ -800,11 +802,11 @@ impl<H: TurnHooks> Inner<H> {
         }
         if warm.held.is_none() {
             let held = self
-                .start_container(session, mounts, requester, !files_shared, warm.slot.clone())
+                .start_container(session, mounts, requester, clear_files, warm.slot.clone())
                 .await?;
             warm.held = Some(held);
         }
-        let record = if !files_shared {
+        let record = if clear_files {
             Some(vec![requester.clone()])
         } else if !session.files_requesters.contains(requester) {
             Some(
