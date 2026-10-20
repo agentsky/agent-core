@@ -4,7 +4,7 @@ use core_types::{ConvRef, ScopeKey, SurfaceKind, TeamId, ThreadKey};
 use cred_proxy::EgressPolicy;
 use sqlx::Connection as _;
 use store::{AgentCreation, NewAgent, Sealer, Visibility};
-use testkit::TempDir;
+use testkit::{TempDir, deep_tree};
 
 use super::*;
 
@@ -658,17 +658,6 @@ async fn startup_clears_work_expired_and_unrecorded_skills() {
         rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
         ["keep", "live"]
     );
-}
-
-fn deep_tree(top: &Path, depth: usize) {
-    use rustix::fs::{Mode, OFlags};
-    let flags = OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC;
-    std::fs::create_dir_all(top).unwrap();
-    let mut level = rustix::fs::open(top, flags, Mode::empty()).unwrap();
-    for _ in 0..depth {
-        rustix::fs::mkdirat(&level, "d", Mode::from_raw_mode(0o755)).unwrap();
-        level = rustix::fs::openat(&level, "d", flags, Mode::empty()).unwrap();
-    }
 }
 
 #[tokio::test]
