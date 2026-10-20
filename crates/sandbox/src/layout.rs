@@ -59,18 +59,21 @@
 //! before this start's container exists. Another container of the same
 //! session can still be running, as during a blue-green overlap of two
 //! agentd instances, so nothing here relies on the tree holding still: the
-//! handles keep every step inside the session directory, and the remover
-//! fails rather than chase entries a writer keeps adding.
+//! handles keep every step inside the session directory, `settings.json`
+//! is replaced by a rename, so that container never finds it missing, and
+//! the remover fails rather than chase entries a writer keeps adding.
 
-use std::ffi::{OsStr, OsString};
+use std::collections::VecDeque;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, chown, fchown};
 use std::path::{Path, PathBuf};
 
 use core_types::{ScopeKey, SessionId, VolumeKey};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use store::Store;
@@ -180,20 +183,26 @@ impl Layout {
             create_dir(&dir, None)?;
             let session_dir = open_dir(&dir)?;
             set_mode(&session_dir)?;
+            let mut budget = Budget::new();
             if clear_files {
-                clear_dir(&session_dir, |name, kind| {
-                    kind == FileType::Directory && SESSION_SUBDIRS.iter().any(|sub| name == *sub)
-                })?;
+                clear_dir(
+                    &session_dir,
+                    |name, kind| {
+                        kind == FileType::Directory
+                            && SESSION_SUBDIRS.iter().any(|sub| name == *sub)
+                    },
+                    &mut budget,
+                )?;
             }
             for sub in SESSION_SUBDIRS.into_iter().filter(|sub| *sub != CLAUDE_DIR) {
                 let handle = this.repair_dir_at(&session_dir, sub)?;
                 if clear_files && CLEARED_SUBDIRS.contains(&sub) {
-                    clear_dir(&handle, |_, _| false)?;
+                    clear_dir(&handle, |_, _| false, &mut budget)?;
                 }
             }
             let claude = this.repair_dir_at(&session_dir, CLAUDE_DIR)?;
             if clear_files {
-                this.clear_claude_dir(&claude, session)?;
+                this.clear_claude_dir(&claude, session, &mut budget)?;
             }
             this.write_settings(&claude)?;
             this.place_skills(&claude, &skills)?;
@@ -238,14 +247,16 @@ impl Layout {
         Ok(())
     }
 
-    /// Writes `settings.json` into the `claude/` directory `dir`: whatever
-    /// is there, a symlink or a directory the agent left included, is
-    /// removed without being followed, and a new file is renamed into
-    /// place. Every step is relative to `dir`, so nothing is written
-    /// outside it.
+    /// Writes `settings.json` into the `claude/` directory `dir`: a new
+    /// file is renamed into place, which replaces a file or a symlink there
+    /// at once without following it, and a directory the agent left there
+    /// is removed first. Every step is relative to `dir`, so nothing is
+    /// written outside it.
     fn write_settings(&self, dir: &File) -> Result<()> {
         const TARGET: &str = "settings.json";
-        remove_tree_at(dir, OsStr::new(TARGET))?;
+        if kind_at(dir, TARGET)? == Some(FileType::Directory) {
+            remove_tree_at(dir, OsStr::new(TARGET), &mut Budget::new())?;
+        }
         let body = settings_json(self.cleanup_period_days);
         let temp = format!(".settings.json.{}", uuid::Uuid::new_v4());
         let file = rustix::fs::openat(
@@ -279,7 +290,9 @@ impl Layout {
         };
         let what = "linking the skills directory";
         match kind_at(dir, SKILLS_DIR)? {
-            Some(_) if target.is_some() => remove_tree_at(dir, OsStr::new(SKILLS_DIR))?,
+            Some(_) if target.is_some() => {
+                remove_tree_at(dir, OsStr::new(SKILLS_DIR), &mut Budget::new())?;
+            }
             Some(FileType::Symlink) => {
                 rustix::fs::unlinkat(dir, SKILLS_DIR, AtFlags::empty()).map_err(errno(what))?;
             }
@@ -297,23 +310,36 @@ impl Layout {
     /// Everything else goes, `settings.json` and `skills` included, which
     /// are put back after. `projects/` and `projects/<session>/` are
     /// repaired like the session's own directories, and created if
-    /// missing.
-    fn clear_claude_dir(&self, claude: &File, session: SessionId) -> Result<()> {
+    /// missing. Every removal is charged to `budget`.
+    fn clear_claude_dir(
+        &self,
+        claude: &File,
+        session: SessionId,
+        budget: &mut Budget,
+    ) -> Result<()> {
         let id = session.to_string();
         let transcript = format!("{id}.jsonl");
-        clear_dir(claude, |name, kind| {
-            name == PROJECTS_DIR && kind == FileType::Directory
-        })?;
+        clear_dir(
+            claude,
+            |name, kind| name == PROJECTS_DIR && kind == FileType::Directory,
+            budget,
+        )?;
         let projects = self.repair_dir_at(claude, PROJECTS_DIR)?;
-        clear_dir(&projects, |name, kind| {
-            name == id.as_str() && kind == FileType::Directory
-        })?;
+        clear_dir(
+            &projects,
+            |name, kind| name == id.as_str() && kind == FileType::Directory,
+            budget,
+        )?;
         let project = self.repair_dir_at(&projects, &id)?;
-        clear_dir(&project, |name, kind| match kind {
-            FileType::RegularFile => name == transcript.as_str(),
-            FileType::Directory => name == id.as_str(),
-            _ => false,
-        })
+        clear_dir(
+            &project,
+            |name, kind| match kind {
+                FileType::RegularFile => name == transcript.as_str(),
+                FileType::Directory => name == id.as_str(),
+                _ => false,
+            },
+            budget,
+        )
     }
 
     /// Gives the directory `dir` to the sandbox user, when its owner
@@ -342,19 +368,22 @@ pub(crate) fn settings_json(cleanup_period_days: u32) -> String {
 }
 
 /// Removes every entry of the directory `dir` that `keep` doesn't keep,
-/// given its name and type, with [`remove_tree_at`]. It reads
-/// [`REMOVAL_BATCH`] names at a time until a batch has nothing to remove,
-/// so `keep` must keep fewer entries than a batch holds, and it fails past
-/// [`MAX_REMOVED_ENTRIES`] removals, as the remover does.
-fn clear_dir(dir: &File, keep: impl Fn(&OsStr, FileType) -> bool) -> Result<()> {
-    let mut budget = MAX_REMOVED_ENTRIES;
+/// given its name and type, with [`remove_tree_at`], charging `budget` for
+/// the listing and the removals. It reads `dir` again until a read finds
+/// nothing to remove, so an entry added meanwhile goes too.
+fn clear_dir(
+    dir: &File,
+    keep: impl Fn(&OsStr, FileType) -> bool,
+    budget: &mut Budget,
+) -> Result<()> {
     loop {
         let mut removed = false;
-        for name in read_batch(dir)? {
-            match kind_at(dir, &name)? {
-                Some(kind) if !keep(&name, kind) => {
-                    budget = budget.checked_sub(1).ok_or_else(too_many_entries)?;
-                    remove_tree_at(dir, &name)?;
+        let mut entries = read_dir(dir, None, budget)?;
+        while let Some(entry) = next_entry(entries.as_mut(), budget)? {
+            let name = OsStr::from_bytes(entry.name.to_bytes());
+            match entry_kind(dir, &entry, budget)? {
+                Some(kind) if !keep(name, kind) => {
+                    remove_tree_at(dir, name, budget)?;
                     removed = true;
                 }
                 _ => {}
@@ -419,17 +448,34 @@ fn kind_at<P: rustix::path::Arg>(parent: &File, name: P) -> Result<Option<FileTy
     }
 }
 
-/// How many names [`remove_tree_at`] reads from a directory at a time.
-const REMOVAL_BATCH: usize = 256;
+/// The most steps one [`Budget`] allows: names read, and directories
+/// opened, entries looked up, unlinked or moved.
+const MAX_REMOVAL_STEPS: u64 = 1 << 22;
 
-/// The most entries [`remove_tree_at`] handles in one call before it gives
-/// up, so a writer adding entries as fast as they go can't keep it busy
-/// for ever.
-const MAX_REMOVED_ENTRIES: u64 = 1 << 24;
+/// The steps a removal may still take, so a writer adding entries as fast
+/// as they go can't keep it busy for ever. One budget can be shared by
+/// several removals that together make one clear.
+pub(crate) struct Budget(u64);
+
+impl Budget {
+    pub(crate) fn new() -> Self {
+        Self(MAX_REMOVAL_STEPS)
+    }
+
+    fn charge(&mut self) -> Result<()> {
+        self.0 = self.0.checked_sub(1).ok_or_else(|| SandboxError::Io {
+            what: "removing a directory tree",
+            source: io::Error::other("the tree took more steps than one removal allows"),
+        })?;
+        Ok(())
+    }
+}
 
 /// Removes the file or directory tree at `path`, without following a
 /// symlink in its last component or anywhere inside the tree, as the
-/// session directories' repair does; a missing `path` is not an error.
+/// session directories' repair does; a missing `path` is not an error, nor
+/// is an entry that another removal of the same tree took first. The
+/// directories above `path` are followed as any path is.
 ///
 /// It is for agentd's own directories that hold what an agent wrote, such
 /// as a private task's session directory: the tree may be read-only,
@@ -452,125 +498,295 @@ pub fn remove_tree(path: &Path) -> Result<()> {
     } else {
         parent
     };
-    let parent = match rustix::fs::open(parent, DIR_HANDLE, Mode::empty()) {
+    let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let parent = match rustix::fs::open(parent, flags, Mode::empty()) {
         Ok(fd) => File::from(fd),
         Err(Errno::NOENT) => return Ok(()),
         Err(err) => return Err(errno("opening a directory")(err)),
     };
-    remove_tree_at(&parent, name)
+    remove_tree_at(&parent, name, &mut Budget::new())
 }
 
 /// Removes `name` in `parent`: a directory with everything in it, or any
 /// other entry, a symlink included, by unlinking it. No symlink is
 /// followed: every entry is looked up with `AT_SYMLINK_NOFOLLOW` and
-/// opened with `O_NOFOLLOW` relative to its parent's handle.
+/// opened with `O_NOFOLLOW` relative to its parent's handle. An entry
+/// found missing, because another removal of the same tree took it, is
+/// skipped.
 ///
-/// Each directory gets mode `0700` through its handle before it is listed,
-/// emptied or moved, so a tree the agent made unreadable or read-only
-/// goes as long as agentd owns it. It works depth first without recursion,
-/// with a handful of files open and at most [`REMOVAL_BATCH`] names read
-/// at a time: the directory being emptied is read a batch at a time, its
-/// files unlinked, and the first subdirectory found is moved up into the
-/// top directory under a fresh name and emptied next, before the rest. So
-/// the top directory holds only the directories still being emptied, at
-/// most one per level of the tree, and one whose last entry was the moved
-/// subdirectory is removed at once.
+/// Each directory gets mode `0700` through its handle before it is listed
+/// or moved, so a tree the agent made unreadable or read-only goes as long
+/// as agentd owns it. It works depth first without recursion, with a
+/// handful of files open and one directory read at a time, as a stream:
+/// files are unlinked and empty directories removed as they are read, and
+/// the first directory found with something in it is moved up into the
+/// top directory and emptied next, and its parent's listing goes on from
+/// where it stopped once it is gone ([`Levels`]). So the top directory
+/// holds the directories still being emptied, at most one per level, a
+/// parent whose last entry was the moved directory being removed at once.
 ///
-/// It handles at most [`MAX_REMOVED_ENTRIES`] entries; a writer that keeps
-/// adding them, or one that adds an entry after a directory was found
-/// empty, makes it fail.
-fn remove_tree_at(parent: &File, name: &OsStr) -> Result<()> {
+/// Every step is charged to `budget`. Running out of it fails, as does a
+/// directory that something added an entry to after it was read to the
+/// end, except the top one, which is read again until it is found empty.
+fn remove_tree_at(parent: &File, name: &OsStr, budget: &mut Budget) -> Result<()> {
     let what = "removing a directory tree";
+    budget.charge()?;
     match kind_at(parent, name)? {
         None => return Ok(()),
         Some(FileType::Directory) => {}
-        Some(_) => {
-            return rustix::fs::unlinkat(parent, name, AtFlags::empty()).map_err(errno(what));
-        }
+        Some(_) => return skip_missing(rustix::fs::unlinkat(parent, name, AtFlags::empty()), what),
     }
-    let top = open_for_removal(parent, name)?;
-    let mut pending: Vec<OsString> = Vec::new();
-    let mut budget = MAX_REMOVED_ENTRIES;
+    let Some(top) = open_for_removal(parent, name, budget)? else {
+        return Ok(());
+    };
+    let mut levels = Levels::new();
+    let mut resume = None;
     loop {
-        let current = match pending.last() {
-            Some(moved) => open_for_removal(&top, moved)?,
-            None => top.try_clone().map_err(io_err(what))?,
-        };
-        let batch = read_batch(&current)?;
-        if batch.is_empty() {
-            drop(current);
-            match pending.pop() {
-                Some(moved) => {
-                    rustix::fs::unlinkat(&top, &moved, AtFlags::REMOVEDIR).map_err(errno(what))?
+        let depth = levels.depth;
+        let current = if depth == 0 {
+            top.try_clone().map_err(io_err(what))?
+        } else {
+            match open_for_removal(&top, levels.name(depth), budget)? {
+                Some(dir) => dir,
+                None => {
+                    resume = levels.ascend();
+                    continue;
                 }
-                None => break,
             }
+        };
+        let mut seen = resume.is_some();
+        let mut descended = false;
+        let mut entries = read_dir(&current, resume.take(), budget)?;
+        while let Some(entry) = next_entry(entries.as_mut(), budget)? {
+            seen = true;
+            let Some(kind) = entry_kind(&current, &entry, budget)? else {
+                continue;
+            };
+            budget.charge()?;
+            if kind != FileType::Directory {
+                skip_missing(
+                    rustix::fs::unlinkat(&current, &entry.name, AtFlags::empty()),
+                    what,
+                )?;
+                continue;
+            }
+            match rustix::fs::unlinkat(&current, &entry.name, AtFlags::REMOVEDIR) {
+                Ok(()) | Err(Errno::NOENT) => continue,
+                Err(Errno::NOTEMPTY | Errno::EXIST) => {}
+                Err(err) => return Err(errno(what)(err)),
+            }
+            if !move_up(&current, &entry.name, &top, &levels.name(depth + 1), budget)? {
+                continue;
+            }
+            levels.descend(entry.cookie);
+            if depth > 0 && next_entry(entries.as_mut(), budget)?.is_none() {
+                budget.charge()?;
+                if matches!(
+                    rustix::fs::unlinkat(&top, levels.name(depth), AtFlags::REMOVEDIR),
+                    Ok(()) | Err(Errno::NOENT)
+                ) {
+                    levels.ascend();
+                    budget.charge()?;
+                    match rustix::fs::renameat(
+                        &top,
+                        levels.name(depth + 1),
+                        &top,
+                        levels.name(depth),
+                    ) {
+                        Ok(()) => {}
+                        Err(Errno::NOENT) => resume = levels.ascend(),
+                        Err(err) => return Err(errno(what)(err)),
+                    }
+                }
+            }
+            descended = true;
+            break;
+        }
+        if descended || (depth == 0 && seen) {
             continue;
         }
-        let read_to_end = batch.len() < REMOVAL_BATCH;
-        let count = batch.len();
-        for (index, entry) in batch.into_iter().enumerate() {
-            budget = budget.checked_sub(1).ok_or_else(too_many_entries)?;
-            match kind_at(&current, &entry)? {
-                None => {}
-                Some(FileType::Directory) => {
-                    drop(open_for_removal(&current, &entry)?);
-                    let moved = OsString::from(format!(".removing-{}", uuid::Uuid::new_v4()));
-                    rustix::fs::renameat_with(
-                        &current,
-                        &entry,
-                        &top,
-                        &moved,
-                        RenameFlags::NOREPLACE,
-                    )
-                    .map_err(errno(what))?;
-                    let emptied = read_to_end && index + 1 == count;
-                    if emptied
-                        && let Some(paused) = pending.last()
-                        && rustix::fs::unlinkat(&top, paused, AtFlags::REMOVEDIR).is_ok()
-                    {
-                        pending.pop();
-                    }
-                    pending.push(moved);
-                    break;
-                }
-                Some(_) => {
-                    rustix::fs::unlinkat(&current, &entry, AtFlags::empty())
-                        .map_err(errno(what))?;
-                }
-            }
+        if depth == 0 {
+            break;
         }
+        budget.charge()?;
+        skip_missing(
+            rustix::fs::unlinkat(&top, levels.name(depth), AtFlags::REMOVEDIR),
+            what,
+        )?;
+        resume = levels.ascend();
     }
     drop(top);
-    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(errno(what))
+    budget.charge()?;
+    skip_missing(rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR), what)
 }
 
-/// The error for a tree with more than [`MAX_REMOVED_ENTRIES`] entries.
-fn too_many_entries() -> SandboxError {
-    SandboxError::Io {
-        what: "removing a directory tree",
-        source: io::Error::other("the tree has more entries than one removal handles"),
+/// How many levels of [`Levels`] keep where their directory's listing
+/// stopped.
+const KEPT_POSITIONS: usize = 1024;
+
+/// The directories one removal has moved up into its top directory and is
+/// still emptying: a count, since level `n` is named
+/// `.removing-<the removal's id>-<n>`, and where the listing of each of
+/// the deepest [`KEPT_POSITIONS`] stopped, so going back up to one reads on
+/// from there rather than from the start. A level above those is read from
+/// the start again, which only a tree that deep makes happen, so the
+/// listing that repeats is paid for by the steps taken below it.
+struct Levels {
+    id: uuid::fmt::Simple,
+    depth: usize,
+    positions: VecDeque<i64>,
+}
+
+impl Levels {
+    fn new() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().simple(),
+            depth: 0,
+            positions: VecDeque::new(),
+        }
+    }
+
+    fn name(&self, depth: usize) -> String {
+        format!(".removing-{}-{depth}", self.id)
+    }
+
+    /// Goes down a level from one whose listing stopped at `position`.
+    fn descend(&mut self, position: i64) {
+        if self.positions.len() == KEPT_POSITIONS {
+            self.positions.pop_front();
+        }
+        self.positions.push_back(position);
+        self.depth += 1;
+    }
+
+    /// Goes back up a level, returning where its listing stopped if that
+    /// was kept.
+    fn ascend(&mut self) -> Option<i64> {
+        self.depth -= 1;
+        self.positions.pop_back()
+    }
+}
+
+/// Moves the directory `name` in `parent` to `to` in `top`, giving it mode
+/// `0700` first if a read-only directory can't be moved, and says whether
+/// it was there to move. The moved directory is opened by its new name
+/// afterwards, never through a handle taken before the move, since the
+/// name may have come to hold another directory meanwhile.
+fn move_up(parent: &File, name: &CStr, top: &File, to: &str, budget: &mut Budget) -> Result<bool> {
+    let what = "moving a directory to remove";
+    budget.charge()?;
+    match rustix::fs::renameat(parent, name, top, to) {
+        Ok(()) => return Ok(true),
+        Err(Errno::NOENT) => return Ok(false),
+        Err(Errno::ACCESS) => {}
+        Err(err) => return Err(errno(what)(err)),
+    }
+    if open_for_removal(parent, name, budget)?.is_none() {
+        return Ok(false);
+    }
+    budget.charge()?;
+    match rustix::fs::renameat(parent, name, top, to) {
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
+        Err(err) => Err(errno(what)(err)),
+    }
+}
+
+/// `result`, with a missing entry, which another removal took, counted as
+/// done.
+fn skip_missing(result: rustix::io::Result<()>, what: &'static str) -> Result<()> {
+    match result {
+        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Err(err) => Err(errno(what)(err)),
     }
 }
 
 /// Opens the directory `name` in `parent` as a handle and gives its owner
-/// `rwx` on it, mode `0700`, so it can be listed, emptied and moved.
-fn open_for_removal(parent: &File, name: &OsStr) -> Result<File> {
-    let dir = open_dir_at(parent, name)?;
+/// `rwx` on it, mode `0700`, so it can be listed, emptied and moved, or
+/// `None` if it is missing.
+fn open_for_removal<P: rustix::path::Arg>(
+    parent: &File,
+    name: P,
+    budget: &mut Budget,
+) -> Result<Option<File>> {
+    budget.charge()?;
+    let dir = match rustix::fs::openat(parent, name, DIR_HANDLE, Mode::empty()) {
+        Ok(fd) => File::from(fd),
+        Err(Errno::NOENT) => return Ok(None),
+        Err(err) => return Err(errno("opening a directory to remove")(err)),
+    };
+    budget.charge()?;
     fs::set_permissions(handle_path(&dir), Permissions::from_mode(0o700))
         .map_err(io_err("making a directory removable"))?;
-    Ok(dir)
+    Ok(Some(dir))
 }
 
-/// Up to [`REMOVAL_BATCH`] names from the directory `dir`, read through its
-/// handle.
-fn read_batch(dir: &File) -> Result<Vec<OsString>> {
+/// A stream of the names in the directory `dir`, read through its handle a
+/// few at a time from `position`, or from the start if there is none or
+/// the filesystem refuses it, or `None` if the directory was removed
+/// meanwhile.
+fn read_dir(
+    dir: &File,
+    position: Option<i64>,
+    budget: &mut Budget,
+) -> Result<Option<rustix::fs::Dir>> {
     let what = "listing a directory";
-    fs::read_dir(handle_path(dir))
-        .map_err(io_err(what))?
-        .take(REMOVAL_BATCH)
-        .map(|entry| entry.map(|entry| entry.file_name()).map_err(io_err(what)))
-        .collect()
+    budget.charge()?;
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let open = || match rustix::fs::openat(dir, c".", flags, Mode::empty()) {
+        Ok(fd) => rustix::fs::Dir::new(fd).map(Some).map_err(errno(what)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(err) => Err(errno(what)(err)),
+    };
+    let Some(mut entries) = open()? else {
+        return Ok(None);
+    };
+    match position.map(|position| entries.seek(position)) {
+        Some(Err(_)) => open(),
+        _ => Ok(Some(entries)),
+    }
+}
+
+/// The type of `entry` in `dir`: the one its listing gave, or, when that
+/// is unknown, looked up, `None` meaning the entry is gone.
+fn entry_kind(dir: &File, entry: &Entry, budget: &mut Budget) -> Result<Option<FileType>> {
+    match entry.kind {
+        FileType::Unknown => {
+            budget.charge()?;
+            kind_at(dir, &entry.name)
+        }
+        kind => Ok(Some(kind)),
+    }
+}
+
+/// An entry [`next_entry`] read.
+struct Entry {
+    name: CString,
+    /// The type the listing gives, which may be [`FileType::Unknown`].
+    kind: FileType,
+    /// Where the listing goes on after it.
+    cookie: i64,
+}
+
+/// The next entry in `entries` but `.` and `..`, each name read charged
+/// to `budget`, or `None` at the end.
+fn next_entry(entries: Option<&mut rustix::fs::Dir>, budget: &mut Budget) -> Result<Option<Entry>> {
+    let Some(entries) = entries else {
+        return Ok(None);
+    };
+    while let Some(entry) = entries.read() {
+        budget.charge()?;
+        let entry = entry.map_err(errno("listing a directory"))?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+            return Ok(Some(Entry {
+                name: name.to_owned(),
+                kind: entry.file_type(),
+                cookie: entry.offset(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 fn mkdir_at(parent: &File, name: &str) -> Result<()> {
@@ -1456,37 +1672,100 @@ mod fs_tests {
         assert_eq!(names(&session_dir.join("claude")), ["settings.json"]);
     }
 
-    #[tokio::test]
-    async fn a_directory_wider_than_a_batch_is_removed() {
-        let dir = TempDir::new("sandbox-test");
-        let layout = layout(&dir, None).await;
-        let key = VolumeKey {
-            agent: AgentId::new_v4(),
-            scope: ScopeKey::Private,
-        };
-        let volume = layout.ensure_volume(&key).await.unwrap();
-        let session = SessionId::new_v4();
-        let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
-            .await
-            .unwrap();
-        let settings = session_dir.join("claude/settings.json");
-        fs::remove_file(&settings).unwrap();
-        for wide in [settings.clone(), settings.join("sub")] {
-            fs::create_dir(&wide).unwrap();
-            for i in 0..REMOVAL_BATCH * 4 + 3 {
-                fs::write(wide.join(format!("f{i}")), "x").unwrap();
+    /// Builds a tree at `root` of `width` files and `width` directories,
+    /// half of them empty and half holding one file, `levels` levels deep,
+    /// and returns how many entries it has.
+    fn wide_tree(root: &Path, width: usize, levels: usize) -> u64 {
+        fs::create_dir(root).unwrap();
+        let mut entries = 1;
+        for i in 0..width {
+            fs::write(root.join(format!("f{i}")), "x").unwrap();
+            let sub = root.join(format!("d{i}"));
+            if levels > 1 {
+                entries += wide_tree(&sub, width, levels - 1);
+            } else {
+                fs::create_dir(&sub).unwrap();
+                entries += 1;
+                if i % 2 == 0 {
+                    fs::write(sub.join("f"), "x").unwrap();
+                    entries += 1;
+                }
             }
-            for i in 0..REMOVAL_BATCH + 7 {
-                fs::create_dir(wide.join(format!("d{i}"))).unwrap();
-                fs::write(wide.join(format!("d{i}/f")), "x").unwrap();
-            }
+            entries += 1;
         }
-        layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
-            .await
-            .unwrap();
-        assert_eq!(names(&session_dir.join("claude")), ["settings.json"]);
+        entries
+    }
+
+    fn remove_with(root: &Path, budget: &mut Budget) -> Result<()> {
+        let parent = open_dir(root.parent().unwrap()).unwrap();
+        remove_tree_at(&parent, root.file_name().unwrap(), budget)
+    }
+
+    #[test]
+    fn a_wide_tree_is_removed_in_steps_linear_in_its_size() {
+        let dir = TempDir::new("sandbox-test");
+        let tree = dir.join("tree");
+        let entries = wide_tree(&tree, 2000, 1) + wide_tree(&tree.join("d0/deeper"), 30, 2);
+        remove_with(&tree, &mut Budget(8 * entries)).unwrap();
+        assert_eq!(names(dir.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_writer_that_keeps_adding_entries_runs_the_budget_out() {
+        let dir = TempDir::new("sandbox-test");
+        let tree = dir.join("tree");
+        fs::create_dir(&tree).unwrap();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writers: Vec<_> = (0..2)
+            .map(|writer| {
+                let stop = stop.clone();
+                let top = open_dir(&tree).unwrap();
+                std::thread::spawn(move || {
+                    let mut i = 0u64;
+                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = mkdir_at(&top, &format!("w{writer}-{i}"));
+                        let _ = mkdir_at(&top, &format!("w{writer}-{i}/x"));
+                        i += 1;
+                    }
+                })
+            })
+            .collect();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let started = std::time::Instant::now();
+        let removed = remove_with(&tree, &mut Budget(20_000));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let err = removed.expect_err("the writers always left something");
+        assert!(err.to_string().contains("more steps"), "{err}");
+        assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+    }
+
+    #[test]
+    fn two_removals_of_one_tree_both_succeed() {
+        for _ in 0..20 {
+            let dir = TempDir::new("sandbox-test");
+            let tree = dir.join("tree");
+            wide_tree(&tree, 6, 3);
+            let mut level = open_dir(&tree).unwrap();
+            for _ in 0..200 {
+                mkdir_at(&level, "d").unwrap();
+                level = open_dir_at(&level, "d").unwrap();
+            }
+            drop(level);
+            let removals: Vec<_> = (0..2)
+                .map(|_| {
+                    let tree = tree.clone();
+                    std::thread::spawn(move || remove_tree(&tree))
+                })
+                .collect();
+            for removal in removals {
+                removal.join().unwrap().unwrap();
+            }
+            assert_eq!(names(dir.path()), Vec::<String>::new());
+        }
     }
 
     #[test]
@@ -1514,6 +1793,10 @@ mod fs_tests {
             remove_tree(Path::new("/")),
             Err(SandboxError::InvalidSpec(_))
         ));
+        fs::create_dir_all(dir.join("real/tree/a")).unwrap();
+        symlink(dir.join("real"), dir.join("alias")).unwrap();
+        remove_tree(&dir.join("alias/tree")).unwrap();
+        assert_eq!(names(&dir.join("real")), Vec::<String>::new());
     }
 
     #[tokio::test]
