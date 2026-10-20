@@ -8,7 +8,7 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1492,6 +1492,17 @@ async fn a_store_failure_before_the_task_runs_is_retried() {
     stack.stop().await;
 }
 
+fn deep_tree(top: &Path, depth: usize) {
+    use rustix::fs::{Mode, OFlags};
+    let flags = OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC;
+    std::fs::create_dir_all(top).unwrap();
+    let mut level = rustix::fs::open(top, flags, Mode::empty()).unwrap();
+    for _ in 0..depth {
+        rustix::fs::mkdirat(&level, "d", Mode::from_raw_mode(0o755)).unwrap();
+        level = rustix::fs::openat(&level, "d", flags, Mode::empty()).unwrap();
+    }
+}
+
 #[tokio::test]
 async fn a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind() {
     let stack = start("").await;
@@ -1526,6 +1537,7 @@ async fn a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind() {
         .join("sessions")
         .join(earlier.to_string());
     assert!(session_dir.join("work/in.txt").exists());
+    deep_tree(&session_dir.join("work/deep"), 16_000);
     sqlx::query("DROP TRIGGER fail_private_sends")
         .execute(&db)
         .await
@@ -1554,7 +1566,7 @@ async fn a_turn_that_fails_after_it_may_have_started_leaves_nothing_behind() {
     while session_dir.exists() {
         assert!(
             started.elapsed() < WAIT,
-            "the failed session's directory was kept"
+            "the failed session's directory, a tree deeper than recursion allows in it, was kept"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
