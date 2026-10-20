@@ -747,9 +747,10 @@ impl<H: TurnHooks> Inner<H> {
     /// The session's files go to the turn only if every requester in
     /// `files_requesters` is the same party as the turn's, and no container
     /// started for another party goes: otherwise the container goes too, and
-    /// the new one clears them and records the turn's requester alone. A requester missing from the record is added
-    /// to it. Either write happens before any process gets the turn, and a
-    /// failed one stops the container.
+    /// the new one clears them and records the turn's requester alone. A
+    /// requester missing from the record is added to it. Either write
+    /// happens before any process gets the turn, and a failed one stops the
+    /// container.
     ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
