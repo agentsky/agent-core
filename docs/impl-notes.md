@@ -6589,7 +6589,7 @@ container an earlier process ran in (after a crash, a kill, or a
 credential kind or model change) counts its first turn's cost as unknown.
 A runner test resumes in such a container and gets no cost; before this
 it got the turn's cost. T21 stops the container when the party changes
-([T21](#another-requesters-turn-gets-a-new-container)), so only the same
+([T21](#another-partys-turn-gets-a-new-container)), so only the same
 party's later turns resume in a used one: a requester's own, or, with
 `requester_groups`, another member of its group whose credential kind or
 model differs, which restarts only the process in the kept container. That
