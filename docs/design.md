@@ -596,9 +596,10 @@ container of the session mounts, as it does the volume's `shared/`. So a
 requester change also clears files: the new container starts with `home/` and
 `tmp/` emptied and everything in `claude/` but the transcript removed, so a
 `.bashrc` or a `CLAUDE.md` an earlier turn left doesn't run or instruct code in
-the next requester's process. The store records whose files the session holds,
-and the clear is decided from that record, so an idle reap or a restart of
-agentd doesn't skip it. A deployment can name groups of requesters who trust
+the next requester's process. The store records every requester whose turns
+have used the files since they were last cleared, and the clear is decided from
+that record, so an idle reap, a restart of agentd or a change to the groups
+below doesn't skip it. A deployment can name groups of requesters who trust
 each other with their credentials (`[runner] requester_groups`): a group shares
 the warm container and the files, with no recycle or clear between its members.
 What a turn leaves in `work/` or `shared/`, and text in the transcript, still

@@ -4569,31 +4569,37 @@ idle reap or a restart the next requester's container would start on another
 requester's files. Some deployments also want trusted requesters to share a
 session's container and files.
 
-**Solution.** `sessions.files_requester` (a migration of its own) records whose
-files the session holds. `ensure_process` reads it with the session, from the
-store with the slot held, and starts a container with
-`SessionSpec::clear_files` unless it names the same party as the turn's
-requester; NULL, for a new session or a row from before the column, clears.
-`prepare_session_dirs` then empties `home/` and `tmp/` and removes everything
-in `claude/` but `projects/<id>/<id>.jsonl` and `projects/<id>/<id>/`, through
-the same handles as its repair, before `settings.json` and `skills` are put
-back. The turn's requester is recorded after the clear and before any process
-starts; if that fails, the container is stopped and the turn fails, since
-otherwise the earlier requester's next turn would skip its clear and inherit
-this one's files. A crash between the clear and the record costs one extra
-clear.
+**Solution.** `sessions.files_requesters` (a migration of its own) records
+the requesters whose turns have used the session's files since they were last
+cleared: a JSON array of `MemberKey` strings, sorted and without duplicates.
+It is parsed strictly, and a value that doesn't parse counts as unknown, as
+NULL does for a new session or a row from before the column. `ensure_process`
+reads it with the session, from the store with the slot held. Unless every
+recorded requester is the same party as the turn's, and there is at least
+one, the warm container goes and the new one starts with
+`SessionSpec::clear_files`: `prepare_session_dirs` empties `home/` and `tmp/`
+and removes everything in `claude/` but `projects/<id>/<id>.jsonl` and
+`projects/<id>/<id>/`, through the same handles as its repair, before
+`settings.json` and `skills` are put back. The record then becomes the turn's
+requester alone. A group member not yet in it, in a warm container or a new
+one, is added. Either write comes before any process gets the turn; if it
+fails, the container is stopped and the turn fails, since otherwise a later
+turn could skip the clear it needs. A crash between a clear and its record
+costs one extra clear.
 
 `PoolConfig::requester_groups` lists groups of `MemberKey`s. Validation
 refuses a group of fewer than two and a member listed twice, so `same_party`
 is an equivalence, and the one relation decides both the recycle and the
 clear: sharing files already lets one member's leftovers run in another's
-process, so recycling the container between them would buy nothing. A
-member's turn in a group's container or on its files leaves the record as it
-was, so removing a group takes effect at the record: a session whose record
-names one former member keeps what the others left there for that member's
-turns, and clears for the others.
-`another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restart`
-and `a_trusted_group_shares_the_warm_container_and_the_files` check both.
+process, so recycling the container between them would buy nothing. The
+record holds every member who used the files, not only the one they were
+cleared for, because the groups are configuration: once a group is removed,
+or a member taken out of one, its former members are no longer the same
+party, so the next turn of any of them clears what the others left. One
+requester alone wouldn't show that a second member had used the files.
+`another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restart`,
+`a_trusted_group_shares_the_warm_container_and_the_files` and the
+`removing_the_group_clears_*` tests check this.
 
 ### `ProcessSandbox` gives every container one address
 
