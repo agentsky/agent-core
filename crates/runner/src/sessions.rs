@@ -274,15 +274,20 @@ fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
 /// requesters whose turns have used the files since they were last cleared
 /// ([`Session::files_requesters`]). Unless every one of them is the same
 /// party as the turn's requester, the turn gets a new container that starts
-/// with `home/` and `tmp/` emptied and everything in `claude/` but the
-/// transcript removed, and the record becomes the turn's requester alone; an
-/// empty record, or one that doesn't parse, clears too. A member of the
-/// group not yet in the record is added to it, in a warm container or a new
-/// one. The record is read from the store with the session's slot held, and
-/// written before any process gets the turn, so an idle reap, a restart or a
-/// group removed from the configuration doesn't skip a clear. If writing it
+/// with the session's files cleared: everything in the session directory but
+/// its four subdirectories, everything in `home/` and `tmp/`, and everything
+/// in `claude/` but the transcript file and its directory, which are kept
+/// whole. The record then becomes the turn's requester alone; an empty
+/// record, or one that doesn't parse, clears too. A member of the group not
+/// yet in the record is added to it, in a warm container or a new one. The
+/// record is read from the store with the session's slot held, and written
+/// before any process gets the turn, so an idle reap, a restart (which stops
+/// the old instance's containers) or a group removed from the configuration
+/// doesn't skip a clear; a warm container of another agentd instance during
+/// a blue-green overlap can still write to the files after it. If writing it
 /// fails, the container is stopped and the turn fails with
-/// [`RunnerError::Store`]. `work/`, `shared/` and the transcript carry over,
+/// [`RunnerError::Store`]. `work/`, `shared/` and the transcript files carry
+/// over,
 /// as does everything between members of one group. A process that
 /// crashed, timed out or refused its `--resume` is stopped after the turn;
 /// if it wasn't seen to exit, its container is stopped too before the next

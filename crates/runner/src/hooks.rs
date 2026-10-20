@@ -48,20 +48,25 @@ pub struct TurnRequest {
     pub message: String,
     /// Whose credential the turn runs on. Its kind picks the process's
     /// credential variable: a turn on another kind than the warm process's
-    /// restarts it. A turn of another requester gets a new container
-    /// whatever its credential: see [`requester`](Self::requester).
+    /// restarts it. A turn of another party gets a new container whatever
+    /// its credential: see [`requester`](Self::requester).
     pub credential: CredentialRef,
     /// `--model`, if the router chose one. A turn on another model than
     /// the warm process's restarts it.
     pub model: Option<String>,
-    /// Who caused the turn, and pays for it. A turn whose requester differs
-    /// from the one whose turn started the warm container stops the
-    /// container, and every process left running in it, and starts another,
-    /// resuming from the transcript, since the turn's credential and its
-    /// agentctl token would otherwise reach those processes. Requesters
-    /// differ when their [`key`](Requester::key)s do: a member linked
-    /// between two turns of the same key keeps the container. Files an
-    /// earlier turn left in the session's directories are kept. An
+    /// Who caused the turn, and pays for it. A turn whose requester is
+    /// another party than the one whose turn started the warm container
+    /// stops the container, and every process left running in it, and
+    /// starts another, resuming from the transcript, since the turn's
+    /// credential and its agentctl token would otherwise reach those
+    /// processes. Two requesters are the same party when their
+    /// [`key`](Requester::key)s are equal or one configured group lists both
+    /// ([`RequesterGroups::same_party`](crate::RequesterGroups::same_party)):
+    /// a member linked between two turns of the same key keeps the
+    /// container. The files earlier turns left in the session's directories
+    /// are cleared for another party too, as
+    /// [`Session::files_requesters`](store::Session::files_requesters) says
+    /// ([`SessionSpec::clear_files`](sandbox::SessionSpec::clear_files)). An
     /// agent-to-agent hop runs as the requester it inherits, so it keeps a
     /// container started for that requester.
     pub requester: Requester,
