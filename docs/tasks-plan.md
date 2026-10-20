@@ -1944,6 +1944,13 @@ Acceptance:
     or a restart too; the same requester's doesn't, and a member of its
     group keeps the warm container and the files. A failure to record the
     requester fails the turn and stops the container.
+  - Once a group is removed, the first member's turn clears what the
+    second member's left, whether the second used the first's warm
+    container or a new one after an idle reap. A failure to add a joining
+    member to the record fails its turn and stops the container.
+  - A record changed under a warm container (to another party, or NULL)
+    recycles the container and clears the files; another party's turn
+    gets a new container even when the record names it.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
@@ -2921,15 +2928,18 @@ Not scheduled. Each needs a decision before it becomes a task.
   spend credentials between turns, and T21 recycles the session's container
   when the requester changes, which ends every process running in it
   ([impl-notes](impl-notes.md#another-requesters-turn-gets-a-new-container)).
-  A leftover can still spend the credentials of its own requester's later
-  turns while they run; only killing the processes a turn leaves behind in
-  the container when it ends removes that. On a requester change T21 also
-  clears the session's `home/`, `tmp/` and everything in `claude/` but the
-  transcript (a `.bashrc` the Bash tool's shells source, a `CLAUDE.md` the
-  CLI loads as user memory), unless `requester_groups` puts both
-  requesters in one group. Files still outlive the container in `work/`
-  and `shared/`, and text in the transcript: a turn can leave something
-  there that runs or instructs code in a later requester's process.
+  A leftover can still spend the credentials of its own party's later
+  turns while they run (a requester's, or a `requester_groups` group's);
+  only killing the processes a turn leaves behind in the container when it
+  ends removes that. When the party changes T21 also clears the session's
+  `home/`, `tmp/` and everything in `claude/` but the transcript file and
+  its directory (a `.bashrc` the Bash tool's shells source, a `CLAUDE.md`
+  the CLI loads as user memory). Files still outlive the container in
+  `work/` and `shared/`, and in the kept transcript files: a turn can leave
+  something there that runs or instructs code in a later requester's
+  process. During a blue-green overlap of two agentd instances, the other
+  instance's warm container of a session, and what is left running in it,
+  can also write to the session's files after a clear.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private

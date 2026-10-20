@@ -136,8 +136,16 @@ impl Row {
             }
             _ => return Err(corrupt("kind")),
         };
+        let id: SessionId = parse_column(&self.id, TABLE, "id")?;
+        let files_requesters = match self.files_requesters.as_deref() {
+            None => Vec::new(),
+            Some(text) => parse_requesters(text).unwrap_or_else(|| {
+                tracing::warn!(session = %id, "a session's files_requesters doesn't parse; its files will be cleared");
+                Vec::new()
+            }),
+        };
         Ok(Session {
-            id: parse_column(&self.id, TABLE, "id")?,
+            id,
             agent: parse_column(&self.agent_id, TABLE, "agent_id")?,
             thread: ThreadKey {
                 conv: ConvRef {
@@ -160,11 +168,7 @@ impl Row {
                 .reset_at
                 .map(|at| from_unix(at, TABLE, "reset_at"))
                 .transpose()?,
-            files_requesters: self
-                .files_requesters
-                .as_deref()
-                .and_then(parse_requesters)
-                .unwrap_or_default(),
+            files_requesters,
         })
     }
 }
@@ -178,13 +182,13 @@ fn requesters_column(requesters: &[MemberKey]) -> String {
     serde_json::Value::from(keys).to_string()
 }
 
-/// Parses a `files_requesters` value strictly: a JSON array of member key
-/// strings in the order [`requesters_column`] writes them, or `None`.
+/// Parses a `files_requesters` value: a JSON array of member key strings,
+/// returned sorted by string form and without duplicates, or `None` for
+/// anything else.
 fn parse_requesters(text: &str) -> Option<Vec<MemberKey>> {
-    let keys: Vec<String> = serde_json::from_str(text).ok()?;
-    if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
-        return None;
-    }
+    let mut keys: Vec<String> = serde_json::from_str(text).ok()?;
+    keys.sort();
+    keys.dedup();
     keys.iter().map(|key| key.parse().ok()).collect()
 }
 
@@ -829,7 +833,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn files_requesters_that_dont_parse_strictly_are_unknown() {
+    async fn files_requesters_that_dont_parse_are_unknown() {
         let store = memory_store().await;
         let session = store
             .session_for_thread(AgentId::new_v4(), &dm(), &ScopeKey::Private, at(1))
@@ -839,12 +843,10 @@ mod tests {
         for bad in [
             "nonsense",
             "",
-            "[]",
             "\"slack:T1:U1\"",
             "[1]",
             "[\"teams:T1:U1\"]",
-            "[\"slack:T1:U2\",\"slack:T1:U1\"]",
-            "[\"slack:T1:U1\",\"slack:T1:U1\"]",
+            "[\"slack:T1:U1\",\"teams:T1:U2\"]",
             "{\"slack:T1:U1\": 1}",
         ] {
             sqlx::query("UPDATE sessions SET files_requesters = ? WHERE id = ?")
@@ -856,12 +858,13 @@ mod tests {
             let stored = store.session(session.id).await.unwrap().unwrap();
             assert!(stored.files_requesters.is_empty(), "{bad}");
         }
+        let key = |user: &str| format!("slack:T1:{user}").parse::<MemberKey>().unwrap();
         assert_eq!(
-            parse_requesters("[\"slack:T1:U1\",\"slack:T1:U2\"]")
-                .unwrap()
-                .len(),
-            2
+            parse_requesters("[\"slack:T1:U2\",\"slack:T1:U1\",\"slack:T1:U2\"]"),
+            Some(vec![key("U1"), key("U2")]),
+            "order and duplicates don't matter"
         );
+        assert_eq!(parse_requesters("[]"), Some(Vec::new()));
     }
 
     #[tokio::test]
