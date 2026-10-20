@@ -3938,7 +3938,7 @@ left to clear.
 
 T21 recycles the session's container when the party changes, which ends
 every process a turn left running
-([T21](#another-requesters-turn-gets-a-new-container)), so a background
+([T21](#another-partys-turn-gets-a-new-container)), so a background
 process left from turn N spends only the credentials of its own party's
 later turns while they run (a requester's, or a configured group's). Only
 killing the processes a turn leaves behind when it ends removes that. Some
@@ -5106,7 +5106,7 @@ Every other volume mounts `shared/` read-write and no `memory/`. A turn
 whose mounts differ from the warm container's stops the container, like a
 credential kind or model change stops the process.
 
-### Another requester's turn gets a new container
+### Another party's turn gets a new container
 
 **Issue.** A warm container is reused across turns of one session, and a
 background process a turn leaves running, such as a `&` job or a Bash-tool
@@ -5164,7 +5164,7 @@ still use its own party's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Killing leftover processes at turn end")
 records both; the next note clears the session's files.
 
-### A requester change clears the session's files
+### A change of party clears the session's files
 
 **Issue.** Recycling ends processes, not the files a turn leaves in `home/`,
 `tmp/` and `claude/`, and `Held::requester` lives in memory only, so after an
@@ -5192,7 +5192,11 @@ turn's requester alone. A group member not yet in it, in a warm container or a
 new one, is added. Either write comes before any process gets the turn; if it
 fails, the container is stopped and the turn fails, since otherwise a later
 turn could skip the clear it needs. A crash between a clear and its record
-costs one extra clear.
+costs one extra clear. A clear that fails, as one that runs out of time
+against a process still writing does (T17's remover gives a clear a
+minute), fails the start and so the turn with a `Sandbox` error and leaves
+the record as it was; what it removed stays removed, and the next start
+clears again and goes on from there.
 
 The warm container's own requester (`Held::requester`) is still checked as
 well: the record says whose turns used the files, and the held requester whose
@@ -5215,7 +5219,8 @@ party, so the next turn of any of them clears what the others left. One
 requester alone wouldn't show that a second member had used the files.
 
 The record keeps a restart or an idle reap from skipping a clear for one
-agentd instance, which stops every container the old instance left at startup.
+agentd instance; a restart relies on agentd stopping the old instance's
+containers at startup.
 During a blue-green overlap the other instance's warm container of the same
 session, and anything left running in it, can still write to the session's
 files after this instance cleared them, until a turn on the other instance
