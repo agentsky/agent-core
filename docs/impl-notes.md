@@ -5995,7 +5995,8 @@ sets `SessionSpec::skills_dir` to `<data>/skills/<agent>` when that
 directory exists as the container starts. Sandboxes mount the agent's
 skills directory itself (the process backend links it), so a skill added,
 replaced or removed changes in running sandboxes at once: a removal's
-`remove_dir_all` takes the files away from a running conversation too.
+`sandbox::remove_tree` takes the files away from a running conversation
+too.
 What a running Claude Code has already loaded is up to it, so the replies
 say only that a conversation already running may not see the change until
 its process next starts, unlike a persona, which is read at start.

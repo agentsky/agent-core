@@ -831,10 +831,14 @@ impl Skills {
     /// use, whose name has no row in either state (the bundled skill
     /// aside). A row of either state keeps both directories of its name,
     /// so a move in progress between them is never taken for left over.
+    /// A directory that can't be removed, as one too big to remove in the
+    /// remover's time, is logged and left to the next purge, so it never
+    /// keeps agentd from starting; nothing writes to these directories
+    /// but agentd.
     ///
     /// # Errors
     ///
-    /// If the store or the disk fails.
+    /// If the store fails, or a directory can't be read.
     pub async fn purge(&self) -> Result<(), SkillError> {
         self.purge_older_than(STALE_AFTER).await
     }
@@ -881,13 +885,23 @@ impl Skills {
 }
 
 /// A work directory, removed on drop with [`sandbox::remove_tree`], since
-/// it holds a tree the owner's repository chose.
+/// it holds a tree the owner's repository chose: in a blocking task when
+/// dropped inside a runtime, as on a cancelled operation, so no runtime
+/// thread waits on the disk, or else at once. One the task doesn't get to
+/// is left to [`Skills::purge`].
 struct WorkDir(PathBuf);
 
 impl Drop for WorkDir {
     fn drop(&mut self) {
-        if let Err(err) = sandbox::remove_tree(&self.0) {
-            tracing::warn!(dir = %self.0.display(), error = %err, "couldn't remove a skill work directory");
+        let dir = std::mem::take(&mut self.0);
+        let remove = move || {
+            if let Err(err) = sandbox::remove_tree(&dir) {
+                tracing::warn!(dir = %dir.display(), error = %err, "couldn't remove a skill work directory");
+            }
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+            Err(_) => remove(),
         }
     }
 }
@@ -990,7 +1004,8 @@ async fn move_into(from: &Path, to: &Path, aside: &Path) -> Result<(), SkillErro
 /// Removes `dir` unless it changed within `age`, going by its status
 /// change time, which creating it, or adding or removing an entry in it,
 /// updates. A directory may hold a work directory's tree, which the
-/// owner's repository chose, so it goes with [`sandbox::remove_tree`].
+/// owner's repository chose, so it goes with [`sandbox::remove_tree`]; a
+/// failure to remove it is logged, not returned.
 async fn remove_stale(dir: &Path, age: Duration) -> Result<(), SkillError> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = match tokio::fs::symlink_metadata(dir).await {
@@ -1003,8 +1018,12 @@ async fn remove_stale(dir: &Path, age: Duration) -> Result<(), SkillError> {
     if OffsetDateTime::now_utc() - changed < age {
         return Ok(());
     }
-    remove_tree(dir, "removing a stale skill directory").await?;
-    tracing::info!(path = %dir.display(), "removed a skill directory no row records");
+    match remove_tree(dir, "removing a stale skill directory").await {
+        Ok(()) => tracing::info!(path = %dir.display(), "removed a skill directory no row records"),
+        Err(err) => {
+            tracing::warn!(path = %dir.display(), error = %err, "couldn't remove a skill directory no row records; the next purge tries again")
+        }
+    }
     Ok(())
 }
 
