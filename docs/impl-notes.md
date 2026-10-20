@@ -6431,7 +6431,7 @@ ran each turn. A change of credential kind or model shows as a new pid.
 A test with two linked members on one model shows a new pid for the
 second member's turn, with each turn's own bearer token upstream, since
 T21 recycles the container when the party changes
-([T21](#another-requesters-turn-gets-a-new-container)), and the same pid
+([T21](#another-partys-turn-gets-a-new-container)), and the same pid
 for that member's next turn.
 
 ### A broken link asks for a new login, never the community key
