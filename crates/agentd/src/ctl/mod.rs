@@ -266,11 +266,11 @@ impl Ctl {
     pub async fn purge(&self) -> Result<CtlPurged, HookError> {
         let purged = self.store().purge_ctl().await?;
         drop(std::mem::take(&mut *self.outboxes()));
-        match tokio::fs::remove_dir_all(&self.settings().staging_dir).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        }
+        let staging = self.settings().staging_dir.clone();
+        tokio::task::spawn_blocking(move || sandbox::remove_tree(&staging))
+            .await
+            .map_err(std::io::Error::other)?
+            .map_err(std::io::Error::other)?;
         Ok(purged)
     }
 
