@@ -182,9 +182,12 @@ pub struct SessionSpec {
     /// Extra container labels. Keys starting with `agentd.` are reserved.
     pub labels: BTreeMap<String, String>,
     /// Whether the files earlier turns left in the session's directories
-    /// are cleared before it starts: `home/` and `tmp/` are emptied, and
-    /// everything in `claude/` but the session's transcript is removed.
-    /// `work/`, `shared/` and `memory/` are left as they are.
+    /// are cleared before it starts: every entry of the session directory
+    /// but `work/`, `claude/`, `home/` and `tmp/` is removed, `home/` and
+    /// `tmp/` are emptied, and everything in `claude/` is removed but the
+    /// transcript, `projects/<id>/<id>.jsonl`, and its `projects/<id>/<id>/`
+    /// directory, which are kept whole. `work/`, `shared/` and `memory/`
+    /// are left as they are.
     pub clear_files: bool,
 }
 

@@ -2097,3 +2097,61 @@ async fn a_failed_record_of_a_member_joining_the_files_fails_the_turn_and_stops_
     assert_eq!(h.files_requesters(id).await, [key("U1")]);
     assert_eq!(h.transcript(&session), ["1"]);
 }
+
+#[tokio::test]
+async fn a_record_changed_under_a_warm_container_recycles_it() {
+    let h = Harness::new(&[
+        Turn::reply("a"),
+        Turn::reply("b"),
+        Turn::reply("c"),
+        Turn::reply("d"),
+    ])
+    .await;
+    let session = h.thread_session("1.1").await;
+    let id = session.id;
+    reply(&h.run(id, request_by("1", "U1")).await);
+    assert!(h.manager.is_warm(id));
+
+    let left = leave_files(&h, &session);
+    h.store
+        .set_session_files_requesters(id, &[key("U2")])
+        .await
+        .unwrap();
+    h.clear();
+    let report = h.run(id, request_by("2", "U1")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert!(h.events().contains(&Event::ContainerStopped(id)));
+    assert_eq!(h.sandbox.clears(), [true, true]);
+    assert!(none_exist(&left), "files another party used are cleared");
+    assert_eq!(h.files_requesters(id).await, [key("U1")]);
+
+    let left = leave_files(&h, &session);
+    let mut db = sqlx::SqliteConnection::connect(&h._dir.db_url())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE sessions SET files_requesters = NULL WHERE id = ?")
+        .bind(id.to_string())
+        .execute(&mut db)
+        .await
+        .unwrap();
+    h.clear();
+    let report = h.run(id, request_by("3", "U1")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert!(h.events().contains(&Event::ContainerStopped(id)));
+    assert_eq!(h.sandbox.clears(), [true, true, true]);
+    assert!(none_exist(&left), "files of unknown requesters are cleared");
+
+    h.store
+        .set_session_files_requesters(id, &[key("U2")])
+        .await
+        .unwrap();
+    h.clear();
+    let report = h.run(id, request_by("4", "U2")).await;
+    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert!(
+        h.events().contains(&Event::ContainerStopped(id)),
+        "a container U1's turns ran in never serves U2, whatever the record says"
+    );
+    assert_eq!(h.sandbox.clears(), [true, true, true, false]);
+    assert_eq!(h.transcript(&session), ["1", "2", "3", "4"]);
+}
