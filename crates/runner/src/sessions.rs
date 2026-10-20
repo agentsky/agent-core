@@ -159,7 +159,9 @@ struct Held<H: TurnHooks> {
     container: Container,
     mounts: Mounts,
     /// The surface identity of the requester whose turn started it. Only
-    /// their turns run in it: see `Inner::ensure_process`.
+    /// their turns, and those of the requesters in their group
+    /// ([`RequesterGroups`](crate::RequesterGroups)), run in it: see
+    /// `Inner::ensure_process`.
     requester: MemberKey,
     tracked: Arc<Tracked<H>>,
     process: Option<Running<H>>,
@@ -236,16 +238,28 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// runs once more, unless a call for that process has succeeded since, and if
 /// that fails too the runner logs it and gives up.
 ///
-/// A turn reuses the session's warm container when its requester and its
-/// mounts match, and the warm process in it when its credential kind and
-/// its model match too. Otherwise it stops the process (and the container,
-/// for another requester, other mounts or a failed `process_stopping`) and
-/// starts another, resuming from the transcript. Another requester's turn
-/// gets a new container because stopping it ends every process an earlier
-/// turn left running there, which could otherwise spend this turn's
-/// credential and act through agentctl while it runs. It ends running
-/// processes only: files an earlier turn left in the session's directories,
-/// which every container of the session mounts, stay. A process that
+/// A turn reuses the session's warm container when its requester is the
+/// same party ([`RequesterGroups::same_party`]) and its mounts match, and the
+/// warm process in it when its credential kind and its model match too.
+/// Otherwise it stops the process (and the container, for another party,
+/// other mounts or a failed `process_stopping`) and starts another, resuming
+/// from the transcript. Another party's turn gets a new container because
+/// stopping it ends every process an earlier turn left running there, which
+/// could otherwise spend this turn's credential and act through agentctl
+/// while it runs.
+///
+/// Stopping ends running processes only, so the files earlier turns left in
+/// the session's directories, which every container of the session mounts,
+/// are cleared too ([`SessionSpec::clear_files`]): a container started for a
+/// turn whose requester isn't the same party as the session's
+/// [`Session::files_requester`], or for a session that has none, starts with
+/// `home/` and `tmp/` emptied and everything in `claude/` but the transcript
+/// removed. The record is read from the store with the session's slot held,
+/// and written once the files are cleared, before any process starts, so an
+/// idle reap or a restart doesn't skip a clear. If writing it fails, the
+/// container is stopped and the turn fails with [`RunnerError::Store`].
+/// `work/`, `shared/` and the transcript carry over, as does everything
+/// between members of one group. A process that
 /// crashed, timed out or refused its `--resume` is stopped after the turn;
 /// if it wasn't seen to exit, its container is stopped too before the next
 /// process starts, so two processes never write one transcript. A container
@@ -293,6 +307,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// restart either.
 ///
 /// [`TurnStats::init_seen`]: crate::TurnStats::init_seen
+/// [`RequesterGroups::same_party`]: crate::RequesterGroups::same_party
 pub struct SessionManager<H: TurnHooks> {
     inner: Arc<Inner<H>>,
 }
@@ -708,16 +723,21 @@ impl<H: TurnHooks> Inner<H> {
     /// turn's credential kind and model. Returns how the process was
     /// started, if it was.
     ///
-    /// A container started for another requester goes, process and all,
-    /// as a dead one or one with other mounts does, so nothing an earlier
+    /// A container started for another party goes, process and all, as a
+    /// dead one or one with other mounts does, so nothing an earlier
     /// requester's turn left running sees this turn's credential or
     /// agentctl token. Requesters are compared by their surface identity,
-    /// `Requester::key`: a key names one member at most, and only ever the
-    /// same one, so a requester whose account was linked between two turns
-    /// keeps the container, and the credential kind that changes with it
-    /// restarts only the process. An agent-to-agent hop runs as the
-    /// requester it inherits, so it keeps a container started for that
-    /// requester.
+    /// `Requester::key`, and the configured groups: a key names one member
+    /// at most, and only ever the same one, so a requester whose account was
+    /// linked between two turns keeps the container, and the credential kind
+    /// that changes with it restarts only the process. An agent-to-agent hop
+    /// runs as the requester it inherits, so it keeps a container started
+    /// for that requester.
+    ///
+    /// A container it starts clears the session's files unless the
+    /// session's `files_requester` is the same party as the turn's
+    /// requester, and then records the turn's requester there before any
+    /// process starts. A failure to record it stops the container.
     ///
     /// The container's address is read after the container is tracked, so
     /// a death the sandbox reports from then on is seen, and one before then
@@ -743,7 +763,7 @@ impl<H: TurnHooks> Inner<H> {
         let kind = request.credential.kind();
         if let Some(held) = &warm.held {
             let dead = held.tracked.state().dead;
-            if dead || held.mounts != mounts || held.requester != request.requester.key {
+            if dead || held.mounts != mounts || !self.same_party(&held.requester, request) {
                 self.release_container(warm).await?;
             }
         }
@@ -760,10 +780,26 @@ impl<H: TurnHooks> Inner<H> {
         let held = match warm.held.take() {
             Some(held) => warm.held.insert(held),
             None => {
+                let requester = &request.requester.key;
+                let clear_files = !session
+                    .files_requester
+                    .as_ref()
+                    .is_some_and(|holder| self.same_party(holder, request));
                 let held = self
-                    .start_container(session, mounts, &request.requester.key, warm.slot.clone())
+                    .start_container(session, mounts, requester, clear_files, warm.slot.clone())
                     .await?;
-                warm.held.insert(held)
+                let held = warm.held.insert(held);
+                if clear_files
+                    && let Err(error) = self
+                        .store
+                        .set_session_files_requester(session.id, requester)
+                        .await
+                {
+                    tracing::warn!(session = %session.id, %error, "recording whose files the session holds failed; stopping the container");
+                    self.release_container(warm).await.ok();
+                    return Err(error.into());
+                }
+                held
             }
         };
         if held.process.is_some() {
@@ -827,14 +863,25 @@ impl<H: TurnHooks> Inner<H> {
         }
     }
 
+    /// Whether `held`, a requester's surface identity, is the same party as
+    /// `request`'s requester.
+    fn same_party(&self, held: &MemberKey, request: &TurnRequest) -> bool {
+        self.config
+            .pool
+            .requester_groups
+            .same_party(held, &request.requester.key)
+    }
+
     /// Starts a container for `session` and the turns of the requester
     /// whose surface identity is `requester`, once both caps have room, and
-    /// tracks it.
+    /// tracks it. With `clear_files`, the session's files are cleared
+    /// first ([`SessionSpec::clear_files`]).
     async fn start_container(
         &self,
         session: &Session,
         mounts: Mounts,
         requester: &MemberKey,
+        clear_files: bool,
         slot: Weak<AsyncMutex<Warm<H>>>,
     ) -> Result<Held<H>> {
         let volume_key = session.volume();
@@ -850,6 +897,7 @@ impl<H: TurnHooks> Inner<H> {
         );
         spec.shared = mounts.shared;
         spec.memory = mounts.memory;
+        spec.clear_files = clear_files;
         let container = self.sandbox.start(&spec).await?;
         let tracked = Arc::new(Tracked {
             container: container.id().clone(),
@@ -864,7 +912,7 @@ impl<H: TurnHooks> Inner<H> {
             }),
         });
         lock(&self.containers).insert(container.id().clone(), Arc::clone(&tracked));
-        tracing::info!(session = %session.id, container = %container.id(), "started a session container");
+        tracing::info!(session = %session.id, container = %container.id(), clear_files, "started a session container");
         Ok(Held {
             container,
             mounts,
@@ -1206,6 +1254,7 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             last_turn_at: None,
             reset_at: None,
+            files_requester: None,
         }
     }
 

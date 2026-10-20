@@ -181,11 +181,16 @@ pub struct SessionSpec {
     pub memory: bool,
     /// Extra container labels. Keys starting with `agentd.` are reserved.
     pub labels: BTreeMap<String, String>,
+    /// Whether the files earlier turns left in the session's directories
+    /// are cleared before it starts: `home/` and `tmp/` are emptied, and
+    /// everything in `claude/` but the session's transcript is removed.
+    /// `work/`, `shared/` and `memory/` are left as they are.
+    pub clear_files: bool,
 }
 
 impl SessionSpec {
     /// A spec with the least access: `shared/` read-only, no `memory/`, no
-    /// skills, no extra environment or labels.
+    /// skills, no extra environment or labels. Files are not cleared.
     pub fn new(
         session: SessionId,
         volume: VolumeRef,
@@ -202,6 +207,7 @@ impl SessionSpec {
             shared: SharedAccess::ReadOnly,
             memory: false,
             labels: BTreeMap::new(),
+            clear_files: false,
         }
     }
 }
