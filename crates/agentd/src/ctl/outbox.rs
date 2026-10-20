@@ -150,13 +150,12 @@ impl Drop for Outbox {
     }
 }
 
-/// Removes `dir` and everything in it, logging a failure other than its
-/// absence.
+/// Removes `dir` and everything in it with [`sandbox::remove_tree`], which
+/// copes with a tree an agent made read-only, unreadable or very deep,
+/// logging a failure other than its absence.
 pub(crate) fn remove_dir(dir: &Path) {
-    match fs::remove_dir_all(dir) {
-        Ok(()) => {}
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-        Err(err) => tracing::warn!(error = %err, "removing an agentctl staging directory failed"),
+    if let Err(err) = sandbox::remove_tree(dir) {
+        tracing::warn!(error = %err, "removing an agentctl staging directory failed");
     }
 }
 
