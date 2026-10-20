@@ -3898,11 +3898,12 @@ left to clear.
 T21 recycles the session's container when the requester changes, which
 ends every process a turn left running
 ([T21](#another-requesters-turn-gets-a-new-container)), so a background
-process left from turn N spends only the credentials of its own
-requester's later turns while they run. Only killing the processes a turn
-leaves behind when it ends removes that. Some files outlive the container,
-though. T21 clears `home/`, `tmp/` and `claude/`, keeping only the transcript,
-on a requester change, but what a turn leaves in the session's `work/`, in
+process left from turn N spends only the credentials of its own party's
+later turns while they run (a requester's, or a configured group's). Only
+killing the processes a turn leaves behind when it ends removes that. Some
+files outlive the container, though. T21 clears `home/`, `tmp/` and
+`claude/`, keeping only the transcript file and its directory, when the
+party changes, but what a turn leaves in the session's `work/`, in
 `shared/`, or in the transcript can run or instruct code in a later
 requester's process, which then spends that requester's credential.
 The plan's Deferred work has an entry for both.
@@ -5095,10 +5096,12 @@ kind, and the fit check restarts the process in the kept container for it.
 The cost is a container start and a `--resume` of the transcript whenever
 consecutive turns of one session come from different requesters, as in a
 busy channel thread; a requester's own run of turns keeps the warm process.
-Only one requester's turns now share a warm process, so the case the T20
-note on `total_cost_usd` gives, of other members' turns on a shared warm
-process ([T20](#total_cost_usd-is-the-processs-running-total)), no longer
-arises. `a_requester_change_replaces_the_container` checks that another
+Only one party's turns share a warm process: one requester's, or those of a
+configured group (see the next notes). Members of a group on one warm process
+are still each billed their own turn, since T20 bills a turn the rise in the
+process's running total, not the total
+([T20](#total_cost_usd-is-the-processs-running-total)).
+`a_requester_change_replaces_the_container` checks that another
 requester's turn, a community-key one included, replaces the container, and
 that the same requester and a hop carrying it keep it;
 `a_requester_linked_between_turns_keeps_the_container` that a key gaining a
@@ -5114,7 +5117,7 @@ goes with the container. So a turn can leave a file that runs or instructs code
 in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
 a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 `work/` or `shared/`, or text in the transcript. A leftover process can also
-still use its own requester's later turns, and the egress allowlist between
+still use its own party's later turns, and the egress allowlist between
 turns. The plan's Deferred work ("Killing leftover processes at turn end")
 records both; the next note clears `home/`, `tmp/` and `claude/`.
 
@@ -5128,21 +5131,31 @@ session's container and files.
 
 **Solution.** `sessions.files_requesters` (a migration of its own) records
 the requesters whose turns have used the session's files since they were last
-cleared: a JSON array of `MemberKey` strings, sorted and without duplicates.
-It is parsed strictly, and a value that doesn't parse counts as unknown, as
-NULL does for a new session or a row from before the column. `ensure_process`
-reads it with the session, from the store with the slot held. Unless every
-recorded requester is the same party as the turn's, and there is at least
-one, the warm container goes and the new one starts with
-`SessionSpec::clear_files`: `prepare_session_dirs` empties `home/` and `tmp/`
-and removes everything in `claude/` but `projects/<id>/<id>.jsonl` and
-`projects/<id>/<id>/`, through the same handles as its repair, before
-`settings.json` and `skills` are put back. The record then becomes the turn's
-requester alone. A group member not yet in it, in a warm container or a new
-one, is added. Either write comes before any process gets the turn; if it
+cleared: a JSON array of `MemberKey` strings, written sorted and without
+duplicates. A value that doesn't parse counts as unknown, as NULL does for a
+new session or a row from before the column, and is logged with the session's
+id when it is read. `ensure_process` reads it with the session, from the store
+with the slot held. Unless every recorded requester is the same party as the
+turn's, and there is at least one, the warm container goes and the new one
+starts with `SessionSpec::clear_files`: `prepare_session_dirs` removes every
+entry of the session directory but its four subdirectories, empties `home/`
+and `tmp/` and removes everything in `claude/` but `projects/<id>/<id>.jsonl`
+and `projects/<id>/<id>/`, before `settings.json` and `skills` are put back.
+It uses the same handles as its repair and `remove_tree_at` (T17's remover),
+so a tree the agent made unreadable or read-only, or very deep, goes too. The
+transcript file and its directory are kept whole, so anything the agent put
+there carries over as the transcript's text does. The record then becomes the
+turn's requester alone. A group member not yet in it, in a warm container or a
+new one, is added. Either write comes before any process gets the turn; if it
 fails, the container is stopped and the turn fails, since otherwise a later
 turn could skip the clear it needs. A crash between a clear and its record
 costs one extra clear.
+
+The warm container's own requester (`Held::requester`) is still checked as
+well: the record says whose turns used the files, and the held requester whose
+processes may still run in the container. They agree while one agentd instance
+writes the record, but not when another rewrites it, as below, and then only
+the held requester keeps another party out of the container.
 
 `PoolConfig::requester_groups` lists groups of `MemberKey`s. Validation
 refuses a group of fewer than two and a member listed twice, so `same_party`
@@ -5154,8 +5167,16 @@ cleared for, because the groups are configuration: once a group is removed,
 or a member taken out of one, its former members are no longer the same
 party, so the next turn of any of them clears what the others left. One
 requester alone wouldn't show that a second member had used the files.
+
+The record keeps a restart or an idle reap from skipping a clear for one
+agentd instance, which stops every container the old instance left at startup.
+During a blue-green overlap the other instance's warm container of the same
+session, and anything left running in it, can still write to the session's
+files after this instance cleared them, so a clear holds only once one
+instance serves the session.
 `another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restart`,
-`a_trusted_group_shares_the_warm_container_and_the_files` and the
+`a_trusted_group_shares_the_warm_container_and_the_files`,
+`a_record_changed_under_a_warm_container_recycles_it` and the
 `removing_the_group_clears_*` tests check this.
 
 ### `ProcessSandbox` gives every container one address

@@ -42,15 +42,16 @@
 //!
 //! A start whose spec sets [`clear_files`](crate::SessionSpec::clear_files)
 //! also clears what earlier turns left, before `settings.json` and
-//! `claude/skills` are put back: everything in `home/` and `tmp/`, and
+//! `claude/skills` are put back: every entry of the session directory but
+//! its four subdirectories, everything in `home/` and `tmp/`, and
 //! everything in `claude/` but the session's transcript,
 //! `projects/<session id>/<session id>.jsonl`, and the
 //! `projects/<session id>/<session id>/` directory of its subagents'
-//! transcripts and tool results. The same handles are used: each directory
-//! is listed and each entry looked up relative to its parent's handle, a
-//! directory is removed with its contents through
-//! `/proc/self/fd/<handle>`, anything else is unlinked, and a transcript
-//! entry that is a symlink or of the wrong type is removed, not kept.
+//! transcripts and tool results, which are kept whole. The same handles
+//! are used: each directory is listed and each entry looked up relative to
+//! its parent's handle, every entry that goes is removed with
+//! `remove_tree_at`, and a transcript entry that is a symlink or of the
+//! wrong type is removed, not kept. `work/` is not cleared.
 //!
 //! The repair runs only in [`Sandbox::start`](crate::Sandbox::start),
 //! before the session's container exists, so nothing in the sandbox races
@@ -174,6 +175,11 @@ impl Layout {
             create_dir(&dir, None)?;
             let session_dir = open_dir(&dir)?;
             set_mode(&session_dir)?;
+            if clear_files {
+                clear_dir(&session_dir, |name, kind| {
+                    kind == FileType::Directory && SESSION_SUBDIRS.iter().any(|sub| name == *sub)
+                })?;
+            }
             for sub in SESSION_SUBDIRS.into_iter().filter(|sub| *sub != CLAUDE_DIR) {
                 let handle = this.repair_dir_at(&session_dir, sub)?;
                 if clear_files && CLEARED_SUBDIRS.contains(&sub) {
@@ -182,7 +188,7 @@ impl Layout {
             }
             let claude = this.repair_dir_at(&session_dir, CLAUDE_DIR)?;
             if clear_files {
-                clear_claude_dir(&claude, session)?;
+                this.clear_claude_dir(&claude, session)?;
             }
             this.write_settings(&claude)?;
             this.place_skills(&claude, &skills)?;
@@ -289,6 +295,31 @@ impl Layout {
         Ok(())
     }
 
+    /// Clears the `claude/` directory `claude` down to `session`'s
+    /// transcript: `projects/<session>/<session>.jsonl`, a regular file,
+    /// and the `projects/<session>/<session>/` directory, both kept whole.
+    /// Everything else goes, `settings.json` and `skills` included, which
+    /// are put back after. `projects/` and `projects/<session>/` are
+    /// repaired like the session's own directories, and created if
+    /// missing.
+    fn clear_claude_dir(&self, claude: &File, session: SessionId) -> Result<()> {
+        let id = session.to_string();
+        let transcript = format!("{id}.jsonl");
+        clear_dir(claude, |name, kind| {
+            name == PROJECTS_DIR && kind == FileType::Directory
+        })?;
+        let projects = self.repair_dir_at(claude, PROJECTS_DIR)?;
+        clear_dir(&projects, |name, kind| {
+            name == id.as_str() && kind == FileType::Directory
+        })?;
+        let project = self.repair_dir_at(&projects, &id)?;
+        clear_dir(&project, |name, kind| match kind {
+            FileType::RegularFile => name == transcript.as_str(),
+            FileType::Directory => name == id.as_str(),
+            _ => false,
+        })
+    }
+
     /// Gives the directory `dir` to the sandbox user, when its owner
     /// differs, and sets its mode to `0755`.
     fn claim(&self, dir: &File) -> Result<()> {
@@ -315,64 +346,15 @@ pub(crate) fn settings_json(cleanup_period_days: u32) -> String {
 }
 
 /// Removes every entry of the directory `dir` that `keep` doesn't keep,
-/// given its name and type, relative to `dir` and following no symlink: a
-/// directory goes with its contents, through `/proc/self/fd/<handle>`,
-/// anything else is unlinked.
+/// given its name and type, with [`remove_tree_at`].
 fn clear_dir(dir: &File, keep: impl Fn(&OsStr, FileType) -> bool) -> Result<()> {
-    let what = "clearing a session directory";
-    for entry in fs::read_dir(handle_path(dir)).map_err(io_err(what))? {
-        let name = entry.map_err(io_err(what))?.file_name();
-        let kind = match rustix::fs::statat(dir, &name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => FileType::from_raw_mode(stat.st_mode),
-            Err(Errno::NOENT) => continue,
-            Err(err) => return Err(errno(what)(err)),
-        };
-        if keep(&name, kind) {
-            continue;
-        }
-        if kind == FileType::Directory {
-            fs::remove_dir_all(handle_path(dir).join(&name)).map_err(io_err(what))?;
-        } else {
-            rustix::fs::unlinkat(dir, &name, AtFlags::empty()).map_err(errno(what))?;
+    for name in list_dir(dir)? {
+        match kind_at(dir, &name)? {
+            Some(kind) if !keep(&name, kind) => remove_tree_at(dir, &name)?,
+            _ => {}
         }
     }
     Ok(())
-}
-
-/// Clears the `claude/` directory `claude` down to `session`'s transcript:
-/// `projects/<session>/<session>.jsonl`, a regular file, and the
-/// `projects/<session>/<session>/` directory. Everything else goes,
-/// `settings.json` and `skills` included, which are put back after.
-fn clear_claude_dir(claude: &File, session: SessionId) -> Result<()> {
-    let id = session.to_string();
-    let transcript = format!("{id}.jsonl");
-    clear_dir(claude, |name, kind| {
-        name == PROJECTS_DIR && kind == FileType::Directory
-    })?;
-    let Some(projects) = open_kept_dir(claude, PROJECTS_DIR)? else {
-        return Ok(());
-    };
-    clear_dir(&projects, |name, kind| {
-        name == id.as_str() && kind == FileType::Directory
-    })?;
-    let Some(project) = open_kept_dir(&projects, &id)? else {
-        return Ok(());
-    };
-    clear_dir(&project, |name, kind| match kind {
-        FileType::RegularFile => name == transcript.as_str(),
-        FileType::Directory => name == id.as_str(),
-        _ => false,
-    })
-}
-
-/// [`open_dir_at`] for a directory [`clear_dir`] kept, or `None` if there
-/// was none.
-fn open_kept_dir(parent: &File, name: &str) -> Result<Option<File>> {
-    match rustix::fs::openat(parent, name, DIR_HANDLE, Mode::empty()) {
-        Ok(fd) => Ok(Some(File::from(fd))),
-        Err(Errno::NOENT) => Ok(None),
-        Err(err) => Err(errno("opening a session directory")(err)),
-    }
 }
 
 /// Creates the directory `path` if it's missing. An existing entry must be
@@ -1034,6 +1016,103 @@ mod fs_tests {
     }
 
     #[tokio::test]
+    async fn clearing_removes_stray_entries_fifos_and_a_file_named_projects() {
+        let dir = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        write(&session_dir.join("CLAUDE.md"), "evil");
+        write(&session_dir.join("payload/run.sh"), "evil");
+        let fifo = |dir: &Path, name: &str| {
+            rustix::fs::mknodat(
+                open_dir(dir).unwrap(),
+                name,
+                FileType::Fifo,
+                Mode::RUSR | Mode::WUSR,
+                0,
+            )
+            .unwrap();
+        };
+        fifo(&session_dir, "pipe");
+        fifo(&session_dir.join("home"), "pipe");
+        fifo(&session_dir.join("tmp"), "pipe");
+        fs::remove_dir_all(session_dir.join("claude/projects")).ok();
+        write(&session_dir.join("claude/projects"), "not a directory");
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert_eq!(names(&session_dir), ["claude", "home", "tmp", "work"]);
+        assert!(names(&session_dir.join("home")).is_empty());
+        assert!(names(&session_dir.join("tmp")).is_empty());
+        assert_eq!(
+            names(&session_dir.join("claude")),
+            ["projects", "settings.json"]
+        );
+        assert_eq!(
+            names(&session_dir.join("claude/projects")),
+            [session.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_removes_unreadable_and_read_only_directories_without_root() {
+        let dir = TempDir::new("sandbox-test");
+        if fs::metadata(dir.path()).unwrap().uid() == 0 {
+            return;
+        }
+        let outside = TempDir::new("sandbox-test");
+        fs::write(outside.join("victim"), "keep").unwrap();
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        leave_files(&session_dir, session);
+        for sub in ["home", "tmp", "claude"] {
+            locked_tree(&session_dir.join(sub).join("go"), outside.path());
+        }
+        let projects = session_dir.join("claude/projects");
+        locked_tree(&projects.join("other"), outside.path());
+        fs::set_permissions(&projects, Permissions::from_mode(0o000)).unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert!(names(&session_dir.join("home")).is_empty());
+        assert!(names(&session_dir.join("tmp")).is_empty());
+        assert_eq!(
+            names(&session_dir.join("claude")),
+            ["projects", "settings.json"]
+        );
+        assert_eq!(names(&projects), [session.to_string()]);
+        let project = projects.join(session.to_string());
+        assert_eq!(
+            names(&project),
+            [session.to_string(), format!("{session}.jsonl")]
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(format!("{session}.jsonl"))).unwrap(),
+            "transcript"
+        );
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+    }
+
+    #[tokio::test]
     async fn clearing_removes_symlinks_planted_as_the_transcript_without_following_them() {
         let dir = TempDir::new("sandbox-test");
         let outside = TempDir::new("sandbox-test");
@@ -1070,9 +1149,13 @@ mod fs_tests {
             .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
             .await
             .unwrap();
-        assert_eq!(names(&session_dir.join("claude")), ["settings.json"]);
+        assert!(
+            fs::symlink_metadata(session_dir.join("claude/projects"))
+                .unwrap()
+                .is_dir()
+        );
+        assert!(names(&project).is_empty());
 
-        fs::create_dir_all(&project).unwrap();
         fs::create_dir(project.join(format!("{session}.jsonl"))).unwrap();
         fs::write(project.join(session.to_string()), "not a dir").unwrap();
         layout
@@ -1188,7 +1271,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let settings = session_dir.join("claude/settings.json");
@@ -1200,6 +1283,7 @@ mod fs_tests {
                 &volume,
                 session,
                 SkillsEntry::Link(Some(skills.path().to_owned())),
+                false,
             )
             .await
             .unwrap();
@@ -1227,7 +1311,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let skills = session_dir.join("claude/skills");
@@ -1239,6 +1323,7 @@ mod fs_tests {
                 &volume,
                 session,
                 SkillsEntry::Link(Some(target.path().to_owned())),
+                false,
             )
             .await
             .unwrap();
@@ -1261,7 +1346,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let settings = session_dir.join("claude/settings.json");
@@ -1274,7 +1359,7 @@ mod fs_tests {
         }
         drop(level);
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert!(fs::symlink_metadata(&settings).unwrap().is_file());
