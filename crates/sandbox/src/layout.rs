@@ -28,9 +28,17 @@
 //! written. A handle is opened with `O_PATH`, which needs no permission on
 //! the directory itself, so a directory the agent made mode `0` can still
 //! be repaired. Linux has no `fchmod` for an `O_PATH` handle, so modes,
-//! owners and recursive removals go through `/proc/self/fd/<handle>`,
+//! owners and directory listings go through `/proc/self/fd/<handle>`,
 //! which names the handle's directory and not whatever its path names
 //! now.
+//!
+//! A directory tree the agent left where something else belongs is
+//! removed by `remove_tree_at`, not `std::fs::remove_dir_all`: agentd
+//! runs as the sandbox user, without root's override of file modes, so a
+//! directory the agent made `0` or `0555` (as Go's module cache is) must
+//! get its owner's `rwx` back before it can be listed or emptied, and a
+//! tree tens of thousands of levels deep must not take a stack frame and a
+//! file descriptor per level.
 //!
 //! A start whose spec sets [`clear_files`](crate::SessionSpec::clear_files)
 //! also clears what earlier turns left, before `settings.json` and
@@ -48,7 +56,7 @@
 //! before the session's container exists, so nothing in the sandbox races
 //! it; the handles make it not rely on that.
 
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::AsRawFd;
@@ -221,18 +229,12 @@ impl Layout {
 
     /// Writes `settings.json` into the `claude/` directory `dir` through a
     /// new file renamed over the old one, so a symlink the agent left there
-    /// is replaced, not followed. A directory in its place is renamed aside
-    /// and removed. Every step is relative to `dir`, so nothing is written
-    /// outside it.
+    /// is replaced, not followed. A directory in its place is removed. Every
+    /// step is relative to `dir`, so nothing is written outside it.
     fn write_settings(&self, dir: &File) -> Result<()> {
         const TARGET: &str = "settings.json";
-        let is_dir = rustix::fs::statat(dir, TARGET, AtFlags::SYMLINK_NOFOLLOW)
-            .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Directory);
-        if is_dir {
-            let aside = format!(".settings.json.{}.old", uuid::Uuid::new_v4());
-            rustix::fs::renameat(dir, TARGET, dir, &aside)
-                .map_err(errno("replacing settings.json"))?;
-            let _ = fs::remove_dir_all(handle_path(dir).join(&aside));
+        if kind_at(dir, TARGET)? == Some(FileType::Directory) {
+            remove_tree_at(dir, OsStr::new(TARGET))?;
         }
         let body = settings_json(self.cleanup_period_days);
         let temp = format!(".settings.json.{}", uuid::Uuid::new_v4());
@@ -270,7 +272,7 @@ impl Layout {
             .map(|stat| FileType::from_raw_mode(stat.st_mode))
         {
             Ok(FileType::Directory) if target.is_some() => {
-                fs::remove_dir_all(handle_path(dir).join(SKILLS_DIR)).map_err(io_err(what))?;
+                remove_tree_at(dir, OsStr::new(SKILLS_DIR))?;
             }
             Ok(kind)
                 if kind == FileType::Symlink
@@ -403,7 +405,7 @@ fn open_dir(path: &Path) -> Result<File> {
 }
 
 /// [`open_dir`] for `name` in `parent`.
-fn open_dir_at(parent: &File, name: &str) -> Result<File> {
+fn open_dir_at<P: rustix::path::Arg>(parent: &File, name: P) -> Result<File> {
     rustix::fs::openat(parent, name, DIR_HANDLE, Mode::empty())
         .map(File::from)
         .map_err(errno("opening a session directory"))
@@ -415,6 +417,93 @@ const DIR_HANDLE: OFlags = OFlags::PATH
     .union(OFlags::DIRECTORY)
     .union(OFlags::NOFOLLOW)
     .union(OFlags::CLOEXEC);
+
+/// The type of `name` in `parent`, not following a symlink, or `None` if
+/// there is no such entry.
+fn kind_at<P: rustix::path::Arg>(parent: &File, name: P) -> Result<Option<FileType>> {
+    match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
+        Err(Errno::NOENT) => Ok(None),
+        Err(err) => Err(errno("inspecting a session directory")(err)),
+    }
+}
+
+/// Removes `name` in `parent`: a directory with everything in it, or any
+/// other entry, a symlink included, by unlinking it. No symlink is
+/// followed: every entry is looked up with `AT_SYMLINK_NOFOLLOW` and
+/// opened with `O_NOFOLLOW` relative to its parent's handle.
+///
+/// Each directory gets mode `0700` through its handle before it is listed,
+/// emptied or moved, so a tree the agent made unreadable or read-only
+/// goes as long as agentd owns it. It works without recursion and with at
+/// most a handful of files open, however deep the tree: each directory
+/// directly under the one being removed is emptied of its files, and its
+/// own subdirectories are moved up under fresh names into the directory
+/// being removed, which is listed again until it is empty.
+fn remove_tree_at(parent: &File, name: &OsStr) -> Result<()> {
+    let what = "removing a directory tree";
+    match kind_at(parent, name)? {
+        None => return Ok(()),
+        Some(FileType::Directory) => {}
+        Some(_) => {
+            return rustix::fs::unlinkat(parent, name, AtFlags::empty()).map_err(errno(what));
+        }
+    }
+    let top = open_for_removal(parent, name)?;
+    loop {
+        let entries = list_dir(&top)?;
+        if entries.is_empty() {
+            break;
+        }
+        for entry in entries {
+            match kind_at(&top, &entry)? {
+                None => continue,
+                Some(FileType::Directory) => {}
+                Some(_) => {
+                    rustix::fs::unlinkat(&top, &entry, AtFlags::empty()).map_err(errno(what))?;
+                    continue;
+                }
+            }
+            let sub = open_for_removal(&top, &entry)?;
+            for child in list_dir(&sub)? {
+                match kind_at(&sub, &child)? {
+                    None => {}
+                    Some(FileType::Directory) => {
+                        drop(open_for_removal(&sub, &child)?);
+                        let moved = format!(".removing-{}", uuid::Uuid::new_v4());
+                        rustix::fs::renameat(&sub, &child, &top, &moved).map_err(errno(what))?;
+                    }
+                    Some(_) => {
+                        rustix::fs::unlinkat(&sub, &child, AtFlags::empty())
+                            .map_err(errno(what))?;
+                    }
+                }
+            }
+            drop(sub);
+            rustix::fs::unlinkat(&top, &entry, AtFlags::REMOVEDIR).map_err(errno(what))?;
+        }
+    }
+    drop(top);
+    rustix::fs::unlinkat(parent, name, AtFlags::REMOVEDIR).map_err(errno(what))
+}
+
+/// Opens the directory `name` in `parent` as a handle and gives its owner
+/// `rwx` on it, mode `0700`, so it can be listed, emptied and moved.
+fn open_for_removal(parent: &File, name: &OsStr) -> Result<File> {
+    let dir = open_dir_at(parent, name)?;
+    fs::set_permissions(handle_path(&dir), Permissions::from_mode(0o700))
+        .map_err(io_err("making a directory removable"))?;
+    Ok(dir)
+}
+
+/// The names in the directory `dir`, read through its handle.
+fn list_dir(dir: &File) -> Result<Vec<OsString>> {
+    let what = "listing a directory";
+    fs::read_dir(handle_path(dir))
+        .map_err(io_err(what))?
+        .map(|entry| entry.map(|entry| entry.file_name()).map_err(io_err(what)))
+        .collect()
+}
 
 fn mkdir_at(parent: &File, name: &str) -> Result<()> {
     rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(DIR_MODE))
@@ -1046,6 +1135,149 @@ mod fs_tests {
         }
         assert_eq!(owned(volume.path()), (me.uid(), me.gid()));
         assert_eq!(owned(&session_dir), (me.uid(), me.gid()));
+    }
+
+    /// Builds at `root` what an agent or a build can leave: `0555`
+    /// directories holding `0444` files (as Go's module cache is), a mode
+    /// `0` directory, a `0500` one, and a symlink to `outside`.
+    fn locked_tree(root: &Path, outside: &Path) {
+        let chmod = |path: &Path, mode: u32| {
+            fs::set_permissions(root.join(path), Permissions::from_mode(mode)).unwrap();
+        };
+        fs::create_dir_all(root.join("mod/pkg@v1/sub")).unwrap();
+        fs::create_dir_all(root.join("zero/inner")).unwrap();
+        fs::create_dir_all(root.join("r500/inner")).unwrap();
+        for file in [
+            "mod/pkg@v1/go.mod",
+            "mod/pkg@v1/sub/a.go",
+            "zero/inner/f",
+            "r500/f",
+        ] {
+            fs::write(root.join(file), "x").unwrap();
+            chmod(Path::new(file), 0o444);
+        }
+        symlink(outside, root.join("mod/link")).unwrap();
+        for (path, mode) in [
+            ("mod/pkg@v1/sub", 0o555),
+            ("mod/pkg@v1", 0o555),
+            ("mod", 0o555),
+            ("zero/inner", 0),
+            ("zero", 0),
+            ("r500/inner", 0o500),
+            ("r500", 0o500),
+            ("", 0o555),
+        ] {
+            chmod(Path::new(path), mode);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_and_unreadable_trees_are_removed_without_root() {
+        let dir = TempDir::new("sandbox-test");
+        if fs::metadata(dir.path()).unwrap().uid() == 0 {
+            return;
+        }
+        let outside = TempDir::new("sandbox-test");
+        fs::write(outside.join("victim"), "keep").unwrap();
+        let skills = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
+        let settings = session_dir.join("claude/settings.json");
+        fs::remove_file(&settings).unwrap();
+        locked_tree(&settings, outside.path());
+        locked_tree(&session_dir.join("claude/skills"), outside.path());
+        layout
+            .prepare_session_dirs(
+                &volume,
+                session,
+                SkillsEntry::Link(Some(skills.path().to_owned())),
+            )
+            .await
+            .unwrap();
+        assert!(fs::symlink_metadata(&settings).unwrap().is_file());
+        assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
+        assert_eq!(
+            fs::read_link(session_dir.join("claude/skills")).unwrap(),
+            skills.path()
+        );
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn a_symlink_inside_a_removed_tree_is_unlinked_not_followed() {
+        let dir = TempDir::new("sandbox-test");
+        let outside = TempDir::new("sandbox-test");
+        fs::create_dir(outside.join("inside")).unwrap();
+        fs::write(outside.join("inside/victim"), "keep").unwrap();
+        let target = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
+        let skills = session_dir.join("claude/skills");
+        fs::create_dir_all(skills.join("a/b")).unwrap();
+        symlink(outside.path(), skills.join("a/b/out")).unwrap();
+        symlink(outside.join("inside"), skills.join("out")).unwrap();
+        layout
+            .prepare_session_dirs(
+                &volume,
+                session,
+                SkillsEntry::Link(Some(target.path().to_owned())),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fs::read_link(&skills).unwrap(), target.path());
+        assert_eq!(
+            fs::read_to_string(outside.join("inside/victim")).unwrap(),
+            "keep"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tree_deeper_than_the_stack_allows_recursion_is_removed() {
+        const DEPTH: usize = 16_000;
+        let dir = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
+        let settings = session_dir.join("claude/settings.json");
+        fs::remove_file(&settings).unwrap();
+        fs::create_dir(&settings).unwrap();
+        let mut level = open_dir(&settings).unwrap();
+        for _ in 0..DEPTH {
+            mkdir_at(&level, "d").unwrap();
+            level = open_dir_at(&level, "d").unwrap();
+        }
+        drop(level);
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .await
+            .unwrap();
+        assert!(fs::symlink_metadata(&settings).unwrap().is_file());
     }
 
     #[tokio::test]
