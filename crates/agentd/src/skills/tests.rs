@@ -185,10 +185,21 @@ impl Harness {
             .collect()
     }
 
-    fn work_is_empty(&self) -> bool {
-        std::fs::read_dir(self.data.join(WORK_DIR))
-            .map(|mut entries| entries.next().is_none())
-            .unwrap_or(true)
+    /// Whether the work directory is empty within ten seconds, since a
+    /// work directory goes in a blocking task once its guard drops.
+    async fn work_is_empty(&self) -> bool {
+        let empty = || {
+            std::fs::read_dir(self.data.join(WORK_DIR))
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(true)
+        };
+        for _ in 0..400 {
+            if empty() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        empty()
     }
 }
 
@@ -222,7 +233,7 @@ async fn a_skill_is_added_from_a_local_git_fixture_repo() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].source, "https://git.test/pdf.git");
     assert_eq!(rows[0].state, SkillState::Active);
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[tokio::test]
@@ -252,7 +263,7 @@ async fn a_ref_picks_the_branch_and_a_missing_repo_or_ref_fails() {
             "{source}"
         );
     }
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[tokio::test]
@@ -308,7 +319,7 @@ async fn skills_are_added_from_an_uploaded_file_or_zip() {
         h.upload("x.zip", "not a zip").await,
         Err(Refused::Problem(Problem::Archive))
     );
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[tokio::test]
@@ -673,14 +684,14 @@ async fn trees_deeper_than_recursion_allows_leave_no_work_behind() {
     deep_tree(&work.0.join("left"), DEPTH);
     drop(work);
     assert!(
-        h.work_is_empty(),
+        h.work_is_empty().await,
         "a work directory goes when its guard drops"
     );
 
     deep_tree(&h.data.join(WORK_DIR).join("left-over"), DEPTH);
     h.skills.purge_older_than(Duration::ZERO).await.unwrap();
     assert!(
-        h.work_is_empty(),
+        h.work_is_empty().await,
         "the purge removes a stale work directory"
     );
 }
@@ -708,7 +719,7 @@ async fn replacing_a_skill_takes_its_hosts_away_even_if_its_files_cant_move() {
             .is_err()
     );
     assert!(h.hosts().await.is_empty());
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[tokio::test]
@@ -769,7 +780,7 @@ async fn a_stale_confirmation_restores_the_active_skill_and_its_row() {
     );
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
     assert!(h.hosts().await.is_empty());
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
     assert!(h.pending("gh").join("SKILL.md").is_file());
     assert!(matches!(
         h.skills.confirm(h.agent, "gh").await.unwrap(),
@@ -796,7 +807,7 @@ async fn a_stale_confirmation_without_an_active_skill_puts_the_files_back() {
     assert!(!h.live("gh").exists());
     assert!(h.pending("gh").join("SKILL.md").is_file());
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
     assert!(matches!(
         h.skills.confirm(h.agent, "gh").await.unwrap(),
         Confirmed::Active(_)
@@ -833,7 +844,7 @@ async fn a_confirmation_the_store_fails_puts_back_the_files_and_the_old_skill() 
     );
     assert_eq!(h.store.agent_skills(h.agent).await.unwrap(), rows);
     assert_eq!(h.hosts().await, ["a.example"]);
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 
     sqlx::query("DROP TRIGGER confirming_fails")
         .execute(&mut db)
@@ -982,7 +993,7 @@ async fn an_undo_whose_files_cant_go_back_still_restores_the_old_skill() {
         "unconfirmed"
     );
     drop(work);
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[tokio::test]
@@ -1255,7 +1266,7 @@ async fn files_declaring_other_hosts_than_the_row_are_left_waiting() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].state, SkillState::Pending);
     assert!(h.hosts().await.is_empty());
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[tokio::test]
@@ -1353,7 +1364,7 @@ async fn a_failed_replacement_of_a_waiting_skill_leaves_no_new_hosts_to_confirm(
         Confirmed::NotPending
     );
     assert!(h.hosts().await.is_empty());
-    assert!(h.work_is_empty());
+    assert!(h.work_is_empty().await);
 }
 
 #[test]
