@@ -115,8 +115,18 @@ impl ManagerBot {
     ///
     /// A [`SurfaceError`] if the DM can't be opened or posted to.
     pub async fn dm(&self, member: &MemberKey, text: &str) -> Result<(), SurfaceError> {
-        let room = self.dms.open_dm(member).await?;
+        let room = self.dm_room(member).await?;
         self.post(&room, text).await
+    }
+
+    /// The room of the manager bot's DM with `member`, opened if there is
+    /// none yet.
+    ///
+    /// # Errors
+    ///
+    /// A [`SurfaceError`] if the DM can't be opened.
+    pub async fn dm_room(&self, member: &MemberKey) -> Result<ConversationId, SurfaceError> {
+        self.dms.open_dm(member).await
     }
 }
 
@@ -228,7 +238,9 @@ impl Replies {
         text: &str,
     ) -> Result<(), ReplyError> {
         match origin {
-            Origin::SlackSlash { response_url } => self.respond(member, response_url, text).await,
+            Origin::SlackSlash { response_url, .. } => {
+                self.respond(member, response_url, text).await
+            }
             Origin::SlackDm { channel: room } | Origin::RocketChatDm { room } => {
                 Ok(self.bot_for(member)?.post(room, text).await?)
             }
@@ -244,5 +256,15 @@ impl Replies {
     /// As for [`reply_private`](Self::reply_private).
     pub async fn dm(&self, member: &MemberKey, text: &str) -> Result<(), ReplyError> {
         Ok(self.bot_for(member)?.dm(member, text).await?)
+    }
+
+    /// The room of the manager bot's DM with `member`, opened if there is
+    /// none yet.
+    ///
+    /// # Errors
+    ///
+    /// As for [`reply_private`](Self::reply_private).
+    pub async fn dm_room(&self, member: &MemberKey) -> Result<ConversationId, ReplyError> {
+        Ok(self.bot_for(member)?.dm_room(member).await?)
     }
 }
