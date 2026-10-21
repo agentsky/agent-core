@@ -80,6 +80,11 @@ pub(crate) const SPECS: &[Spec] = &[
          or from a SKILL.md or .zip attached to a direct message with me",
     ),
     Spec::new(
+        "skill confirm",
+        "skill confirm <name> <skill>",
+        "add a skill that `skill add` held back because it asks to reach other hosts",
+    ),
+    Spec::new(
         "skill rm",
         "skill rm <name> <skill>",
         "remove a skill from an agent",
@@ -232,7 +237,8 @@ mod tests {
         assert!(group_help("nope").is_none());
         assert_eq!(
             prefix_usage(&["skill"]),
-            "Usage: `skill add <name> [source]`, `skill rm <name> <skill>`"
+            "Usage: `skill add <name> [source]`, `skill confirm <name> <skill>`, \
+             `skill rm <name> <skill>`"
         );
         assert_eq!(
             prefix_usage(&["admin", "api-key"]),

@@ -205,9 +205,10 @@ impl EgressPolicy {
         &self.rules
     }
 
-    /// Why `ip` is unreachable, for the log line, or `None` if it is
-    /// reachable.
-    pub(crate) fn unreachable(&self, ip: IpAddr) -> Option<&'static str> {
+    /// Why `ip` is unreachable, as a short phrase for a log line, or
+    /// `None` if it is reachable. agentd applies the same check to the
+    /// addresses of a Git host it clones a skill from.
+    pub fn unreachable(&self, ip: IpAddr) -> Option<&'static str> {
         let ip = ip.to_canonical();
         if self.own.iter().any(|net| net.contains(ip)) {
             return Some(OWN_NETWORK);

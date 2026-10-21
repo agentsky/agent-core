@@ -58,7 +58,7 @@ fn help_for_one_command() {
     let admin = fail("help Admin ban").to_string();
     assert!(admin.contains("`admin api-key set <key>`"));
     assert!(admin.contains("`admin slack`"));
-    assert_eq!(fail("help skill").to_string().lines().count(), 2);
+    assert_eq!(fail("help skill").to_string().lines().count(), 3);
 }
 
 #[test]
@@ -309,8 +309,29 @@ fn skill_rm() {
 }
 
 #[test]
+fn skill_confirm() {
+    let Command::Skill(SkillCommand::Confirm { name: n, skill }) =
+        ok("skill confirm helper pdf-tools")
+    else {
+        panic!()
+    };
+    assert_eq!(n, name("helper"));
+    assert_eq!(skill.as_str(), "pdf-tools");
+    invalid(
+        "skill confirm helper",
+        "Missing `<skill>`.\nUsage: `skill confirm <name> <skill>`",
+    );
+    invalid(
+        "skill confirm helper Tool",
+        "A skill name is 1 to 64 characters, each a-z, 0-9 or -.\n\
+         Usage: `skill confirm <name> <skill>`",
+    );
+}
+
+#[test]
 fn skill_needs_a_subcommand() {
-    let usage = "Usage: `skill add <name> [source]`, `skill rm <name> <skill>`";
+    let usage = "Usage: `skill add <name> [source]`, `skill confirm <name> <skill>`, \
+                 `skill rm <name> <skill>`";
     invalid("skill", &format!("Missing a subcommand.\n{usage}"));
     invalid(
         "skill remove helper x",
@@ -723,6 +744,7 @@ fn only_the_three_secret_bearing_commands_say_so() {
         "create helper",
         "persona helper sk-ant-in-a-persona",
         "skill add helper",
+        "skill confirm helper x",
         "skill rm helper x",
         "allow helper everyone",
         "deny helper everyone",
@@ -758,6 +780,7 @@ fn every_command_has_its_own_help_line() {
         "create helper",
         "persona helper",
         "skill add helper",
+        "skill confirm helper x",
         "skill rm helper x",
         "allow helper everyone",
         "deny helper everyone",

@@ -393,6 +393,12 @@ enum SkillCmd {
         #[arg(value_name = "source", value_parser = parse_skill_source)]
         source: Option<String>,
     },
+    Confirm {
+        #[arg(value_name = "name", value_parser = parse_agent_name)]
+        name: AgentName,
+        #[arg(value_name = "skill", value_parser = parse_skill_name)]
+        skill: SkillName,
+    },
     Rm {
         #[arg(value_name = "name", value_parser = parse_agent_name)]
         name: AgentName,
@@ -445,6 +451,7 @@ impl Cmd {
             Cmd::Persona { name, text } => Command::Persona { name, text },
             Cmd::Skill { command } => Command::Skill(match command {
                 SkillCmd::Add { name, source } => SkillCommand::Add { name, source },
+                SkillCmd::Confirm { name, skill } => SkillCommand::Confirm { name, skill },
                 SkillCmd::Rm { name, skill } => SkillCommand::Rm { name, skill },
             }),
             Cmd::Allow { name, target } => Command::Allow { name, target },
