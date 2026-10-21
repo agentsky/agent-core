@@ -159,6 +159,29 @@ pub(crate) const SPECS: &[Spec] = &[
         "approve a private task someone asked one of your agents for",
     ),
     Spec::new("decline", "decline <consent-id>", "decline a private task"),
+    Spec::new(
+        "cloud add",
+        "cloud add <routine> <url> <token>",
+        "register a routine's API trigger URL and token from claude.ai/code/routines \
+         under a label of your choosing, or replace its token; send it only privately",
+    ),
+    Spec::new(
+        "cloud run",
+        "cloud run <routine> <task>",
+        "start a cloud session of the routine on your own account, with the rest of the \
+         line as its task",
+    )
+    .with_tail_after(1),
+    Spec::new(
+        "cloud list",
+        "cloud list",
+        "list your routines and your last cloud hand-offs",
+    ),
+    Spec::new(
+        "cloud rm",
+        "cloud rm <routine>",
+        "forget a routine and its token",
+    ),
     Spec::new("help", "help [command]", "show this help, or one command's"),
 ];
 
