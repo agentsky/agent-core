@@ -1127,6 +1127,57 @@ impl WebApi {
             .map(drop)
     }
 
+    /// `chat.postMessage` with Block Kit `blocks`: posts them to the top
+    /// level of `channel`, with `text` (mrkdwn) as the notification's and
+    /// screen readers' fallback, and link previews off. Returns the new
+    /// message's `ts`. Like [`post_message`](Self::post_message), it sends
+    /// neither `link_names` nor `parse`.
+    ///
+    /// # Errors
+    ///
+    /// See [`map_error`]; `invalid_blocks` is [`SurfaceError::Api`].
+    pub async fn post_blocks(
+        &self,
+        channel: &ConversationId,
+        text: &str,
+        blocks: &Value,
+    ) -> Result<MessageId> {
+        let body = json!({
+            "channel": channel,
+            "text": text,
+            "blocks": blocks,
+            "unfurl_links": false,
+            "unfurl_media": false,
+        });
+        let posted: PostResponse = self
+            .call(
+                Method::ChatPostMessage,
+                Body::Json(body),
+                Some(channel.as_str()),
+            )
+            .await?;
+        Ok(posted.ts)
+    }
+
+    /// `chat.update` with Block Kit `blocks`: replaces the bot's message
+    /// `ts` in `channel` with them, and its fallback text with `text`.
+    ///
+    /// # Errors
+    ///
+    /// As for [`update_message`](Self::update_message).
+    pub async fn update_blocks(
+        &self,
+        channel: &ConversationId,
+        ts: &MessageId,
+        text: &str,
+        blocks: &Value,
+    ) -> Result<()> {
+        let body = json!({"channel": channel, "ts": ts, "text": text, "blocks": blocks});
+        self.call::<IgnoredAny>(Method::ChatUpdate, Body::Json(body), None)
+            .await
+            .map(drop)
+    }
+
     /// `chat.postEphemeral`: shows `text` to `user` alone in `channel`, in
     /// the thread `thread_ts` if given. Returns the ephemeral message's
     /// `ts`, which can't be edited or reacted to.

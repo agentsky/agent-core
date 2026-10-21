@@ -265,6 +265,7 @@ async fn record(
                 turn: None,
                 requester: &requester,
                 hop: Hop::ZERO,
+                consent: None,
             },
             OffsetDateTime::now_utc(),
         )

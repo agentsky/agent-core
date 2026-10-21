@@ -26,10 +26,12 @@ mod mention;
 pub mod rocketchat;
 pub mod slack;
 mod split;
+mod unicode;
 mod url;
 mod verbatim;
 
 pub use split::split;
+pub use unicode::is_default_ignorable;
 
 /// Resolves a display name written as `@Name` to the handle the surface's
 /// mention syntax needs: a user id on Slack (`<@U123>`), a username on

@@ -13,6 +13,8 @@
 //!   the relink notice.
 //! - [`community`]: the community API key, which the credential proxy
 //!   reads from the store.
+//! - [`consents`]: private tasks' consents, their cards, and their
+//!   expiry.
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`pipeline`]: the runner's sessions and sandboxes, and the turn hooks
 //!   that give each process its placeholder and agentctl token.
@@ -35,6 +37,7 @@ pub mod cli;
 pub mod commands;
 pub mod community;
 pub mod config;
+pub mod consents;
 pub mod ctl;
 pub mod net;
 pub mod pipeline;

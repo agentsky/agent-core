@@ -51,6 +51,7 @@ use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
 use crate::commands::rocketchat::{self, CommandFeed, StoreDedup};
 use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::community::StoreCommunityKey;
+use crate::consents::CONSENT_SWEEP_INTERVAL;
 use crate::net::RefuseSubnet;
 use crate::pipeline::Pipeline;
 use crate::skills::SkillHosts;
@@ -289,7 +290,10 @@ impl Server {
     /// 2. The turns already taken get `server.drain_timeout_secs` to finish,
     ///    while the proxy and ctl listeners still serve them. Those still
     ///    running then are dropped, their working emoji taken off and their
-    ///    threads told to ask again ([`Pipeline::cut_short`]).
+    ///    threads told to ask again ([`Pipeline::cut_short`]). The turns of
+    ///    private tasks dropped that way are killed, and waited for until
+    ///    they are billed, for at most about half a minute
+    ///    ([`Pipeline::wait_for_kills`]).
     /// 3. The proxy and ctl listeners stop accepting too, and in-flight
     ///    requests, the workers and the sweeper get what is left of the
     ///    same timeout to finish. Whatever is still running then is
@@ -316,6 +320,9 @@ impl Server {
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the [`CommandIntake`], the relink notifier,
+    /// with a pipeline the consents' worker
+    /// ([`Consents::run`](crate::consents::Consents::run)), whose private
+    /// tasks the pipeline drains like its turns,
     /// with the Slack manager app the configuration token rotator and the
     /// sweeper of agents' apps (install reminders, stale creations), and with
     /// `[rocketchat]` the manager bot's connection and the [`Supervisor`] of
@@ -387,6 +394,17 @@ impl Server {
             notifier.run(wake, RELINK_SWEEP_INTERVAL, notifying).await;
             "relink notifier"
         });
+        if let Some(pipeline) = &pipeline {
+            let consents = app.ctl().consents().clone();
+            let pipeline = pipeline.clone();
+            let settling = stopping.clone();
+            tasks.spawn(async move {
+                consents
+                    .run(pipeline, CONSENT_SWEEP_INTERVAL, settling)
+                    .await;
+                "consent worker"
+            });
+        }
         let intake = routers.intake;
         tasks.spawn(async move {
             intake.run().await;
@@ -487,6 +505,12 @@ impl Server {
             if !drained {
                 tracing::warn!("turns still running at the drain's end; dropping them");
                 pipeline.cut_short().await;
+                if !forced {
+                    tokio::select! {
+                        () = pipeline.wait_for_kills() => {}
+                        () = abort.as_mut() => forced = true,
+                    }
+                }
             }
         }
         stop_internal.send_replace(true);

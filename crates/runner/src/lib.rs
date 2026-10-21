@@ -90,7 +90,7 @@ pub use persona::{
     AGENTS_DIR, SKILLS_DIR, persona_dir, skills_dir, write_if_changed, write_persona,
 };
 pub use process::ClaudeProcess;
-pub use sessions::{SessionConfig, SessionManager, TurnReport};
+pub use sessions::{SessionConfig, SessionManager, TurnReport, WorkDir};
 pub use store::{CostUnknown, Session, SessionKind};
 pub use stream::{
     ErrorKind, MAX_LINE_BYTES, MAX_TURN_COST_USD, MAX_TURN_TOKENS, TurnOutcome, TurnResult,

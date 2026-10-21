@@ -143,6 +143,53 @@ async fn post_message_threads_without_unfurls_link_names_or_parse() {
 }
 
 #[tokio::test]
+async fn blocks_are_posted_and_updated_with_their_fallback_text() {
+    let (server, api) = server().await;
+    mount(
+        &server,
+        "chat.postMessage",
+        ok(json!({"channel": "D0DM00001", "ts": "1727697700.000200", "message": {}})),
+    )
+    .await;
+    mount(
+        &server,
+        "chat.update",
+        ok(json!({"ts": "1727697700.000200"})),
+    )
+    .await;
+    let blocks = json!([{"type": "section", "text": {"type": "plain_text", "text": "hi"}}]);
+    let dm = ConversationId::from("D0DM00001");
+    let ts = api.post_blocks(&dm, "fallback", &blocks).await.unwrap();
+    assert_eq!(ts.as_str(), "1727697700.000200");
+    let closed = json!([{"type": "context", "elements": []}]);
+    api.update_blocks(&dm, &ts, "done", &closed).await.unwrap();
+
+    let sent = requests(&server).await;
+    assert_eq!(
+        json_body(&sent[0]),
+        json!({
+            "channel": "D0DM00001",
+            "text": "fallback",
+            "blocks": blocks,
+            "unfurl_links": false,
+            "unfurl_media": false,
+        })
+    );
+    assert_eq!(
+        json_body(&sent[1]),
+        json!({
+            "channel": "D0DM00001",
+            "ts": "1727697700.000200",
+            "text": "done",
+            "blocks": closed,
+        })
+    );
+    for request in &sent {
+        assert_token_only_in_header(request);
+    }
+}
+
+#[tokio::test]
 async fn update_message_sends_neither_link_names_nor_parse() {
     let (server, api) = server().await;
     mount(

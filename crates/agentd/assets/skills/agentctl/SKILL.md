@@ -30,7 +30,7 @@ it.
 
 Refused when the file is over the size limit (50 MB by default), when a turn
 already staged 10 files, or when the file name holds `/`, `\`, control or
-invisible characters, or is `.` or `..`.
+invisible characters, or is only whitespace, `.` or `..`.
 
 ## post
 
@@ -119,15 +119,28 @@ agentctl private [--file <path>]... <task>
 
 Asks for a task on your owner's private resources (their `shared/`
 directory and private tools), which this conversation can't reach. It
-returns a consent id at once and does not wait for the task. Unless your
-owner asked for this turn, your owner is asked to approve the task first,
-and sees it exactly as you wrote it, so write it plainly. When the task
+returns a consent id at once and does not wait for the task. Unless this
+turn is your owner's own direct message with you, your owner is asked to
+approve the task first, and sees it exactly as you wrote it, so write it
+plainly: invisible or control characters other than newlines and tabs,
+indentation past 32 columns, blank runs wider than 16 columns (a tab is 8) inside a
+line, more than 2 blank lines in a row and heavily stacked accents are
+refused; the task text may be at most 3000 characters, an
+emoji counting as two. When the task
 finishes, agentd posts its result to this thread; you won't see it in this
 turn, so tell the requester that the result will follow.
 
-`--file` hands a file from this conversation's directory to the task;
-repeat it for several. Refused inside a private task. Not available yet on
-this server: it answers "not available yet".
+`--file` hands a file from this session's directory (your working
+directory, or anything else under the session directory) to the task, as it
+is now; repeat it for several, up to 10, each named differently and none a
+dotfile or `CLAUDE.md`, together no larger than one attachment may be. The
+task finds them in its working directory. Nothing else of this conversation
+reaches the task: put what it needs in the task text or a file. Its result
+comes back as a new message in this thread, headed `Private task <id>:`,
+with the files it attached; if your owner declines, or doesn't answer in
+time, that is posted instead. A turn may ask for three private tasks, and
+only a few may wait for your owner or run at once; past that the request is
+refused until some are done. Refused inside a private task.
 
 ## Inside a private task
 

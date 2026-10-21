@@ -27,6 +27,13 @@ bridge. Without the rules sessions can't reach the credential proxy, so a
 missing rule fails loudly rather than letting sandboxes talk to each other.
 The rules need root, and don't survive a reboot of the host.
 
+A private task (`agentctl private`) runs in a sandbox of its own that holds
+the agent owner's private files and a placeholder bound to the owner's
+Claude account, on this same `sandbox` network as the channel sandboxes,
+which run whatever other members prompt. Nothing but this isolation keeps
+the two apart, so any deployment that creates the network another way must
+enforce it too.
+
 On the host, Rocket.Chat is at <http://localhost:3000> and agentd's public
 listener at `127.0.0.1:8443`. Both bind the loopback address only.
 

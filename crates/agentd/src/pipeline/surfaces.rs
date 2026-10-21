@@ -133,13 +133,11 @@ impl StoreSurfaces {
 
 #[async_trait::async_trait]
 impl SurfaceLookup for StoreSurfaces {
-    async fn surface(&self, agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        match self.lookup(agent, conv).await {
-            Ok(surface) => surface,
-            Err(err) => {
-                tracing::warn!(%agent, error = %err, "looking up an agent's surface failed");
-                None
-            }
-        }
+    async fn surface(
+        &self,
+        agent: AgentId,
+        conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        self.lookup(agent, conv).await
     }
 }
