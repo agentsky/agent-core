@@ -3313,9 +3313,11 @@ running as the sandbox user without root's override of file modes, gets
 **Solution.** `remove_tree_at` works through handles and never follows a
 symlink: each entry is looked up with `AT_SYMLINK_NOFOLLOW` and opened
 with `O_NOFOLLOW` relative to its parent, and each directory gets mode
-`0700` through its handle before it is read or moved. It goes depth first
-without recursion: files are unlinked and empty directories removed as
-they are read, and the first directory found with something in it is
+`0700` through its handle before it is read, and before it is moved if a
+move fails with `EACCES`, as it does for a directory without write
+permission. It goes depth first without recursion: files are unlinked
+and empty directories removed as they are read, and the first directory
+found with something in it is
 renamed into the top directory as `.removing-<uuid>-<n>`, `n` its level,
 and emptied next. Only a count of the levels is kept, so a tree of any
 depth takes a handful of file descriptors and constant memory beyond the
@@ -3332,13 +3334,15 @@ entries as had been removed before it.
 The moves use plain `renameat`; `renameat2` flags such as
 `RENAME_NOREPLACE` fail on NFS, and the names are unique anyway. Any step
 that finds its entry missing counts it as removed, so two removals of one
-tree, as two agentd instances can make, both succeed. A removal, or all
-the removals of one clear, gives up after a minute, so a process that
-keeps adding entries can't hold a blocking thread, and the session start
-waiting for it, for ever; what was removed by then stays removed, so the
-next attempt goes on from there. The sandbox crate exports the same
-remover as `remove_tree` for agentd's own directories that hold what an
-agent wrote.
+tree, as two agentd instances can make, both succeed; one whose top
+directory another removal took, and whose name something then made a new
+directory at, fails at once instead of reading the old one again. A
+removal, or all the removals of one session start, gives up after a
+minute, so a process that keeps adding entries can't hold a blocking
+thread, and the session start waiting for it, for ever; what was removed
+by then stays removed, so the next attempt goes on from there. The
+sandbox crate exports the same remover as `remove_tree` for agentd's own
+directories that hold what an agent wrote.
 
 ### Several agentd, or test runs, on one Docker host
 
