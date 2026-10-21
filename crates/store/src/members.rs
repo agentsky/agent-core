@@ -49,6 +49,22 @@ impl Store {
             .collect()
     }
 
+    /// Replaces `member`'s display name. Returns false if there is no such
+    /// member.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails.
+    pub async fn set_member_display_name(&self, member: MemberId, name: &str) -> Result<bool> {
+        let result = sqlx::query("UPDATE members SET display_name = ? WHERE id = ?")
+            .bind(name)
+            .bind(member.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// The member that owns the surface identity `key`, created at `now`
     /// with `display_name` if there is none yet.
     ///
@@ -151,6 +167,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(name, "Ada");
+    }
+
+    #[tokio::test]
+    async fn set_member_display_name_renames_a_member() {
+        let store = memory_store().await;
+        let member = store
+            .ensure_member(&member_key("u1"), "u1", at(1_000))
+            .await
+            .unwrap();
+        assert!(store.set_member_display_name(member, "ada").await.unwrap());
+        let name: String = sqlx::query_scalar("SELECT display_name FROM members WHERE id = ?")
+            .bind(member.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .unwrap();
+        assert_eq!(name, "ada");
+        let nobody = core_types::MemberId::new_v4();
+        assert!(!store.set_member_display_name(nobody, "x").await.unwrap());
     }
 
     #[tokio::test]

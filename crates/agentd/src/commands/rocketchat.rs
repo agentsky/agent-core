@@ -14,18 +14,18 @@
 //! manager bot's and each agent's, has to look for commands in what it
 //! delivers: through [`CommandFeed::into_sender`], which sends commands to
 //! the one [`CommandIntake`] and passes only other messages onward, so a
-//! command is never also taken as a turn. T13 has only the manager bot's
-//! connection; T14 feeds every agent's into the same intake. A room without the manager bot is
-//! heard by the agents' connections, and a command there is answered all the
-//! same.
+//! command is never also taken as a turn. The agents' connections, started
+//! by the [`Supervisor`](crate::agents::Supervisor), feed the same intake. A
+//! room without the manager bot is heard by the agents' connections, and a
+//! command there is answered all the same.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use core_types::{
-    Binding, ConvKind, ConversationId, InboundEvent, MemberKey, SendError, Sender, Sink, Surface,
-    SurfaceError,
+    Binding, ConvKind, ConversationId, InFile, InboundEvent, MemberKey, SendError, Sender, Sink,
+    Surface, SurfaceError,
 };
 use store::Store;
 use surface_rocketchat::Dedup;
@@ -63,6 +63,7 @@ struct Heard {
     member: MemberKey,
     text: String,
     origin: Origin,
+    files: Vec<InFile>,
 }
 
 /// Runs the commands that every Rocket.Chat connection hears, whichever
@@ -159,7 +160,7 @@ fn start(
             let _ = previous.await;
         }
         commands
-            .handle_text(&heard.member, &heard.text, &heard.origin)
+            .handle_text(&heard.member, &heard.text, &heard.origin, &heard.files)
             .await;
         let _ = done.send(());
     });
@@ -186,6 +187,7 @@ impl CommandFeed {
             member: event.sender.clone(),
             text: text.to_owned(),
             origin,
+            files: event.files.clone(),
         };
         self.tx.send(heard).await.map_err(|_| SendError)?;
         Ok(None)
@@ -196,9 +198,8 @@ impl CommandFeed {
     /// without one.
     ///
     /// The connection that records a message first delivers it for every
-    /// bot in the room, so once agents take turns, every connection, the
-    /// manager bot's included, passes the rest to where turns are taken.
-    /// Until then the manager bot's connection has nowhere to pass them.
+    /// bot in the room, so every connection, the manager bot's included,
+    /// passes the rest to the same place.
     pub fn into_sender(self, onward: Option<Sender<InboundEvent>>) -> Sender<InboundEvent> {
         Sender::new(Feeding { feed: self, onward })
     }

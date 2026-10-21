@@ -2,7 +2,9 @@
 //!
 //! Every call is authenticated with `X-User-Id` and `X-Auth-Token`: the
 //! manager's personal access token, or a bot's. [`RestClient::with_credentials`]
-//! switches identity while sharing the connection pool.
+//! switches identity while sharing the connection pool. Redirects are
+//! followed only within the server's origin, so those headers never leave
+//! it; see [`RestClient::new`].
 //!
 //! Errors map to [`SurfaceError`]. Rocket.Chat answers most failures with HTTP
 //! 400 and a body `{"success": false, "error": "…", "errorType": "…"}`; see
@@ -22,7 +24,8 @@ use bytes::Bytes;
 use core_types::{ConversationId, MessageId, OutFile, SurfaceError, UserId};
 use rand::RngExt;
 use rand::distr::Alphanumeric;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::{HeaderMap, HeaderValue, LOCATION};
+use reqwest::redirect::Policy;
 use reqwest::{Method, StatusCode, Url};
 use secrecy::{ExposeSecret, SecretString};
 use serde::de::{DeserializeOwned, IgnoredAny};
@@ -44,6 +47,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long an upload may take.
 const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How long connecting may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The most same-origin redirects one call follows, reqwest's default.
+const MAX_REDIRECTS: usize = 10;
 
 /// How long to wait before the one retry when a 429 carries no usable
 /// `x-ratelimit-reset`.
@@ -69,6 +78,15 @@ const PASSWORD_LEN: usize = 48;
 
 /// The longest platform error description kept in a [`SurfaceError`].
 const MAX_DESCRIPTION: usize = 200;
+
+/// How `users.info` describes a user it doesn't know.
+const USER_NOT_FOUND: &str = "User not found.";
+
+/// The error codes with which Rocket.Chat says a user doesn't exist, as
+/// older servers also answer `users.info` for an unknown name. Any other
+/// not-found, such as a bare HTTP 404 from a proxy, isn't taken to mean
+/// the user is gone.
+pub const USER_GONE_CODES: &[&str] = &["error-invalid-user", "error-user-not-found"];
 
 /// Error codes that mean the caller may not do this.
 const FORBIDDEN_CODES: &[&str] = &[
@@ -174,6 +192,18 @@ pub struct User {
     /// Whether the account is active, when reported.
     #[serde(default)]
     pub active: Option<bool>,
+    /// The email addresses. `users.info` includes them for the caller
+    /// itself, or when the caller has `view-full-other-user-info`, like
+    /// [`User::roles`].
+    #[serde(default)]
+    pub emails: Vec<Email>,
+}
+
+/// One of a user's email addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct Email {
+    /// The address.
+    pub address: String,
 }
 
 /// A room's type, Rocket.Chat's `t` field.
@@ -290,7 +320,9 @@ pub struct Message {
     pub id: MessageId,
     /// The room it is in (`rid`).
     pub room: ConversationId,
-    /// The text (`msg`).
+    /// The text (`msg`). A file message with an empty `msg` takes its
+    /// attachment's `description` instead, where some clients put the text
+    /// typed with an upload.
     pub text: String,
     /// Who sent it (`u`).
     pub sender: UserRef,
@@ -357,6 +389,8 @@ struct RawMessage {
     files: Vec<Value>,
     #[serde(default)]
     file: Option<Value>,
+    #[serde(default)]
+    attachments: Vec<Value>,
     #[serde(default, rename = "_updatedAt")]
     updated_at: Option<Value>,
 }
@@ -372,15 +406,20 @@ impl TryFrom<RawMessage> for Message {
 
     fn try_from(raw: RawMessage) -> Result<Self, String> {
         let sent_at = parse_timestamp(&raw.ts).ok_or("invalid message timestamp")?;
-        let files = if raw.files.is_empty() {
+        let files: Vec<FileRef> = if raw.files.is_empty() {
             raw.file.iter().filter_map(file_ref).collect()
         } else {
             raw.files.iter().filter_map(file_ref).collect()
         };
+        let msg = raw.msg.unwrap_or_default();
         Ok(Self {
             id: raw.id.into(),
             room: raw.rid.into(),
-            text: raw.msg.unwrap_or_default(),
+            text: if msg.is_empty() && !files.is_empty() {
+                file_description(&raw.attachments)
+            } else {
+                msg
+            },
             sender: raw.u,
             sent_at,
             updated_at: raw.updated_at.as_ref().and_then(parse_timestamp),
@@ -394,6 +433,16 @@ impl TryFrom<RawMessage> for Message {
             files,
         })
     }
+}
+
+/// The description of a file message's attachment. Depending on the
+/// client, the text typed with an upload lands in `msg` or here.
+fn file_description(attachments: &[Value]) -> String {
+    attachments
+        .iter()
+        .find_map(|a| a.get("description").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Reads an ISO 8601 string or EJSON `{"$date": <ms>}`.
@@ -443,6 +492,7 @@ fn iso_millis(at: OffsetDateTime) -> String {
 #[derive(Debug, Clone)]
 pub struct RestClient {
     http: reqwest::Client,
+    foreign: reqwest::Client,
     base: Url,
     creds: Credentials,
     max_retry_wait: Duration,
@@ -525,6 +575,13 @@ impl RestClient {
     ///
     /// The URL must be `http` or `https`, with no user info, query or
     /// fragment.
+    ///
+    /// A call follows up to 10 redirects within the origin (scheme, host and
+    /// port) it was sent to, with its headers, and stops at the first
+    /// redirect to another origin, `http` to `https` on the same host
+    /// included: reqwest drops only headers such as `Authorization` and
+    /// `Cookie` there, not `X-User-Id` and `X-Auth-Token`. Such a redirect
+    /// then fails the call, except in [`RestClient::download`].
     pub fn new(base_url: &str, creds: Credentials) -> Result<Self> {
         let base = Url::parse(base_url)
             .map_err(|err| SurfaceError::Api(format!("invalid Rocket.Chat URL: {err}")))?;
@@ -543,11 +600,18 @@ impl RestClient {
             ));
         }
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(same_origin_redirects())
+            .build()
+            .map_err(transport)?;
+        let foreign = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .redirect(Policy::none())
             .build()
             .map_err(transport)?;
         Ok(Self {
             http,
+            foreign,
             base,
             creds,
             max_retry_wait: DEFAULT_MAX_RETRY_WAIT,
@@ -575,7 +639,7 @@ impl RestClient {
     }
 
     /// Sets the largest file [`RestClient::upload`] sends, in bytes. A
-    /// larger file fails with [`SurfaceError::Api`] before anything is read
+    /// larger file fails with [`SurfaceError::TooLarge`] before anything is read
     /// or sent. The default is 100 MiB, Rocket.Chat's default
     /// `FileUpload_MaxFileSize`; set it to the server's value when that is
     /// lower, so an oversized file fails without being read.
@@ -757,6 +821,28 @@ impl RestClient {
         Ok(found.user)
     }
 
+    /// `GET users.info`: a user by username, or `None` if Rocket.Chat
+    /// knows no user of that name. Roles come back as for
+    /// [`RestClient::user_info`].
+    ///
+    /// Rocket.Chat answers an unknown username with HTTP 400 and the error
+    /// `User not found.`, without a code, and older servers with one of
+    /// [`USER_GONE_CODES`]. Any other failure, such as a 5xx, a 429 or a
+    /// transport error, stays an error.
+    pub async fn user_by_username(&self, username: &str) -> Result<Option<User>> {
+        match self
+            .call::<UserEnvelope>(Call::get("users.info").query("username", username))
+            .await
+        {
+            Ok(found) => Ok(Some(found.user)),
+            Err(SurfaceError::Api(description)) if description == USER_NOT_FOUND => Ok(None),
+            Err(SurfaceError::NotFound(code)) if USER_GONE_CODES.contains(&code.as_str()) => {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// `POST im.create`: opens (or finds) the direct message with the user
     /// named `username` and returns its room id.
     ///
@@ -845,6 +931,72 @@ impl RestClient {
         url.into()
     }
 
+    /// Downloads a message's file, `<base>/file-upload/<id>/<name>`, with
+    /// this client's credentials as `X-User-Id` and `X-Auth-Token` headers,
+    /// never in the URL.
+    ///
+    /// A server that keeps files in an object store (Amazon S3, Google Cloud
+    /// Storage) redirects to a presigned URL there. That URL is fetched once,
+    /// without any Rocket.Chat header and without following a further
+    /// redirect: it authorizes itself.
+    ///
+    /// The file is read into memory, and refused with
+    /// [`SurfaceError::TooLarge`] once it proves larger than `max` bytes, by
+    /// its `Content-Length` or while it is read, so a large file costs at
+    /// most `max + 1` bytes of memory. A 401 or 403 is
+    /// [`SurfaceError::Forbidden`], a 404 [`SurfaceError::NotFound`].
+    pub async fn download(&self, id: &str, name: &str, max: u64) -> Result<Bytes> {
+        let url = self.file_url(&FileRef {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            mime_type: None,
+            size: None,
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("x-user-id", header(self.creds.user_id.as_str())?);
+        headers.insert("x-auth-token", header(self.creds.token.expose_secret())?);
+        let mut response = self
+            .http
+            .get(url)
+            .headers(headers)
+            .timeout(REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(transport)?;
+        if let Some(elsewhere) = foreign_redirect(&response) {
+            response = self
+                .foreign
+                .get(elsewhere)
+                .timeout(REQUEST_TIMEOUT)
+                .send()
+                .await
+                .map_err(transport)?;
+        }
+        let status = response.status();
+        if !status.is_success() {
+            return Err(match status {
+                StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                    SurfaceError::Forbidden("file download".into())
+                }
+                StatusCode::NOT_FOUND => SurfaceError::NotFound("file".into()),
+                _ => SurfaceError::Api(format!("file download failed (HTTP {})", status.as_u16())),
+            });
+        }
+        let too_large =
+            || SurfaceError::TooLarge(format!("the file is larger than the {max}-byte limit"));
+        if response.content_length().is_some_and(|length| length > max) {
+            return Err(too_large());
+        }
+        let mut data = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(transport)? {
+            data.extend_from_slice(&chunk);
+            if u64::try_from(data.len()).unwrap_or(u64::MAX) > max {
+                return Err(too_large());
+            }
+        }
+        Ok(Bytes::from(data))
+    }
+
     /// Uploads a file to a room, in the thread under `thread_root` if given,
     /// and returns the message that carries it.
     ///
@@ -857,7 +1009,8 @@ impl RestClient {
     ///
     /// The file is read into memory once, and only if it is a regular file
     /// no larger than [`RestClient::with_max_upload_size`]; otherwise the
-    /// call fails with [`SurfaceError::Api`] and sends nothing. A missing
+    /// call fails with [`SurfaceError::TooLarge`], or [`SurfaceError::Api`]
+    /// for anything but a regular file, and sends nothing. A missing
     /// file is [`SurfaceError::NotFound`].
     pub async fn upload(
         &self,
@@ -1009,6 +1162,37 @@ impl RestClient {
     }
 }
 
+/// Follows up to [`MAX_REDIRECTS`] redirects within the origin a request
+/// was sent to, and stops at one to another origin, so the Rocket.Chat
+/// headers never leave the server.
+fn same_origin_redirects() -> Policy {
+    Policy::custom(|attempt| {
+        let same_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if !same_origin {
+            attempt.stop()
+        } else if attempt.previous().len() > MAX_REDIRECTS {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
+/// Where `response` redirects to, if it is a redirect to an `http` or
+/// `https` URL on another origin: one [`same_origin_redirects`] stopped at.
+fn foreign_redirect(response: &reqwest::Response) -> Option<Url> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let location = response.headers().get(LOCATION)?.to_str().ok()?;
+    let next = response.url().join(location).ok()?;
+    (matches!(next.scheme(), "http" | "https") && next.origin() != response.url().origin())
+        .then_some(next)
+}
+
 /// A sensitive header value. Tokens and ids never contain control
 /// characters, so a failure means corrupt credentials.
 fn header(value: &str) -> Result<HeaderValue> {
@@ -1027,7 +1211,7 @@ async fn read_upload(path: &Path, max: u64) -> Result<Bytes> {
         kind => SurfaceError::Transport(format!("could not read the file to upload: {kind}")),
     };
     let too_large = |size: u64| {
-        SurfaceError::Api(format!(
+        SurfaceError::TooLarge(format!(
             "the file to upload is {size} bytes, more than the {max}-byte limit"
         ))
     };

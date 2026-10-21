@@ -1074,11 +1074,10 @@ async fn logout_succeeds_when_revocation_fails() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refresh_in_flight_during_logout_does_not_relink() {
     let h = harness().await;
+    let (held, mut hold) = Held::new(token_response("access-2", Some("refresh-2")));
     Mock::given(method("POST"))
         .and(path(TOKEN_PATH))
-        .respond_with(
-            token_response("access-2", Some("refresh-2")).set_delay(Duration::from_millis(300)),
-        )
+        .respond_with(held)
         .expect(1)
         .mount(&h.server)
         .await;
@@ -1100,11 +1099,18 @@ async fn a_refresh_in_flight_during_logout_does_not_relink() {
         let (auth, member) = (h.auth.clone(), h.member);
         tokio::spawn(async move { auth.access_token(member).await })
     };
-    eventually("the refresh is sent", || async {
-        !requests_to(&h.server, TOKEN_PATH).await.is_empty()
+    hold.arrived().await;
+    let mut logout = std::pin::pin!(h.auth.logout(h.member));
+    std::future::poll_fn(|cx| {
+        assert!(
+            logout.as_mut().poll(cx).is_pending(),
+            "logout finished while the refresh was in flight"
+        );
+        Poll::Ready(())
     })
     .await;
-    assert!(h.auth.logout(h.member).await.unwrap());
+    hold.release();
+    assert!(logout.await.unwrap());
     refresh.await.unwrap().unwrap();
     assert!(h.store.get_claude_link(h.member).await.unwrap().is_none());
     assert!(matches!(
