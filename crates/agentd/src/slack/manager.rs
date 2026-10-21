@@ -131,7 +131,9 @@ impl SlackManager {
         let directory = Arc::new(TeamDirectory::new(identity.team.clone()));
         Self {
             client,
-            surface: Arc::new(SlackSurface::new(api, directory)),
+            surface: Arc::new(
+                SlackSurface::new(api, directory).with_bot_user(Some(identity.bot_user.clone())),
+            ),
             identity: Arc::new(identity),
         }
     }

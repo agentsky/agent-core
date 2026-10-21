@@ -167,7 +167,12 @@ impl Dedup for StoreDedup {
         event_id: &str,
     ) -> Result<bool, SurfaceError> {
         self.0
-            .mark_event_processed(source, event_id, OffsetDateTime::now_utc())
+            .mark_event_processed(
+                source,
+                event_id,
+                OffsetDateTime::now_utc(),
+                store::PROCESSED_EVENT_RETENTION,
+            )
             .await
             .map_err(|err| SurfaceError::Transport(err.to_string()))
     }

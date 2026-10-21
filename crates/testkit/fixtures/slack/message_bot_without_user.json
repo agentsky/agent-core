@@ -5,7 +5,7 @@
   "event": {
     "bot_id": "B0LEGACY1",
     "type": "message",
-    "text": "Deploy finished.",
+    "text": "<@U0BOT0001> deploy finished.",
     "ts": "1727698300.000900",
     "thread_ts": "1727697650.000150",
     "bot_profile": {

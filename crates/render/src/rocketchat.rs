@@ -11,7 +11,7 @@ use crate::verbatim::{self, Scope};
 use crate::{MentionDirectory, mention};
 
 /// Names Rocket.Chat treats as broadcasts to a whole room.
-const BROADCASTS: &[&str] = &["all", "here"];
+pub const BROADCASTS: &[&str] = &["all", "here"];
 
 /// Inserted after the `@` of a broadcast so it can't notify anyone.
 const ZERO_WIDTH_SPACE: char = '\u{200B}';

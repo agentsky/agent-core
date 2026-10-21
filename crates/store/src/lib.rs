@@ -24,8 +24,9 @@
 //! [`volumes`](Store::put_volume), [`sessions`](Store::session_for_thread),
 //! [`message_refs`](Store::record_message_ref),
 //! [`slack_config_tokens`](Store::put_slack_config_token),
-//! [`agents`](Store::create_agent) with their bindings and
-//! [retirements](Store::claim_retirement),
+//! [`agents`](Store::create_agent) with their bindings,
+//! [retirements](Store::claim_retirement) and
+//! [Slack apps](Store::set_slack_app),
 //! [`agent_skills`](Store::put_skill),
 //! [`community_settings`](Store::set_community_api_key), and
 //! [`failure_notices`](Store::claim_failure_notice).
@@ -54,6 +55,7 @@ mod relink_notices;
 mod seal;
 mod sessions;
 mod skills;
+mod slack_apps;
 mod slack_config_tokens;
 mod volumes;
 
@@ -71,6 +73,7 @@ pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use sessions::{RESETS_AT_ONCE, Session, SessionKind, ThreadSession};
 pub use skills::{AgentSkill, NewSkill, SkillState};
+pub use slack_apps::{InstallReminder, NewSlackApp, SlackAppBinding, SlackAppKeys};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };

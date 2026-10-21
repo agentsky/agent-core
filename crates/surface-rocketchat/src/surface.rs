@@ -598,6 +598,13 @@ impl Surface for RocketChatSurface {
         Ok(messages)
     }
 
+    /// Messages come over the realtime connection agentd's own login
+    /// opened to the server, which only the server speaks on, so they are
+    /// the server's as they arrived: the copy is the event itself.
+    async fn confirm(&self, event: &InboundEvent) -> Result<Option<InboundEvent>> {
+        Ok(Some(event.clone()))
+    }
+
     fn render(&self, markdown: &str) -> Vec<String> {
         let text = render::rocketchat::to_markdown(markdown, &NoDirectory);
         render::split(&text, self.limit)

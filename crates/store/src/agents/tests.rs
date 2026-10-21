@@ -346,6 +346,13 @@ async fn active_bots_are_the_active_bindings_of_live_agents() {
     );
     assert_eq!(bots[0].binding, helper_binding);
     assert_eq!(bots[0].bot, bot("bot1"));
+    assert_eq!(
+        store
+            .active_bot_users(SurfaceKind::RocketChat, &team())
+            .await
+            .unwrap(),
+        [UserId::new("bot1"), UserId::new("bot2")]
+    );
     sqlx::query("UPDATE agent_bindings SET bot_token_enc = x'00' WHERE id = ?")
         .bind(helper_binding.to_string())
         .execute(&store.pool)
@@ -550,6 +557,8 @@ async fn directory_lists_live_agents_with_their_owner_and_bot() {
         summary,
         [("coder", "Ada L", None), ("writer", "bob", Some("bot1"))]
     );
+    assert_eq!(all[0].bot_user, None);
+    assert_eq!(all[1].bot_user, Some(UserId::new("bot1")));
     let adas = store
         .directory(SurfaceKind::RocketChat, &team(), Some(ada))
         .await

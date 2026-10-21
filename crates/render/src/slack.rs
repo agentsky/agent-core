@@ -25,7 +25,7 @@ pub const MESSAGE_LIMIT: Limit = Limit {
 };
 
 /// Names Slack treats as broadcasts to a whole channel or workspace.
-const BROADCASTS: &[&str] = &["here", "channel", "everyone"];
+pub const BROADCASTS: &[&str] = &["here", "channel", "everyone"];
 
 /// What a thematic break (`---`) becomes. mrkdwn has no divider.
 const RULE: &str = "──────────";

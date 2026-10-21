@@ -168,6 +168,34 @@ impl Store {
         .transpose()
     }
 
+    /// `member`'s configuration token for `team`, decrypted, if it can
+    /// still be used at `now`: Slack hasn't refused to renew it, and it
+    /// hasn't expired.
+    ///
+    /// # Errors
+    ///
+    /// As for [`slack_config_token`](Self::slack_config_token).
+    pub async fn usable_slack_config_token(
+        &self,
+        member: MemberId,
+        team: &TeamId,
+        now: OffsetDateTime,
+    ) -> Result<Option<SlackConfigToken>> {
+        let row: Option<(Vec<u8>, Vec<u8>, i64, String)> = sqlx::query_as(
+            "SELECT token_enc, refresh_token_enc, expires_at, version FROM slack_config_tokens \
+             WHERE member_id = ? AND team_id = ? AND broken_at IS NULL AND expires_at > ?",
+        )
+        .bind(member.to_string())
+        .bind(team.as_str())
+        .bind(to_unix(now))
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(token, refresh, expires_at, version)| {
+            self.open_config_token(member, team, &token, &refresh, expires_at, version)
+        })
+        .transpose()
+    }
+
     fn open_config_token(
         &self,
         member: MemberId,
@@ -527,6 +555,37 @@ mod tests {
             .ensure_member(&member_key(user), user, at(1_000))
             .await
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_a_token_neither_broken_nor_expired_is_usable() {
+        let store = memory_store().await;
+        let ada = member(&store, "ada").await;
+        let workspace = team();
+        let usable = |now| store.usable_slack_config_token(ada, &workspace, at(now));
+        assert!(usable(1_000).await.unwrap().is_none());
+        let row = store
+            .put_slack_config_token(ada, &team(), &tokens("xoxe.a", 50_000), at(1_000))
+            .await
+            .unwrap();
+        let read = usable(49_999).await.unwrap().unwrap();
+        assert_eq!(read.token.expose_secret(), "xoxe.a");
+        assert_eq!(read.row, row);
+        assert!(usable(50_000).await.unwrap().is_none());
+        assert!(
+            store
+                .usable_slack_config_token(ada, &TeamId::new("T0OTHER"), at(2_000))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .mark_slack_config_token_broken(&row, at(2_000))
+                .await
+                .unwrap()
+        );
+        assert!(usable(2_000).await.unwrap().is_none());
     }
 
     #[tokio::test]

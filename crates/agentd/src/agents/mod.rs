@@ -76,10 +76,6 @@ pub const DEFAULT_MAX_PER_OWNER: u32 = 10;
 /// username.
 const OWNER_SEPARATOR: char = '.';
 
-/// Usernames Rocket.Chat reads as broadcasts, so a bot can't be mentioned
-/// by them.
-const BROADCAST_NAMES: &[&str] = &["all", "here"];
-
 /// The email of the bot user of `binding`: unique, and in a domain that
 /// can't receive mail.
 fn bot_email(binding: BindingId) -> String {
@@ -282,7 +278,7 @@ impl RocketChatAgents {
         let store = &self.inner.store;
         let rest = &self.inner.rest;
         let prefixed = format!("{owner}{OWNER_SEPARATOR}{name}");
-        let usernames: Vec<&str> = if BROADCAST_NAMES.contains(&name) {
+        let usernames: Vec<&str> = if render::rocketchat::BROADCASTS.contains(&name) {
             vec![&prefixed]
         } else {
             vec![name, &prefixed]

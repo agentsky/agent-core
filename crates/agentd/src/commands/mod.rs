@@ -45,6 +45,7 @@ pub mod rocketchat;
 mod sessions;
 mod skills;
 pub mod slack;
+mod slack_agents;
 pub mod slack_tokens;
 
 #[cfg(test)]
@@ -65,6 +66,7 @@ use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
 use crate::skills::Skills;
+use crate::slack::agents::SlackAgents;
 use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
@@ -206,13 +208,16 @@ impl FollowUp {
 /// The reply when something on agentd's side failed. The cause is logged.
 const FAILED: &str = "Something went wrong on my side. Please try again in a minute.";
 
-/// Runs `/agent` commands and sends their replies.
+/// Runs `/agent` commands and sends their replies. Agents are created on
+/// Rocket.Chat through [`RocketChatAgents`], and on Slack, as apps, through
+/// [`SlackAgents`] ([`with_slack_agents`](Self::with_slack_agents)).
 ///
 /// Cloning is cheap and shares everything.
 #[derive(Debug, Clone)]
 pub struct Commands {
     inner: Arc<Inner>,
     admins: Arc<[MemberKey]>,
+    slack_agents: Option<SlackAgents>,
 }
 
 #[derive(Debug)]
@@ -267,7 +272,16 @@ impl Commands {
                 sessions: Mutex::new(None),
             }),
             admins: Arc::new([]),
+            slack_agents: None,
         }
+    }
+
+    /// These commands, creating and deleting agents on Slack through
+    /// `agents`.
+    #[must_use]
+    pub fn with_slack_agents(mut self, agents: SlackAgents) -> Self {
+        self.slack_agents = Some(agents);
+        self
     }
 
     /// The same commands, with `admins` as the community admins: the only
@@ -454,7 +468,7 @@ impl Commands {
             .await?;
         let start = self.inner.auth.start_login(member).await?;
         Ok(format!(
-            "To link your Claude account, open this link and approve:\n{}\n\n\
+            "To link your Claude account, [open the Claude login page]({}) and approve.\n\n\
              The page then shows a code. Send it {} as {}. The link works once, \
              for {} minutes.",
             start.url,
