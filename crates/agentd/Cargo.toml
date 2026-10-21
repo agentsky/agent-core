@@ -13,13 +13,18 @@ workspace = true
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
+base64.workspace = true
 clap.workspace = true
+core-types.workspace = true
+http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
+rand.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_path_to_error.workspace = true
+sha2.workspace = true
 store.workspace = true
 thiserror.workspace = true
 time.workspace = true
@@ -28,7 +33,9 @@ toml.workspace = true
 tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
-core-types.workspace = true
+futures.workspace = true
 testkit.workspace = true
+tower = { workspace = true, features = ["util"] }
