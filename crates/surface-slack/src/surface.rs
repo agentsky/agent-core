@@ -1,13 +1,13 @@
 //! [`SlackSurface`]: the [`Surface`] for one Slack binding.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, MemberKey, Msg, MsgRef, OutFile,
-    ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
+    Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
 };
 use render::MentionDirectory;
 use render::slack::{MESSAGE_LIMIT, to_mrkdwn};
@@ -97,7 +97,15 @@ pub struct SlackSurface {
     members_api: WebApi,
     directory: Arc<TeamDirectory>,
     bot_user: Option<UserId>,
+    member_of: Arc<Mutex<HashMap<ConversationId, Instant>>>,
 }
+
+/// How long [`Surface::can_post`] trusts that the bot is a member of a
+/// conversation, once Slack said so.
+pub const MEMBERSHIP_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// The most conversations whose membership one surface remembers.
+const MAX_MEMBERSHIPS: usize = 10_000;
 
 impl SlackSurface {
     /// A surface acting through `api` (the binding's bot token) in the
@@ -109,6 +117,7 @@ impl SlackSurface {
             api,
             directory,
             bot_user: None,
+            member_of: Arc::default(),
         }
     }
 
@@ -228,6 +237,50 @@ impl SlackSurface {
     }
 
     /// The channel id of `conv`, which must be in this workspace.
+    fn lock_member_of(&self) -> MutexGuard<'_, HashMap<ConversationId, Instant>> {
+        self.member_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether Slack says the bot may post in `channel`: the conversation
+    /// asked about, not archived, and the bot a member, or a DM. Slack not
+    /// finding the conversation for the bot, refusing the bot, or no longer
+    /// accepting its token is a no too; only a failure that may pass, as a
+    /// rate limit or a network error, is an error. Such a no is logged as
+    /// a warning with Slack's error, since a revoked token or a missing
+    /// scope looks like it. A yes is kept for [`MEMBERSHIP_TTL`], and a no
+    /// drops it.
+    async fn member(&self, channel: &ConversationId) -> Result<bool> {
+        let info = match self.api.conversation_info(channel).await {
+            Ok(info) => Some(info),
+            Err(
+                err @ (SurfaceError::NotFound(_)
+                | SurfaceError::Forbidden(_)
+                | SurfaceError::Unauthorized),
+            ) => {
+                tracing::warn!(%channel, error = %err, "Slack refused to say whether the bot is in a conversation; taking it as no");
+                None
+            }
+            Err(err) => return Err(err),
+        };
+        let member = info.is_some_and(|info| {
+            info.id == *channel
+                && !info.is_archived
+                && (info.is_member || info.is_im || info.is_mpim)
+        });
+        let mut member_of = self.lock_member_of();
+        if member {
+            if member_of.len() >= MAX_MEMBERSHIPS {
+                member_of.clear();
+            }
+            member_of.insert(channel.clone(), Instant::now() + MEMBERSHIP_TTL);
+        } else {
+            member_of.remove(channel);
+        }
+        Ok(member)
+    }
+
     fn channel<'a>(&self, conv: &'a ConvRef) -> Result<&'a ConversationId> {
         if conv.surface != SurfaceKind::Slack || conv.team != *self.directory.team() {
             return Err(SurfaceError::Api(
@@ -376,15 +429,21 @@ impl Surface for SlackSurface {
         Err(SurfaceError::Unsupported("events"))
     }
 
-    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
+    /// Posts the mrkdwn `text`. Its mentions are read as Slack's copy of it
+    /// is ([`normalize::mentions`]), so both deliveries of a post hand off
+    /// to the same agents.
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
         let channel = self.channel(&to.conv)?;
         let ts = self
             .api
             .post_message(channel, to.thread_root.as_ref(), text)
             .await?;
-        Ok(MsgRef {
-            conv: to.conv.clone(),
-            id: ts,
+        Ok(Posted {
+            msg: MsgRef {
+                conv: to.conv.clone(),
+                id: ts,
+            },
+            mentions: normalize::mentions(text, None),
         })
     }
 
@@ -404,10 +463,29 @@ impl Surface for SlackSurface {
     }
 
     /// Slack never joins a bot to a conversation it posts in; it refuses
-    /// the post with `not_in_channel` instead. So this only checks that the
-    /// conversation is in this surface's workspace.
+    /// the post with `not_in_channel` instead. So this checks that the
+    /// conversation is in this surface's workspace and, with
+    /// `conversations.info`, that the bot is a member, or that it is a DM,
+    /// and that it isn't archived. Slack's yes is trusted for
+    /// [`MEMBERSHIP_TTL`]; a no is asked again each time, so a bot just
+    /// added posts at once.
     async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
-        self.channel(conv).map(|_| true)
+        let channel = self.channel(conv)?;
+        if self
+            .lock_member_of()
+            .get(channel)
+            .is_some_and(|until| *until > Instant::now())
+        {
+            return Ok(true);
+        }
+        self.member(channel).await
+    }
+
+    /// Asks Slack as [`can_post`](Self::can_post) does, whatever it said
+    /// lately, and keeps the answer: a no forgets an earlier yes.
+    async fn can_post_now(&self, conv: &ConvRef) -> Result<bool> {
+        let channel = self.channel(conv)?;
+        self.member(channel).await
     }
 
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {
@@ -451,7 +529,8 @@ impl Surface for SlackSurface {
     /// 3. The message is read back whole with [`WebApi::message`], in the
     ///    thread the event names, and normalized with
     ///    [`normalize::read_back`], the ingress's rules, with this binding's
-    ///    bot user: subtypes, sender, mentions from `text` and `blocks`,
+    ///    bot user: subtypes, sender, mentions (from `text` and `blocks`,
+    ///    a bot's from `text` alone, none with a backtick on each side),
     ///    thread, files and whether the message addresses the bot: outside
     ///    a one-to-one DM, a mention of the bot or a thread reply under its
     ///    root. A bot known only by its bot id is named by its user, as

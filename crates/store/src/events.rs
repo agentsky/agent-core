@@ -57,6 +57,25 @@ impl Store {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Whether the event `event_id` from `source` was
+    /// [recorded](Self::mark_event_processed) and not swept since. It
+    /// records nothing: a caller that goes on to handle the event still
+    /// marks it, and only that mark decides.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails.
+    pub async fn event_processed(&self, source: &str, event_id: &str) -> Result<bool> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM processed_events WHERE source = ? AND event_id = ?")
+                .bind(source)
+                .bind(event_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(found.is_some())
+    }
+
     /// Deletes what has expired at `now`: pending logins whose expiry is not
     /// after `now`, processed events recorded more than their retention
     /// before it, and per-thread usage and limit notices older than

@@ -16,15 +16,16 @@ use axum::{Json, Router};
 use core_types::{
     Ack, AskAgentRequest, AttachRequest, AttachResponse, CtlError, CtlErrorCode, CtlRequest,
     Cursor, HistoryRequest, HistoryResponse, LockRequest, LockResponse, MsgRef, OutFile,
-    PostRequest, PrivateRequest, PrivateResponse, ReactRequest, SurfaceError, TurnKind,
+    PostRequest, PrivateRequest, PrivateResponse, ReactRequest, ReplyTarget, ScopeKey,
+    SurfaceError, TurnKind,
 };
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
-use store::{CtlToken, CtlTurn, TokenHash};
+use store::{CtlToken, CtlTurn, TokenHash, Visibility};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt as _;
 
-use super::outbox::{QueuedPost, QueuedReaction};
+use super::outbox::{MAX_HAND_OFFS, Outbox, QueuedPost, QueuedReaction};
 use super::target;
 use super::token::{MAX_PRESENTED_LEN, hash_token};
 use super::{Ctl, MAX_POST_BYTES};
@@ -405,23 +406,40 @@ async fn post_message(
             format!("the message is over {MAX_POST_BYTES} bytes"),
         ));
     }
-    let text_len = request.text.len();
-    ctl.queue(&caller, |outbox| {
-        outbox
-            .push_post(QueuedPost {
-                to,
-                text: request.text,
-            })
-            .then_some(())
-            .ok_or_else(|| {
-                error(
-                    CtlErrorCode::Refused,
-                    format!(
-                        "this turn has already queued {} messages",
-                        super::outbox::MAX_POSTS
-                    ),
-                )
-            })
+    queue_post(
+        &ctl,
+        &caller,
+        QueuedPost {
+            to,
+            text: request.text,
+            asks: None,
+        },
+        |_| Ok(()),
+    )?;
+    Ok(Json(Ack {}))
+}
+
+/// Queues `post` for delivery after `caller`'s turn, unless the turn has
+/// queued [`MAX_POSTS`](super::outbox::MAX_POSTS) already or `allowed`
+/// refuses, which reads the turn's outbox in the same critical section.
+fn queue_post(
+    ctl: &Ctl,
+    caller: &Authorized,
+    post: QueuedPost,
+    allowed: impl FnOnce(&Outbox) -> Result<(), ApiError>,
+) -> Result<(), ApiError> {
+    let text_len = post.text.len();
+    ctl.queue(caller, |outbox| {
+        allowed(outbox)?;
+        outbox.push_post(post).then_some(()).ok_or_else(|| {
+            error(
+                CtlErrorCode::Refused,
+                format!(
+                    "this turn has already queued {} messages",
+                    super::outbox::MAX_POSTS
+                ),
+            )
+        })
     })?;
     tracing::debug!(
         session = %caller.token.session,
@@ -429,7 +447,7 @@ async fn post_message(
         text_len,
         "agentctl queued a post"
     );
-    Ok(Json(Ack {}))
+    Ok(())
 }
 
 /// `POST /v1/react`: queues a reaction to a message in this conversation.
@@ -617,12 +635,166 @@ async fn lock(
     Ok(Json(response))
 }
 
-/// `POST /v1/ask-agent`: not available until agent-to-agent hand-off (T34).
-async fn ask_agent(Caller(_): Caller) -> ApiError {
-    error(
-        CtlErrorCode::NotAvailable,
-        "agentctl ask-agent is not available yet",
-    )
+/// `POST /v1/ask-agent`: queues a post in this thread, as the calling
+/// agent, that mentions the agent asked for and gives it the task, and
+/// returns at once. After the turn, the post goes out with the turn's
+/// other queued posts, recorded with the turn's requester and hop, and the
+/// pipeline hands it off to that agent as it does any reply that mentions
+/// another agent, at the next hop.
+///
+/// Only in a channel or a group DM, where another agent can answer. The
+/// agent is one with a bot on this surface and team that the turn's
+/// requester may see (public ones, and the requester's own), named by its
+/// bot's handle written as a mention (`@handle` or Slack's `<@…>`), or by
+/// a bare word that is its name or handle; a bare word that fits several
+/// agents, as one's name and another's handle can on Rocket.Chat, is
+/// refused with each one's handle, name, and whether it is the
+/// requester's own or public. The post is the handle and a colon, alone
+/// on its first paragraph, then the task: no word or table of the task is
+/// read as part of the mention, and the renderers resolve a managed bot's
+/// handle before anyone's name. A turn asks each agent once: the other
+/// agent takes one turn for this turn however many of its posts mention
+/// it. Only an earlier `ask-agent` counts as asking, never an
+/// `agentctl post` whose text looks like one. Such a plain post that
+/// mentions the agent still spends the hop: the agent runs once per
+/// `(agent, turn)`, on whichever of the turn's posts mentioning it comes
+/// first, so a plain post queued before the `ask-agent` is the one it
+/// answers, and the task goes unread. A turn asks at most
+/// [`MAX_HAND_OFFS`] agents, and each one it asks keeps its place among
+/// them, whatever the turn's other posts mention.
+async fn ask_agent(
+    State(ctl): State<Ctl>,
+    Caller(caller): Caller,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<Ack>, ApiError> {
+    let request: AskAgentRequest = json_body(body, "ask-agent")?;
+    if !matches!(
+        caller.token.volume.scope,
+        ScopeKey::Channel(_) | ScopeKey::GroupDm(_)
+    ) {
+        return Err(error(
+            CtlErrorCode::Refused,
+            "agentctl ask-agent works only in a channel or a group DM, where another agent can answer",
+        ));
+    }
+    let task = request.task.trim();
+    if task.is_empty() {
+        return Err(error(CtlErrorCode::BadRequest, "the task is empty"));
+    }
+    let (wanted, mention) = agent_handle(&request.agent);
+    if wanted.is_empty() {
+        return Err(error(CtlErrorCode::BadRequest, "name the agent to ask"));
+    }
+    let conv = &caller.turn.thread.conv;
+    let asker = caller.turn.requester.member;
+    let visible: Vec<_> = ctl
+        .store()
+        .directory(conv.surface, &conv.team, None)
+        .await
+        .map_err(|err| internal("reading the agent directory", &err))?
+        .into_iter()
+        .filter(|entry| {
+            entry.agent.visibility == Visibility::Public || Some(entry.agent.owner) == asker
+        })
+        .filter_map(|entry| {
+            Some((
+                entry.agent.id,
+                entry.handle(conv.surface)?,
+                entry.agent.name,
+                Some(entry.agent.owner) == asker,
+            ))
+        })
+        .collect();
+    let found: Vec<_> = visible
+        .iter()
+        .filter(|(_, handle, name, _)| {
+            handle.eq_ignore_ascii_case(wanted) || (!mention && name.eq_ignore_ascii_case(wanted))
+        })
+        .collect();
+    let (asked, handle) = match found.as_slice() {
+        [] => {
+            return Err(error(
+                CtlErrorCode::NotFound,
+                format!("no agent called {wanted} has a bot here"),
+            ));
+        }
+        [(agent, _, _, _)] if *agent == caller.token.agent => {
+            return Err(error(CtlErrorCode::Refused, "an agent can't ask itself"));
+        }
+        [(agent, handle, _, _)] => (*agent, handle),
+        several => {
+            let handles: Vec<String> = several
+                .iter()
+                .map(|(_, handle, name, yours)| {
+                    let whose = if *yours { "yours" } else { "public" };
+                    format!("@{handle} ({name}, {whose})")
+                })
+                .collect();
+            return Err(error(
+                CtlErrorCode::BadRequest,
+                format!(
+                    "several agents go by {wanted}; name one by its handle, with its @: {}",
+                    handles.join(", ")
+                ),
+            ));
+        }
+    };
+    let text = format!("@{handle}:\n\n{task}");
+    if text.len() > MAX_POST_BYTES {
+        return Err(error(
+            CtlErrorCode::TooLarge,
+            format!("the task is over {MAX_POST_BYTES} bytes"),
+        ));
+    }
+    let to = ReplyTarget::from(caller.turn.thread.clone());
+    let post = QueuedPost {
+        to,
+        text,
+        asks: Some(asked),
+    };
+    queue_post(&ctl, &caller, post, |outbox| {
+        if outbox.posts().iter().any(|post| post.asks == Some(asked)) {
+            return Err(error(
+                CtlErrorCode::Refused,
+                format!(
+                    "this turn already asked @{handle}, which answers a turn once: put everything in one task"
+                ),
+            ));
+        }
+        if outbox
+            .posts()
+            .iter()
+            .filter(|post| post.asks.is_some())
+            .count()
+            >= MAX_HAND_OFFS
+        {
+            return Err(error(
+                CtlErrorCode::Refused,
+                format!(
+                    "this turn already asked as many agents as one turn hands off to ({MAX_HAND_OFFS})"
+                ),
+            ));
+        }
+        Ok(())
+    })?;
+    Ok(Json(Ack {}))
+}
+
+/// The name or handle `agent` asks for, without the `@` of a mention, or
+/// the `<@` and `>` of a Slack one and its `|label`, and whether it was
+/// written as a mention, which names a handle only.
+fn agent_handle(agent: &str) -> (&str, bool) {
+    let agent = agent.trim();
+    if let Some(inner) = agent
+        .strip_prefix("<@")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        return (inner.split('|').next().unwrap_or(inner).trim(), true);
+    }
+    match agent.strip_prefix('@') {
+        Some(handle) => (handle.trim(), true),
+        None => (agent, false),
+    }
 }
 
 /// `POST /v1/private`: records a consent for the task, with the files it

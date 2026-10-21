@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use core_types::surface_trait::Result;
 use core_types::{
     Binding, Caps, ConvRef, ConversationId, Cursor, InboundEvent, Limit, MemberKey, MessageId, Msg,
-    MsgRef, OutFile, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, TeamId, ThreadKey,
-    UserId,
+    MsgRef, OutFile, Posted, ReplyTarget, Sender, Surface, SurfaceError, SurfaceKind, TeamId,
+    ThreadKey, UserId,
 };
 use render::MentionDirectory;
 use time::OffsetDateTime;
@@ -516,15 +516,18 @@ impl Surface for RocketChatSurface {
         Err(SurfaceError::Closed)
     }
 
-    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
+    async fn post(&self, to: &ReplyTarget, text: &str) -> Result<Posted> {
         let room = self.member_room(&to.conv).await?;
         let posted = self
             .rest
             .post_message(room, text, to.thread_root.as_ref())
             .await?;
-        Ok(MsgRef {
-            conv: to.conv.clone(),
-            id: posted.id,
+        Ok(Posted {
+            mentions: normalize::mentions(&posted),
+            msg: MsgRef {
+                conv: to.conv.clone(),
+                id: posted.id,
+            },
         })
     }
 

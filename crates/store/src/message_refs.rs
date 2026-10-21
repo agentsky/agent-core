@@ -8,7 +8,7 @@ use core_types::{
 use sqlx::SqliteConnection;
 use time::OffsetDateTime;
 
-use crate::{Result, Store, StoreError, from_unix, parse_column, to_unix};
+use crate::{NewHandOff, Result, Store, StoreError, from_unix, parse_column, to_unix};
 
 const TABLE: &str = "message_refs";
 
@@ -16,7 +16,8 @@ const TABLE: &str = "message_refs";
 macro_rules! columns {
     () => {
         "session_id, short_id, surface, team_id, conversation, thread_root, platform_ref, \
-         agent_id, turn_id, requester_member, requester_key, hop, posted_at, consent_id"
+         agent_id, turn_id, requester_member, requester_key, hop, posted_at, consent_id, \
+         hands_off"
     };
 }
 
@@ -42,6 +43,9 @@ pub struct NewMessageRef<'a> {
     /// The consent whose private task's result or outcome the message
     /// reports, if it does: a mention in it starts no agent's turn.
     pub consent: Option<ConsentId>,
+    /// Whether a mention in it hands off to the agent mentioned: a turn's
+    /// post in the turn's own thread, never a private task's.
+    pub hands_off: bool,
 }
 
 /// A `message_refs` row.
@@ -69,6 +73,8 @@ pub struct MessageRef {
     /// The consent whose private task's result or outcome the message
     /// reports, if it does.
     pub consent: Option<ConsentId>,
+    /// Whether a mention in it hands off to the agent mentioned.
+    pub hands_off: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -87,6 +93,7 @@ struct Row {
     hop: i64,
     posted_at: i64,
     consent_id: Option<String>,
+    hands_off: i64,
 }
 
 fn corrupt(column: &'static str) -> StoreError {
@@ -132,6 +139,7 @@ impl Row {
                 .consent_id
                 .map(|consent| parse_column(&consent, TABLE, "consent_id"))
                 .transpose()?,
+            hands_off: self.hands_off != 0,
         })
     }
 }
@@ -164,7 +172,8 @@ async fn in_session(
 async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Result<MessageRef> {
     let row: Row = sqlx::query_as(concat!(
         "UPDATE message_refs SET agent_id = ?, turn_id = ?, requester_member = ?, \
-         requester_key = ?, hop = ?, consent_id = ? WHERE session_id = ? AND surface = ? \
+         requester_key = ?, hop = ?, consent_id = ?, hands_off = ? WHERE session_id = ? \
+         AND surface = ? \
          AND team_id = ? AND conversation = ? AND platform_ref = ? RETURNING ",
         columns!()
     ))
@@ -174,6 +183,7 @@ async fn attribute(conn: &mut SqliteConnection, new: &NewMessageRef<'_>) -> Resu
     .bind(new.requester.key.to_string())
     .bind(i64::from(new.hop.0))
     .bind(new.consent.map(|consent| consent.to_string()))
+    .bind(i64::from(new.hands_off))
     .bind(new.session.to_string())
     .bind(new.msg.conv.surface.as_str())
     .bind(new.msg.conv.team.as_str())
@@ -205,42 +215,76 @@ impl Store {
         new: &NewMessageRef<'_>,
         now: OffsetDateTime,
     ) -> Result<MessageRef> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        if let Some(found) = in_session(&mut tx, new.session, new.msg).await? {
-            let row = match (found.agent, new.agent) {
-                (None, Some(_)) => attribute(&mut tx, new).await?,
-                _ => found,
-            };
-            tx.commit().await?;
-            return Ok(row);
-        }
-        let row: Row = sqlx::query_as(concat!(
-            "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
-             thread_root, platform_ref, agent_id, turn_id, requester_member, requester_key, hop, \
-             posted_at, consent_id) \
-             SELECT ?1, COALESCE(MAX(short_id), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, \
-             ?12, ?13 FROM message_refs WHERE session_id = ?1 RETURNING ",
-            columns!()
-        ))
-        .bind(new.session.to_string())
-        .bind(new.msg.conv.surface.as_str())
-        .bind(new.msg.conv.team.as_str())
-        .bind(new.msg.conv.conversation.as_str())
-        .bind(new.thread_root.map_or("", MessageId::as_str))
-        .bind(new.msg.id.as_str())
-        .bind(new.agent.map(|agent| agent.to_string()))
-        .bind(new.turn.map(|turn| turn.to_string()))
-        .bind(new.requester.member.map(|member| member.to_string()))
-        .bind(new.requester.key.to_string())
-        .bind(i64::from(new.hop.0))
-        .bind(to_unix(now))
-        .bind(new.consent.map(|consent| consent.to_string()))
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        row.into_ref()
+        Ok(self.record_post(new, now, &[]).await?.0)
     }
 
+    /// Records `new` as [`record_message_ref`](Self::record_message_ref)
+    /// does, and in the same transaction a `hand_offs` row for each of
+    /// `hand_offs`, so a post that hands off is never recorded without its
+    /// hand-offs. Returns the row, and the hand-offs' ids in order.
+    ///
+    /// # Errors
+    ///
+    /// As [`record_message_ref`](Self::record_message_ref), and
+    /// [`StoreError::Database`] if a hand-off can't be inserted, as when
+    /// its agent doesn't exist; then nothing is recorded.
+    pub async fn record_post(
+        &self,
+        new: &NewMessageRef<'_>,
+        now: OffsetDateTime,
+        hand_offs: &[NewHandOff<'_>],
+    ) -> Result<(MessageRef, Vec<i64>)> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = match in_session(&mut tx, new.session, new.msg).await? {
+            Some(found) => match (found.agent, new.agent) {
+                (None, Some(_)) => attribute(&mut tx, new).await?,
+                _ => found,
+            },
+            None => insert(&mut tx, new, now).await?,
+        };
+        let mut ids = Vec::with_capacity(hand_offs.len());
+        for hand_off in hand_offs {
+            ids.push(crate::hand_offs::insert(&mut *tx, hand_off).await?);
+        }
+        tx.commit().await?;
+        Ok((row, ids))
+    }
+}
+
+/// Inserts `new`, posted at `now`, as the next short id of its session.
+async fn insert(
+    tx: &mut SqliteConnection,
+    new: &NewMessageRef<'_>,
+    now: OffsetDateTime,
+) -> Result<MessageRef> {
+    let row: Row = sqlx::query_as(concat!(
+        "INSERT INTO message_refs (session_id, short_id, surface, team_id, conversation, \
+             thread_root, platform_ref, agent_id, turn_id, requester_member, requester_key, hop, \
+             posted_at, consent_id, hands_off) \
+             SELECT ?1, COALESCE(MAX(short_id), 0) + 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, \
+             ?12, ?13, ?14 FROM message_refs WHERE session_id = ?1 RETURNING ",
+        columns!()
+    ))
+    .bind(new.session.to_string())
+    .bind(new.msg.conv.surface.as_str())
+    .bind(new.msg.conv.team.as_str())
+    .bind(new.msg.conv.conversation.as_str())
+    .bind(new.thread_root.map_or("", MessageId::as_str))
+    .bind(new.msg.id.as_str())
+    .bind(new.agent.map(|agent| agent.to_string()))
+    .bind(new.turn.map(|turn| turn.to_string()))
+    .bind(new.requester.member.map(|member| member.to_string()))
+    .bind(new.requester.key.to_string())
+    .bind(i64::from(new.hop.0))
+    .bind(to_unix(now))
+    .bind(new.consent.map(|consent| consent.to_string()))
+    .bind(i64::from(new.hands_off))
+    .fetch_one(&mut *tx)
+    .await?;
+    row.into_ref()
+}
+
+impl Store {
     /// Whether agentd posted anything for consent `consent`: a private
     /// task's result, or its outcome, each of which is its last word.
     ///
@@ -432,6 +476,7 @@ mod tests {
             requester,
             hop: Hop::ZERO,
             consent: None,
+            hands_off: false,
         }
     }
 
@@ -498,6 +543,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_post_and_its_hand_offs_are_recorded_together_or_not_at_all() {
+        let store = memory_store().await;
+        let owner = store
+            .ensure_member(&member_key("u1"), "Ada", at(1))
+            .await
+            .unwrap();
+        let writer = agent(&store, owner, "writer").await;
+        let payer = requester("U1", Some(owner));
+        let (first, second) = (msg("C1", "1.1"), msg("C1", "2.1"));
+        let post = |msg| NewMessageRef {
+            session: SessionId::new_v4(),
+            msg,
+            thread_root: None,
+            agent: Some(writer),
+            turn: Some(TurnId::new_v4()),
+            requester: &payer,
+            hop: Hop::ZERO,
+            consent: None,
+            hands_off: true,
+        };
+        let hand_off = |agent| NewHandOff {
+            agent,
+            event_json: "{}",
+            created_at: at(2),
+            due_at: at(3),
+        };
+        let (row, ids) = store
+            .record_post(&post(&first), at(2), &[hand_off(writer)])
+            .await
+            .unwrap();
+        assert!(row.hands_off);
+        let due = store
+            .take_due_hand_offs(at(3), std::time::Duration::from_secs(60), at(1), 10, &[])
+            .await
+            .unwrap();
+        assert_eq!(due.taken.iter().map(|h| h.id).collect::<Vec<_>>(), ids);
+
+        assert!(
+            store
+                .record_post(&post(&second), at(2), &[hand_off(AgentId::new_v4())])
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store.posted_message_ref(&second).await.unwrap(),
+            None,
+            "a hand-off that can't be recorded takes its post's record with it"
+        );
+    }
+
+    #[tokio::test]
     async fn a_posted_message_is_attributed_once_and_found_by_its_ref() {
         let store = memory_store().await;
         let (session, other) = (SessionId::new_v4(), SessionId::new_v4());
@@ -518,6 +614,7 @@ mod tests {
                     requester: &payer,
                     hop: Hop(2),
                     consent: None,
+                    hands_off: true,
                 },
                 at(5),
             )
@@ -527,6 +624,7 @@ mod tests {
         assert_eq!(posted.turn, Some(turn));
         assert_eq!(posted.requester, payer);
         assert_eq!(posted.hop, Hop(2));
+        assert!(posted.hands_off);
         assert_eq!(
             store.posted_message_ref(&reply).await.unwrap(),
             Some(posted.clone())
@@ -554,6 +652,7 @@ mod tests {
                     requester: &payer,
                     hop: Hop::ZERO,
                     consent: None,
+                    hands_off: false,
                 },
                 at(7),
             )
@@ -570,6 +669,7 @@ mod tests {
                     requester: &payer,
                     hop: Hop::ZERO,
                     consent: None,
+                    hands_off: false,
                 },
                 at(8),
             )
@@ -653,6 +753,7 @@ mod tests {
             requester: &payer,
             hop: Hop(3),
             consent: None,
+            hands_off: true,
         };
         store
             .record_message_ref(&inbound(session, &msg("C1", "1.1"), None, &sender), at(1))
@@ -676,6 +777,8 @@ mod tests {
         assert_eq!(attributed.turn, Some(turn));
         assert_eq!(attributed.requester, payer);
         assert_eq!(attributed.hop, Hop(3));
+        assert!(attributed.hands_off, "the post's own row hands off");
+        assert!(!shown.hands_off);
         assert_eq!(
             store.posted_message_ref(&reply).await.unwrap(),
             Some(attributed.clone())
@@ -740,6 +843,7 @@ mod tests {
                             requester: &payer,
                             hop: Hop::ZERO,
                             consent: None,
+                            hands_off: false,
                         },
                         at(20),
                     )

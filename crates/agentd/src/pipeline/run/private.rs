@@ -436,6 +436,7 @@ impl Pipeline {
             credential,
             target: ReplyTarget::from(consent.thread.clone()),
             answering: Answering::PrivateTask(consent.id),
+            hand_offs: None,
         }
         .report(turn, report)
         .await;
@@ -489,8 +490,9 @@ impl Pipeline {
             credential: CredentialRef::Community,
             target: ReplyTarget::from(consent.thread.clone()),
             answering: Answering::PrivateTask(consent.id),
+            hand_offs: None,
         };
-        match delivery.post(None, text).await {
+        match delivery.post(None, text, &mut Handing::default()).await {
             Ok(()) | Err(Lost::Row) => {}
             Err(Lost::Chunk) => return Err(PipelineError::NotPosted),
         }
