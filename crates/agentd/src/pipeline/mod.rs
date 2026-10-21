@@ -12,11 +12,10 @@
 //!   those hooks.
 //! - [`connect_docker`]: the [`DockerSandbox`] `[sandbox]` names, with the
 //!   containers a previous run left stopped.
-//! - [`NoCommunityKey`]: the credential proxy's community key until one can
-//!   be set.
 //!
 //! [`Ctl`]: crate::ctl::Ctl
 
+mod billing;
 mod hooks;
 mod keyed;
 mod message;
@@ -29,21 +28,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use cred_proxy::{CommunityKey, CommunityKeyError};
 use runner::{PoolConfig, ProcessConfig, SessionConfig, SessionManager};
 use sandbox::{DockerSandbox, Sandbox};
-use secrecy::SecretString;
 
 use crate::app::App;
 use crate::commands::SessionControl;
 use crate::config::Config;
 
+pub use billing::{
+    COMMUNITY_KEY_REFUSED_TEXT, COMMUNITY_USAGE_LIMIT_TEXT, FAILURE_DM_INTERVAL,
+    LOGIN_EXPIRED_TEXT, USAGE_LIMIT_TEXT,
+};
 pub use hooks::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, ProcessHandle};
 pub use message::HISTORY_LIMIT;
 pub use run::{
     DEFAULT_MAX_PENDING, DEFAULT_QUEUE_PER_THREAD, DEFAULT_WORKING_EMOJI, DELIVERY_FAILED_TEXT,
-    FAILED_TEXT, LOGIN_EXPIRED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TIMED_OUT_TEXT,
-    TRUNCATED_NOTE, USAGE_LIMIT_TEXT,
+    FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TIMED_OUT_TEXT, TRUNCATED_NOTE,
 };
 pub use surfaces::StoreSurfaces;
 
@@ -209,18 +209,6 @@ pub async fn connect_docker(app: &App) -> anyhow::Result<Option<Arc<dyn Sandbox>
     Ok(Some(Arc::new(docker)))
 }
 
-/// The community API key, until an admin can set one (T26): there is none,
-/// so a turn pointed at it is refused by the proxy with 401.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct NoCommunityKey;
-
-#[async_trait::async_trait]
-impl CommunityKey for NoCommunityKey {
-    async fn api_key(&self) -> Result<SecretString, CommunityKeyError> {
-        Err(CommunityKeyError::NotConfigured)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,14 +243,6 @@ mod tests {
                 .unwrap();
             assert!(no_proxy.split(',').any(|name| name == host), "{url}");
         }
-    }
-
-    #[tokio::test]
-    async fn there_is_no_community_key_yet() {
-        assert!(matches!(
-            NoCommunityKey.api_key().await,
-            Err(CommunityKeyError::NotConfigured)
-        ));
     }
 
     #[tokio::test]

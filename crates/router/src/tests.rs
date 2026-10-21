@@ -30,6 +30,7 @@ struct FakeView {
     refs: HashMap<MsgRef, Attribution>,
     members: HashMap<MemberKey, MemberId>,
     linked: HashSet<MemberId>,
+    broken: HashSet<MemberId>,
     community_key: bool,
     owners: HashMap<AgentId, MemberId>,
     states: HashMap<AgentId, AgentState>,
@@ -58,8 +59,14 @@ impl RouterView for FakeView {
         (!self.members_unavailable).then(|| self.members.get(key).copied())
     }
 
-    fn is_linked(&self, member: MemberId) -> bool {
-        self.linked.contains(&member)
+    fn link_state(&self, member: MemberId) -> LinkState {
+        if self.broken.contains(&member) {
+            LinkState::Broken
+        } else if self.linked.contains(&member) {
+            LinkState::Linked
+        } else {
+            LinkState::Unlinked
+        }
     }
 
     fn community_key_configured(&self) -> bool {
@@ -663,6 +670,49 @@ fn unlinked_owner_gets_link_prompt_never_the_community_key() {
             }
         );
     }
+}
+
+#[test]
+fn a_broken_link_gets_a_relink_prompt_never_the_community_key() {
+    let mut w = World::new();
+    w.view.broken.insert(w.linked);
+    w.view.community_key = true;
+    for event in [w.mention(&w.linked_key), w.dm(&w.linked_key)] {
+        assert_eq!(
+            w.route(&event),
+            Decision::RelinkPrompt {
+                requester: w.requester(&w.linked_key)
+            }
+        );
+    }
+    let requester = w.requester(&w.linked_key.clone());
+    let event = w.b_mentions_a(requester.clone(), Hop::ZERO);
+    assert_eq!(
+        w.route(&event),
+        Decision::RelinkPrompt { requester },
+        "a hop's inherited requester with a broken link is asked to relink"
+    );
+
+    w.view.broken.insert(w.owner);
+    for event in [w.dm(&w.owner_key), w.mention(&w.owner_key)] {
+        assert_eq!(
+            w.route(&event),
+            Decision::RelinkPrompt {
+                requester: w.requester(&w.owner_key)
+            }
+        );
+    }
+
+    assert_eq!(
+        w.route(&w.mention(&w.known_key)),
+        run(
+            w.requester(&w.known_key),
+            Hop::ZERO,
+            CredentialRef::Community,
+            ScopeKind::Channel
+        ),
+        "a member with no link still runs on the community key"
+    );
 }
 
 #[test]
@@ -1364,6 +1414,9 @@ fn decision_matches_exhaustively() {
         match decision {
             Decision::Ignore(reason) => format!("ignore: {reason}"),
             Decision::LinkPrompt { requester } => format!("link prompt for {}", requester.key),
+            Decision::RelinkPrompt { requester } => {
+                format!("relink prompt for {}", requester.key)
+            }
             Decision::Run {
                 requester,
                 hop,
@@ -1389,6 +1442,11 @@ fn decision_matches_exhaustively() {
     );
     assert!(
         describe(&w.route(&w.dm(&w.owner_key))).starts_with("run for slack:T1:UOWNER at hop 0")
+    );
+    w.view.broken.insert(w.linked);
+    assert_eq!(
+        describe(&w.route(&w.mention(&w.linked_key))),
+        "relink prompt for slack:T1:ULINKED"
     );
     w.view.states.insert(w.a, AgentState::Paused);
     assert_eq!(
@@ -1429,7 +1487,8 @@ fn reasons_have_distinct_log_text() {
 /// One point of the invariant grid.
 #[derive(Debug, Clone, Copy)]
 struct Case {
-    owner_linked: bool,
+    owner_link: LinkState,
+    linked_broken: bool,
     community_key: bool,
     kind: ConvKind,
     binding_is_a: bool,
@@ -1462,7 +1521,8 @@ fn no_combination_breaks_the_billing_and_privacy_invariants() {
     ];
     let bools = [false, true];
     let mut runs = 0;
-    for owner_linked in bools {
+    let links = [LinkState::Unlinked, LinkState::Linked, LinkState::Broken];
+    for (owner_link, linked_broken) in links.into_iter().flat_map(|l| bools.map(|b| (l, b))) {
         for community_key in bools {
             for kind in [ConvKind::Dm, ConvKind::GroupDm, ConvKind::Channel] {
                 for binding_is_a in bools {
@@ -1472,7 +1532,8 @@ fn no_combination_breaks_the_billing_and_privacy_invariants() {
                                 for sender in senders {
                                     for recorded_member in bools {
                                         runs += check_invariants(Case {
-                                            owner_linked,
+                                            owner_link,
+                                            linked_broken,
                                             community_key,
                                             kind,
                                             binding_is_a,
@@ -1496,8 +1557,17 @@ fn no_combination_breaks_the_billing_and_privacy_invariants() {
 
 fn check_invariants(case: Case) -> usize {
     let mut w = World::new();
-    if !case.owner_linked {
-        w.view.linked.remove(&w.owner);
+    match case.owner_link {
+        LinkState::Unlinked => {
+            w.view.linked.remove(&w.owner);
+        }
+        LinkState::Linked => {}
+        LinkState::Broken => {
+            w.view.broken.insert(w.owner);
+        }
+    }
+    if case.linked_broken {
+        w.view.broken.insert(w.linked);
     }
     w.view.community_key = case.community_key;
     let people = [
@@ -1569,13 +1639,24 @@ fn check_invariants(case: Case) -> usize {
         side,
     } = decision
     else {
-        if let Decision::LinkPrompt { requester } = &decision {
-            assert!(
-                !requester
-                    .member
-                    .is_some_and(|member| w.view.is_linked(member)),
-                "a linked requester never gets a link prompt: {case:?}"
-            );
+        let state = |requester: &Requester| {
+            requester
+                .member
+                .map_or(LinkState::Unlinked, |member| w.view.link_state(member))
+        };
+        match &decision {
+            Decision::LinkPrompt { requester } => assert_eq!(
+                state(requester),
+                LinkState::Unlinked,
+                "only a requester with no link gets a link prompt: {case:?}"
+            ),
+            Decision::RelinkPrompt { requester } => assert_eq!(
+                state(requester),
+                LinkState::Broken,
+                "only a requester whose link broke gets a relink prompt: {case:?}"
+            ),
+            Decision::Ignore(_) | Decision::Refuse(_) => {}
+            Decision::Run { .. } => unreachable!(),
         }
         return 0;
     };
@@ -1606,13 +1687,18 @@ fn check_invariants(case: Case) -> usize {
                 Some(member),
                 "runs on the requester's own account: {case:?}"
             );
-            assert!(w.view.is_linked(member));
+            assert_eq!(w.view.link_state(member), LinkState::Linked);
         }
         CredentialRef::Community => {
             assert!(case.community_key);
             assert_eq!(side, Side::Public);
             assert_ne!(requester.member, Some(w.owner));
-            assert!(!requester.member.is_some_and(|m| w.view.is_linked(m)));
+            assert!(
+                requester
+                    .member
+                    .is_none_or(|m| w.view.link_state(m) == LinkState::Unlinked),
+                "only a requester with no link runs on the community key: {case:?}"
+            );
         }
     }
     if from_person {

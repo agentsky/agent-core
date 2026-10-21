@@ -798,6 +798,15 @@ async fn an_owners_dm_whose_member_lookup_fails_is_refused_not_run() {
             .is_err(),
         "the owner's member lookup fails"
     );
+    stack
+        .store()
+        .set_community_api_key(
+            &SecretString::from("sk-ant-api03-community-key"),
+            &key("bob"),
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
 
     stack.next_turn(Turn::reply("Ran anyway."));
     let requests = stack.fake.message_requests().await.len();
