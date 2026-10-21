@@ -1,0 +1,12 @@
+# The images in images/ build from the repository root and need only the
+# Cargo workspace. Leaving out the rest keeps the build context small and
+# its cache stable; deploy/compose/data is agentd's data directory in the
+# development stack, owned by uid 10001 and not readable by the builder.
+.git
+.github
+.claude
+target
+deploy
+docs
+images
+scripts
