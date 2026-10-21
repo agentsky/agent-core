@@ -5197,10 +5197,11 @@ new one, is added. Either write comes before any process gets the turn; if it
 fails, the container is stopped and the turn fails, since otherwise a later
 turn could skip the clear it needs. A crash between a clear and its record
 costs one extra clear. A clear that fails, as one that runs out of time
-against a process still writing does (T17's remover gives a clear a
-minute), fails the start and so the turn with a `Sandbox` error and leaves
-the record as it was; what it removed stays removed, and the next start
-clears again and goes on from there.
+against a process still writing does (the clear and the repair of
+`settings.json` and `skills` after it share one minute of T17's remover
+per start), fails the start and so the turn with a `Sandbox` error and
+leaves the record as it was; what it removed stays removed, and the next
+start clears again and goes on from there.
 
 The warm container's own requester (`Held::requester`) is still checked as
 well: the record says whose turns used the files, and the held requester whose
