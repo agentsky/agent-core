@@ -1,9 +1,8 @@
 //! Rocket.Chat surface for agent-core.
+//!
+//! - [`rest`]: the REST client, used to create bot users, post, edit,
+//!   react, upload and read history.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn crate_name() {
-        assert_eq!(env!("CARGO_PKG_NAME"), "surface-rocketchat");
-    }
-}
+#![warn(missing_docs)]
+
+pub mod rest;
