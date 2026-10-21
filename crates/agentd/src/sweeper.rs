@@ -50,8 +50,7 @@ mod tests {
     use secrecy::SecretString;
 
     use super::*;
-    use crate::telemetry::tests::Captured;
-    use crate::telemetry::{LogFormat, subscriber};
+    use crate::telemetry::tests::global_logs;
 
     async fn store_with_expired_login() -> Store {
         let sealer = store::Sealer::from_base64(&store::Sealer::generate_key().unwrap()).unwrap();
@@ -113,23 +112,18 @@ mod tests {
     #[tokio::test]
     async fn logs_what_it_swept_and_failures() {
         let store = store_with_expired_login().await;
-        let captured = Captured::default();
-        let logs = subscriber(
-            LogFormat::Json,
-            tracing_subscriber::EnvFilter::new("debug"),
-            captured.clone(),
-        );
-        let _guard = tracing::subscriber::set_default(logs);
+        let logs = global_logs().tag();
 
         sweep_once(&store).await;
         sweep_once(&store).await;
         store.close().await;
         sweep_once(&store).await;
 
-        let out = captured.text();
+        let out = logs.snapshot();
         let lines: Vec<serde_json::Value> = out
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["target"] == "agentd::sweeper")
             .collect();
         assert_eq!(lines.len(), 2, "{out}");
         assert_eq!(lines[0]["fields"]["message"], "swept expired rows");

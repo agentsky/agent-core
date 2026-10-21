@@ -10,6 +10,8 @@
 //!   its stdin.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.
 //! - [`held`]: a wiremock responder that answers when the test says so.
+//! - [`Logs`]: a test binary's log lines, captured by one global
+//!   subscriber.
 //! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 //! - [`slack`]: Slack request signing and payload fixtures.
 //! - [`TempDir`]: a directory for one test, removed when the test ends.
@@ -21,6 +23,7 @@ pub mod child;
 pub mod claude;
 pub mod fixtures;
 pub mod held;
+pub mod logs;
 pub mod rocketchat;
 pub mod slack;
 pub mod surface;
@@ -29,5 +32,6 @@ mod temp_dir;
 pub use anthropic::{FakeAnthropic, fake_anthropic};
 pub use claude::{Turn, fake_claude_path, write_script};
 pub use held::{Held, Hold};
+pub use logs::{Logged, Logs};
 pub use surface::{Call, MockSurface, Op, UploadedFile};
 pub use temp_dir::TempDir;

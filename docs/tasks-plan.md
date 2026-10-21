@@ -1550,7 +1550,11 @@ Deliverables:
 - `ProcessSandbox`, for tests and Docker-less development: "containers" are
   directories under a temp root, `exec` spawns a local child process with the
   given environment and working directory, and `ip` returns `127.0.0.1`. It
-  isolates nothing, and says so in its rustdoc.
+  isolates nothing, and says so in its rustdoc. Since every running container
+  shares that address, it supports one running container at a time wherever
+  agentd binds something to an address (agentctl tokens, T15; credential
+  placeholders, T18), which revokes the other sessions' there
+  ([impl-notes](impl-notes.md#processsandbox-gives-every-container-one-address)).
 - `reap_orphans()` at startup: stop every container labeled `agentd.session`
   with this agentd's `agentd.instance`.
   Placeholder mappings and agentctl tokens don't survive a restart, so no
@@ -1814,42 +1818,59 @@ Deliverables:
 
 - A migration `…_sessions.sql`: `sessions` (`id`, `agent_id`, `surface`,
   `team_id`, `conversation`, `thread_root` not null, `scope_key`, `kind` of
-  `normal` or `private`, `started` bool, `last_turn_at`, `reset_at`).
+  `normal` or `private`, `consent_id` set exactly for `private` rows,
+  `started` bool, `maybe_started` bool, `created_at`, `last_turn_at`,
+  `reset_at`). `maybe_started` is set before a turn goes to an unstarted
+  session's CLI and cleared once the outcome says, so a turn cut off by a
+  restart resumes first
+  ([impl-notes](impl-notes.md#a-turn-cut-off-before-its-outcome-was-recorded)).
   - DMs store `thread_root = ''`, because SQLite treats NULLs as distinct in
     unique indexes.
   - A partial unique index on `(agent_id, surface, team_id, conversation,
     thread_root) WHERE kind = 'normal' AND reset_at IS NULL`, so a reset row
     doesn't collide with its replacement.
-- The `TurnHooks` trait, the runner's only way out:
-  - `process_starting(session, container_ip, kind) -> ProcessEnv`, which
-    returns the placeholder, the agentctl token and the proxy variables, all
-    as `SecretString`, for `LaunchSpec.placeholder` and `LaunchSpec.env`
+- The `TurnHooks` trait, the runner's only way out. Every call after
+  `process_starting` also gets the `Self::Process` value it returned for
+  that process, so a late call for an old process never touches the
+  session's new one, and `turn_finished` returns `Self::Finished` (T23's
+  outbox), which `run_turn` hands back
+  ([impl-notes](impl-notes.md#the-hooks-name-the-process-not-only-the-session)):
+  - `process_starting(session, container_ip, kind) -> (ProcessEnv,
+    Self::Process)`, where `ProcessEnv` holds the placeholder, the agentctl
+    token and the proxy variables, all as `SecretString`, for
+    `LaunchSpec.placeholder` and `LaunchSpec.env`
     (`BTreeMap<String, SecretString>`).
-  - `turn_starting(session, &TurnRequest)`, which points the placeholder at
-    the turn's credential and records the turn on the agentctl token.
-  - `turn_finished(session, turn)`, which clears the turn from the token and
+  - `turn_starting(session, process, &TurnRequest)`, which points the
+    placeholder at the turn's credential and records the turn on the
+    agentctl token.
+  - `turn_finished(session, process, turn)`, which clears the turn from the token and
     unpoints the placeholder. It is called on every exit from the turn:
     success, error, timeout, interrupt and cancellation. It completes before
     the session's queue slot is released, cancellation included, for example
     by running the turn body in a task the caller's drop doesn't cancel.
     Otherwise a late `turn_finished` for turn N could run after turn N+1's
     `turn_starting` and clear N+1's pointer.
-  - `process_stopping(session)`, which revokes the placeholder and the token. It
+  - `process_stopping(session, process)`, which revokes the placeholder and the token. It
     is called before the container is stopped, and again, idempotently, when the
     sandbox reports the container died.
 - `SessionManager`:
-  - `lookup_or_create(agent, thread_key) -> Session`. A new session id is a v4.
+  - `lookup_or_create(agent, thread_key, scope) -> Session`. A new session
+    id is a v4. A thread's live session on another scope is reset and
+    replaced, so a session never changes volume
+    ([impl-notes](impl-notes.md#lookup_or_create-needs-the-scope)).
   - A session is marked `started` after a turn whose `TurnStats::init_seen`
     is true, whatever its outcome, not when its process starts
     ([impl-notes](impl-notes.md#when-a-session-has-started)).
-  - A turn whose outcome is `TurnOutcome::resume_refused()` (a `--resume`
-    of a session with no transcript) resets the session to `--session-id`:
+  - A turn whose outcome is `TurnOutcome::resume_refused()` on a process
+    the turn started with `SessionStart::Resume` (a `--resume` of a session
+    with no transcript) resets the session to `--session-id`:
     the row is marked not started and the turn runs again, once, on a new
     process with `SessionStart::New` and the same id, since the CLI never
     read the message.
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
-  - `run_turn(session, TurnRequest) -> TurnOutcome`, serialized per session
+  - `run_turn(session, TurnRequest) -> TurnReport` (the `TurnOutcome` and
+    what `turn_finished` returned), serialized per session
     with a keyed queue. Turns queue in arrival order; steering is deferred.
 - Warm pool: one container and one `ClaudeProcess` per active session.
   - An idle reaper, configurable, default 15 minutes, calls
@@ -1859,18 +1880,50 @@ Deliverables:
     reused with a live mapping. The stream ends only after an `Err` item,
     which means deaths may have been missed: the pool subscribes again and
     compares `list_managed()` with the containers it holds.
-  - A per-scope container cap, default 4. Turns beyond it wait in a per-scope
-    queue.
-  - A global cap.
+  - A per-scope container cap, default 4, per volume. Turns beyond it wait in a per-scope
+    queue, after an idle container of the scope is stopped for them if
+    there is one
+    ([impl-notes](impl-notes.md#idle-containers-hold-places-under-the-caps)).
+    A busy session can keep a waiting one out for as long as it has turns;
+    making it yield is [deferred](#deferred-work) ("Fairness at the
+    per-scope cap").
+  - A global cap, default 32, which stops idle containers the same way.
+  - A container's mounts follow the turn's `Side` on the agent's `Private`
+    volume, and a turn with other mounts restarts the container
+    ([impl-notes](impl-notes.md#mounts-come-from-the-turns-side)).
 - Restart rule: if the next turn's `CredentialKind` or model differs from the
   running process's, stop the process and start a new one with `--resume`.
+  If the next turn's requester isn't the same party as the one whose turn
+  started the container, stop the container, which ends every process a turn
+  left running in it, and start a new one, whose process starts with
+  `--resume`.
+  Requesters are compared by `MemberKey`, so a requester whose account is
+  linked between two turns keeps the container. An agent-to-agent hop runs as
+  the requester it inherits, so it keeps a container started for that
+  requester
+  ([impl-notes](impl-notes.md#another-partys-turn-gets-a-new-container)).
+  The members of a group in `PoolConfig::requester_groups` count as one
+  requester. `sessions.files_requesters` (added by
+  `…_session_files_requesters.sql`) records the requesters whose turns have
+  used the session's files since they were last cleared. A turn whose
+  requester isn't the same party as every one of them (an empty or
+  unparsable record included), or whose warm container was started for
+  another party, gets a container that first removes every stray entry of
+  the session directory but its four subdirectories, empties `home/` and
+  `tmp/`, and removes everything in `claude/` but the transcript file and
+  its directory, which are kept whole. The record becomes that requester
+  alone; a group member missing from it is added. Either write comes
+  before any process gets the turn
+  ([impl-notes](impl-notes.md#a-change-of-party-clears-the-sessions-files)).
 - After a turn that leaves `ClaudeProcess::is_running()` false, or after
   `stop`, a process whose `may_be_alive()` is still true was killed without
   its exit being confirmed. Call `process_stopping` and stop the container
   before starting another process for the session, so two processes never
   share a transcript.
-- Private sessions: `create_private(agent, consent) -> Session` on the
-  agent's `Private` volume, always a fresh id. T33 uses it.
+- Private sessions: `create_private(agent, consent, thread) -> Session` on the
+  agent's `Private` volume, always a fresh id, where `thread` is where the
+  result goes. T33 uses it
+  ([impl-notes](impl-notes.md#create_private-needs-the-thread)).
 
 Acceptance:
 
@@ -1882,6 +1935,20 @@ Acceptance:
     transcript.
   - A credential-kind change restarts the process.
   - A model change restarts the process.
+  - Another requester's turn replaces the container; a turn of the same
+    requester, and an agent-to-agent hop carrying it, keep it, as does one
+    whose requester was linked to a member since.
+  - Another requester's turn clears the session's files, after an idle reap
+    or a restart too; the same requester's doesn't, and a member of its
+    group keeps the warm container and the files. A failure to record the
+    requester fails the turn and stops the container.
+  - Once a group is removed, the first member's turn clears what the
+    second member's left, whether the second used the first's warm
+    container or a new one after an idle reap. A failure to add a joining
+    member to the record fails its turn and stops the container.
+  - A record changed under a warm container (to another party, or NULL)
+    recycles the container and clears the files; another party's turn
+    gets a new container even when the record names it.
   - Reset starts with a new id.
   - A `--resume` the CLI refuses for want of a transcript reruns the turn
     with `--session-id`.
@@ -2014,7 +2081,9 @@ Deliverables:
   cap ([impl-notes](impl-notes.md#bollard-logs-request-bodies-at-debug-level)).
 - agentd's `TurnHooks` implementation (T21's trait): it mints and points
   placeholders with T18's `Registry`, and `turn_finished` calls
-  `Registry::unpoint`. It sets the egress proxy variables from
+  `Registry::unpoint`. Its `Process` holds the process's `PlaceholderId`
+  and agentctl token, and its `Finished` is the turn's outbox, which
+  `SessionManager::run_turn` returns in `TurnReport::finished`. It sets the egress proxy variables from
   T19 (`cred_proxy::EGRESS_ENV`), and issues agentctl tokens and records their turns with T15
   (`Ctl::issue_process_token`, `begin_turn`, `end_turn`, which returns the
   turn's outbox, and `revoke_process_token`). It builds `App` with a
@@ -2053,7 +2122,11 @@ Deliverables:
      `per_binding_delivery`, only the receiving binding's agent is a
      candidate, since each other agent gets its own copy.
   3. On `Run`, look up the session, build the turn message, and call
-     `SessionManager::run_turn`.
+     `SessionManager::run_turn`. `run_turn` returns
+     `RunnerError::SessionReset` when a reset or a scope-change replacement
+     lands between `lookup_or_create` and the turn reaching the front of the
+     session's queue. The pipeline then calls `lookup_or_create` again and
+     retries the turn once on the session it returns.
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
@@ -2146,7 +2219,9 @@ Deliverables:
   agent. With `here`, reset only the current conversation's session. This is
   valid only as `!agent` in a channel on Rocket.Chat or a slash command in that
   channel on Slack.
-- Reset stops a warm process first.
+- Reset stops a warm process first. `SessionManager::reset` (T21) does,
+  after the turns queued before it, and `SessionManager::is_warm` answers
+  whether a container is warm.
 
 Acceptance: tests for both commands, owner-only enforcement, and that the next
 turn after reset uses `--session-id` with a new id.
@@ -2620,7 +2695,7 @@ Deliverables:
 - Expiry: a sweeper marks cards `expired` after `[limits]
   consent_ttl` (default 24 hours) and posts the outcome to the thread.
 - Execution:
-  1. `SessionManager::create_private(agent, consent)` makes a fresh session on
+  1. `SessionManager::create_private(agent, consent, thread)` makes a fresh session on
      the owner's private volume.
   2. The turn message is only the task text plus the staged attachments,
      copied into the session's work directory. No thread transcript.
@@ -2628,7 +2703,10 @@ Deliverables:
   4. Mounts follow [Volumes and scopes](#volumes-and-scopes): a task the owner
      requested gets `shared/` read-write and `memory/`. A task a non-owner
      requested gets `shared/` read-only and no `memory/`, and its consent card
-     says it can read the owner's shared files.
+     says it can read the owner's shared files. The runner picks the mounts
+     from `TurnRequest.side`, so the task's turn sets it to `Side::Owner`
+     exactly when the consent's requester is the owner, and to `Side::Public`
+     otherwise. It never copies the side of the channel turn that asked.
   5. The turn recorded on the agentctl token has `TurnKind::PrivateTask`, so
      agentctl allows only `attach` (T15's rule).
 - Delivery: the final reply and attached files are posted to the recorded
@@ -2761,10 +2839,21 @@ Not scheduled. Each needs a decision before it becomes a task.
   `DELETE` and `OPTIONS`.
 - **Killing leftover processes at turn end.** T18 unpoints the placeholder
   when a turn ends, so a background process the model left running can't
-  spend credentials between turns. It can still spend turn N+1's
-  credential while turn N+1 runs, whoever its requester is. Only killing
-  the processes a turn leaves behind in the container when it ends removes
-  that.
+  spend credentials between turns, and T21 recycles the session's container
+  when the party changes, which ends every process running in it
+  ([impl-notes](impl-notes.md#another-partys-turn-gets-a-new-container)).
+  A leftover can still spend the credentials of its own party's later
+  turns while they run (a requester's, or a `requester_groups` group's);
+  only killing the processes a turn leaves behind in the container when it
+  ends removes that. When the party changes T21 also clears the session
+  directory's stray entries, `home/`, `tmp/` and everything in `claude/` but
+  the transcript file and its directory (a `.bashrc` the Bash tool's shells
+  source, a `CLAUDE.md` the CLI loads as user memory). Files still outlive
+  the container in `work/` and `shared/`, and in the kept transcript files:
+  a turn can leave something there that runs or instructs code in a later
+  requester's process. During a blue-green overlap of two agentd
+  instances, the other instance's warm container of a session, and what is
+  left running in it, can also write to the session's files after a clear.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
@@ -2779,6 +2868,17 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Switching models over the stream-json control channel** instead of
   restarting the process.
 - **Per-scope container cap tuning** from real usage (T21 sets a default).
+- **Fairness at the per-scope cap**, a follow-up to T21's pool. A session
+  keeps its container while it has turns, so a busy session can hold its
+  place at the cap while another session of the same scope waits. That
+  delays the waiting session but can't deadlock it: it gets a container as
+  soon as any session of the scope goes idle. The proposal: a session that
+  has run N consecutive turns (N = 4 to start) while a session of the same
+  scope is waiting on the cap gives its container back after the current
+  turn, and its next turn queues like any other. It yields only when a
+  scope-mate is actually waiting, so a lone busy session never pays a
+  container restart, and its next turn queues behind the waiter (FIFO at
+  the cap), so a steady stream of turns can't take the place straight back.
 - **Community bot fallback** that posts as each agent with
   `chat:write.customize`, for workspaces at the app limit (design,
   [Alternatives considered](design.md#alternatives-considered)).

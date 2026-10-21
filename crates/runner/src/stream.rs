@@ -65,11 +65,14 @@ impl TurnOutcome {
         matches!(self, Self::Finished(result) if !result.is_error)
     }
 
-    /// Whether the CLI refused a `--resume` because the session has no
-    /// transcript: an error result with subtype `error_during_execution`
-    /// before the turn's `system`/`init` line, so the CLI never read the
-    /// message. The process exits after it. The session never started:
-    /// start the next process with
+    /// Whether the turn ended as the CLI ends when it refuses a `--resume`
+    /// because the session has no transcript: an error result with subtype
+    /// `error_during_execution` before the turn's `system`/`init` line, so
+    /// the CLI never read the message. The process exits after it.
+    ///
+    /// It is that refusal only on the first turn of a process started with
+    /// [`SessionStart::Resume`](crate::SessionStart::Resume). Then the
+    /// session never started: start the next process with
     /// [`SessionStart::New`](crate::SessionStart::New) under the same id,
     /// and run the turn again there.
     pub fn resume_refused(&self) -> bool {

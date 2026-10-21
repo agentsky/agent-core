@@ -42,6 +42,19 @@
 //! be read into memory at once. [`remove_tree`] is the same remover for
 //! agentd's own trees that hold what an agent wrote.
 //!
+//! A start whose spec sets [`clear_files`](crate::SessionSpec::clear_files)
+//! also clears what earlier turns left, before `settings.json` and
+//! `claude/skills` are put back: every entry of the session directory but
+//! its four subdirectories, everything in `home/` and `tmp/`, and
+//! everything in `claude/` but the session's transcript,
+//! `projects/<session id>/<session id>.jsonl`, and the
+//! `projects/<session id>/<session id>/` directory of its subagents'
+//! transcripts and tool results, which are kept whole. The same handles
+//! are used: each directory is listed and each entry looked up relative to
+//! its parent's handle, every entry that goes is removed with
+//! `remove_tree_at`, and a transcript entry that is a symlink or of the
+//! wrong type is removed, not kept. `work/` is not cleared.
+//!
 //! The repair runs only in [`Sandbox::start`](crate::Sandbox::start),
 //! before this start's container exists. Another container of the same
 //! session can still be running, as during a blue-green overlap of two
@@ -56,6 +69,7 @@ use std::ffi::{CStr, CString, OsStr};
 use std::fs::{self, DirBuilder, File, Permissions};
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, chown, fchown};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -79,6 +93,12 @@ const CLAUDE_DIR: &str = "claude";
 
 /// Where the skills directory appears in `claude/`.
 const SKILLS_DIR: &str = "skills";
+
+/// The directory in `claude/` that holds the transcripts.
+const PROJECTS_DIR: &str = "projects";
+
+/// The session subdirectories that clearing empties.
+const CLEARED_SUBDIRS: [&str; 2] = ["home", "tmp"];
 
 /// The mode of every directory the agent can write, reset on each start.
 const DIR_MODE: u32 = 0o755;
@@ -155,6 +175,7 @@ impl Layout {
         volume: &VolumeRef,
         session: SessionId,
         skills: SkillsEntry,
+        clear_files: bool,
     ) -> Result<PathBuf> {
         let this = self.clone();
         let volume = volume.clone();
@@ -164,11 +185,27 @@ impl Layout {
             create_dir(&dir, None)?;
             let session_dir = open_dir(&dir)?;
             set_mode(&session_dir)?;
+            let deadline = Deadline::new();
+            if clear_files {
+                clear_dir(
+                    &session_dir,
+                    |name, kind| {
+                        kind == FileType::Directory
+                            && SESSION_SUBDIRS.iter().any(|sub| name == *sub)
+                    },
+                    &deadline,
+                )?;
+            }
             for sub in SESSION_SUBDIRS.into_iter().filter(|sub| *sub != CLAUDE_DIR) {
-                this.repair_dir_at(&session_dir, sub)?;
+                let handle = this.repair_dir_at(&session_dir, sub)?;
+                if clear_files && CLEARED_SUBDIRS.contains(&sub) {
+                    clear_dir(&handle, |_, _| false, &deadline)?;
+                }
             }
             let claude = this.repair_dir_at(&session_dir, CLAUDE_DIR)?;
-            let deadline = Deadline::new();
+            if clear_files {
+                this.clear_claude_dir(&claude, session, &deadline)?;
+            }
             this.write_settings(&claude, &deadline)?;
             this.place_skills(&claude, &skills, &deadline)?;
             Ok(dir)
@@ -269,6 +306,44 @@ impl Layout {
         Ok(())
     }
 
+    /// Clears the `claude/` directory `claude` down to `session`'s
+    /// transcript: `projects/<session>/<session>.jsonl`, a regular file,
+    /// and the `projects/<session>/<session>/` directory, both kept whole.
+    /// Everything else goes, `settings.json` and `skills` included, which
+    /// are put back after. `projects/` and `projects/<session>/` are
+    /// repaired like the session's own directories, and created if
+    /// missing. It fails once `deadline` passes.
+    fn clear_claude_dir(
+        &self,
+        claude: &File,
+        session: SessionId,
+        deadline: &Deadline,
+    ) -> Result<()> {
+        let id = session.to_string();
+        let transcript = format!("{id}.jsonl");
+        clear_dir(
+            claude,
+            |name, kind| name == PROJECTS_DIR && kind == FileType::Directory,
+            deadline,
+        )?;
+        let projects = self.repair_dir_at(claude, PROJECTS_DIR)?;
+        clear_dir(
+            &projects,
+            |name, kind| name == id.as_str() && kind == FileType::Directory,
+            deadline,
+        )?;
+        let project = self.repair_dir_at(&projects, &id)?;
+        clear_dir(
+            &project,
+            |name, kind| match kind {
+                FileType::RegularFile => name == transcript.as_str(),
+                FileType::Directory => name == id.as_str(),
+                _ => false,
+            },
+            deadline,
+        )
+    }
+
     /// Gives the directory `dir` to the sandbox user, when its owner
     /// differs, and sets its mode to `0755`.
     fn claim(&self, dir: &File) -> Result<()> {
@@ -292,6 +367,34 @@ pub(crate) fn settings_json(cleanup_period_days: u32) -> String {
     .unwrap_or_default();
     body.push('\n');
     body
+}
+
+/// Removes every entry of the directory `dir` that `keep` doesn't keep,
+/// given its name and type, with [`remove_tree_at`]. It reads `dir` again
+/// until a read finds nothing to remove, so an entry added meanwhile goes
+/// too, and fails once `deadline` passes.
+fn clear_dir(
+    dir: &File,
+    keep: impl Fn(&OsStr, FileType) -> bool,
+    deadline: &Deadline,
+) -> Result<()> {
+    loop {
+        let mut removed = false;
+        let mut entries = read_dir(dir, None, deadline)?;
+        while let Some(entry) = next_entry(entries.as_mut(), deadline)? {
+            let name = OsStr::from_bytes(entry.name.to_bytes());
+            match entry_kind(dir, &entry)? {
+                Some(kind) if !keep(name, kind) => {
+                    remove_tree_at(dir, name, deadline)?;
+                    removed = true;
+                }
+                _ => {}
+            }
+        }
+        if !removed {
+            return Ok(());
+        }
+    }
 }
 
 /// Creates the directory `path` if it's missing. An existing entry must be
@@ -872,7 +975,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert_eq!(session_dir, volume.session_dir(session));
@@ -890,7 +993,7 @@ mod fs_tests {
         assert_eq!(names, ["settings.json"]);
         fs::write(session_dir.join("work/file"), "x").unwrap();
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert!(session_dir.join("work/file").is_file());
@@ -908,7 +1011,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
 
@@ -917,7 +1020,7 @@ mod fs_tests {
         fs::remove_dir_all(session_dir.join("work")).unwrap();
         fs::write(session_dir.join("work"), "not a dir").unwrap();
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert!(
@@ -934,7 +1037,7 @@ mod fs_tests {
         fs::remove_file(&settings).unwrap();
         symlink(&target, &settings).unwrap();
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
@@ -943,7 +1046,7 @@ mod fs_tests {
         fs::remove_file(&settings).unwrap();
         fs::create_dir_all(settings.join("nested")).unwrap();
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
@@ -965,7 +1068,7 @@ mod fs_tests {
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session_dir = layout
-            .prepare_session_dirs(&volume, SessionId::new_v4(), SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, SessionId::new_v4(), SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let claude = session_dir.join("claude");
@@ -1009,19 +1112,19 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let entry = session_dir.join("claude/skills");
         symlink(outside.path(), &entry).unwrap();
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint, false)
             .await
             .unwrap();
         assert!(fs::symlink_metadata(&entry).unwrap().is_dir());
         fs::write(entry.join("left"), "x").unwrap();
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert!(entry.join("left").is_file());
@@ -1030,12 +1133,13 @@ mod fs_tests {
                 &volume,
                 session,
                 SkillsEntry::Link(Some(skills.path().to_owned())),
+                false,
             )
             .await
             .unwrap();
         assert_eq!(fs::read_link(&entry).unwrap(), skills.path());
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Link(None))
+            .prepare_session_dirs(&volume, session, SkillsEntry::Link(None), false)
             .await
             .unwrap();
         assert!(fs::symlink_metadata(&entry).is_err());
@@ -1060,7 +1164,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint, false)
             .await
             .unwrap();
         fs::write(session_dir.join("work/kept"), "x").unwrap();
@@ -1076,7 +1180,7 @@ mod fs_tests {
         chmod(&volume.memory_dir().unwrap(), 0o500);
         chmod(&session_dir, 0);
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint)
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint, false)
             .await
             .unwrap();
         let mode = |path: &Path| fs::symlink_metadata(path).unwrap().mode() & 0o7777;
@@ -1094,6 +1198,289 @@ mod fs_tests {
         }
         assert!(session_dir.join("work/kept").is_file());
         assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<_> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn write(path: &Path, text: &str) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, text).unwrap();
+    }
+
+    /// Fills the session directory with what turns leave: dotfiles in
+    /// `home/` and `tmp/`, user memory, an auto-memory directory and another
+    /// project in `claude/`, and the transcript with its directory.
+    fn leave_files(session_dir: &Path, session: SessionId) {
+        let project = session_dir.join(format!("claude/projects/{session}"));
+        write(&session_dir.join("home/.bashrc"), "evil");
+        write(&session_dir.join("home/.config/git/config"), "evil");
+        write(&session_dir.join("tmp/script.sh"), "evil");
+        write(&session_dir.join("claude/CLAUDE.md"), "evil");
+        write(&session_dir.join("claude/shell-snapshots/s.sh"), "evil");
+        write(&session_dir.join("claude/projects/other/x.jsonl"), "evil");
+        write(&project.join("memory/MEMORY.md"), "evil");
+        write(&project.join("other.jsonl"), "evil");
+        write(&project.join(format!("{session}.jsonl")), "transcript");
+        write(
+            &project.join(format!("{session}/subagents/agent-1.jsonl")),
+            "subagent",
+        );
+        write(&session_dir.join("work/kept"), "work");
+    }
+
+    #[tokio::test]
+    async fn clearing_keeps_only_the_transcript_and_the_work() {
+        let dir = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint, false)
+            .await
+            .unwrap();
+        leave_files(&session_dir, session);
+        write(&session_dir.join("claude/skills/mine/SKILL.md"), "evil");
+        write(&volume.shared_dir().join("kept"), "shared");
+        write(&volume.memory_dir().unwrap().join("kept"), "memory");
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::MountPoint, true)
+            .await
+            .unwrap();
+        assert!(names(&session_dir.join("home")).is_empty());
+        assert!(names(&session_dir.join("tmp")).is_empty());
+        assert_eq!(
+            names(&session_dir.join("claude")),
+            ["projects", "settings.json", "skills"]
+        );
+        assert!(names(&session_dir.join("claude/skills")).is_empty());
+        assert_eq!(read_settings(&session_dir)["cleanupPeriodDays"], 42);
+        assert_eq!(
+            names(&session_dir.join("claude/projects")),
+            [session.to_string()]
+        );
+        let project = session_dir.join(format!("claude/projects/{session}"));
+        assert_eq!(
+            names(&project),
+            [session.to_string(), format!("{session}.jsonl")]
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(format!("{session}.jsonl"))).unwrap(),
+            "transcript"
+        );
+        assert!(
+            project
+                .join(format!("{session}/subagents/agent-1.jsonl"))
+                .is_file()
+        );
+        assert!(session_dir.join("work/kept").is_file());
+        assert!(volume.shared_dir().join("kept").is_file());
+        assert!(volume.memory_dir().unwrap().join("kept").is_file());
+        for sub in SESSION_SUBDIRS {
+            let mode = fs::metadata(session_dir.join(sub)).unwrap().mode();
+            assert_eq!(mode & 0o7777, 0o755, "{sub}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_the_flag_nothing_is_cleared() {
+        let dir = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: awkward_channel(),
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        leave_files(&session_dir, session);
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        assert_eq!(names(&session_dir.join("home")), [".bashrc", ".config"]);
+        assert_eq!(names(&session_dir.join("tmp")), ["script.sh"]);
+        assert_eq!(
+            names(&session_dir.join("claude")),
+            ["CLAUDE.md", "projects", "settings.json", "shell-snapshots"]
+        );
+        let mut projects = vec!["other".to_owned(), session.to_string()];
+        projects.sort();
+        assert_eq!(names(&session_dir.join("claude/projects")), projects);
+        assert_eq!(
+            names(&session_dir.join(format!("claude/projects/{session}"))).len(),
+            4
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_removes_stray_entries_fifos_and_a_file_named_projects() {
+        let dir = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        write(&session_dir.join("CLAUDE.md"), "evil");
+        write(&session_dir.join("payload/run.sh"), "evil");
+        let fifo = |dir: &Path, name: &str| {
+            rustix::fs::mknodat(
+                open_dir(dir).unwrap(),
+                name,
+                FileType::Fifo,
+                Mode::RUSR | Mode::WUSR,
+                0,
+            )
+            .unwrap();
+        };
+        fifo(&session_dir, "pipe");
+        fifo(&session_dir.join("home"), "pipe");
+        fifo(&session_dir.join("tmp"), "pipe");
+        fs::remove_dir_all(session_dir.join("claude/projects")).ok();
+        write(&session_dir.join("claude/projects"), "not a directory");
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert_eq!(names(&session_dir), ["claude", "home", "tmp", "work"]);
+        assert!(names(&session_dir.join("home")).is_empty());
+        assert!(names(&session_dir.join("tmp")).is_empty());
+        assert_eq!(
+            names(&session_dir.join("claude")),
+            ["projects", "settings.json"]
+        );
+        assert_eq!(
+            names(&session_dir.join("claude/projects")),
+            [session.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_removes_unreadable_and_read_only_directories_without_root() {
+        let dir = TempDir::new("sandbox-test");
+        if fs::metadata(dir.path()).unwrap().uid() == 0 {
+            return;
+        }
+        let outside = TempDir::new("sandbox-test");
+        fs::write(outside.join("victim"), "keep").unwrap();
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        leave_files(&session_dir, session);
+        for sub in ["home", "tmp", "claude"] {
+            locked_tree(&session_dir.join(sub).join("go"), outside.path());
+        }
+        let projects = session_dir.join("claude/projects");
+        locked_tree(&projects.join("other"), outside.path());
+        fs::set_permissions(&projects, Permissions::from_mode(0o000)).unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert!(names(&session_dir.join("home")).is_empty());
+        assert!(names(&session_dir.join("tmp")).is_empty());
+        assert_eq!(
+            names(&session_dir.join("claude")),
+            ["projects", "settings.json"]
+        );
+        assert_eq!(names(&projects), [session.to_string()]);
+        let project = projects.join(session.to_string());
+        assert_eq!(
+            names(&project),
+            [session.to_string(), format!("{session}.jsonl")]
+        );
+        assert_eq!(
+            fs::read_to_string(project.join(format!("{session}.jsonl"))).unwrap(),
+            "transcript"
+        );
+        assert_eq!(fs::read_to_string(outside.join("victim")).unwrap(), "keep");
+    }
+
+    #[tokio::test]
+    async fn clearing_removes_symlinks_planted_as_the_transcript_without_following_them() {
+        let dir = TempDir::new("sandbox-test");
+        let outside = TempDir::new("sandbox-test");
+        let layout = layout(&dir, None).await;
+        let key = VolumeKey {
+            agent: AgentId::new_v4(),
+            scope: ScopeKey::Private,
+        };
+        let volume = layout.ensure_volume(&key).await.unwrap();
+        let session = SessionId::new_v4();
+        let session_dir = layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
+            .await
+            .unwrap();
+        let victim = outside.join("victim.jsonl");
+        fs::write(&victim, "keep").unwrap();
+        let victim_dir = outside.join("victim");
+        write(&victim_dir.join("inside"), "keep");
+        let project = session_dir.join(format!("claude/projects/{session}"));
+        fs::create_dir_all(&project).unwrap();
+        symlink(&victim, project.join(format!("{session}.jsonl"))).unwrap();
+        symlink(&victim_dir, project.join(session.to_string())).unwrap();
+        symlink(&victim_dir, session_dir.join("home/link")).unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert!(names(&project).is_empty());
+        assert!(names(&session_dir.join("home")).is_empty());
+
+        fs::remove_dir_all(session_dir.join("claude/projects")).unwrap();
+        symlink(outside.path(), session_dir.join("claude/projects")).unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert!(
+            fs::symlink_metadata(session_dir.join("claude/projects"))
+                .unwrap()
+                .is_dir()
+        );
+        assert!(names(&project).is_empty());
+
+        fs::create_dir(project.join(format!("{session}.jsonl"))).unwrap();
+        fs::write(project.join(session.to_string()), "not a dir").unwrap();
+        layout
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, true)
+            .await
+            .unwrap();
+        assert!(names(&project).is_empty());
+
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "keep");
+        assert_eq!(
+            fs::read_to_string(victim_dir.join("inside")).unwrap(),
+            "keep"
+        );
+        assert_eq!(names(outside.path()), ["victim", "victim.jsonl"]);
     }
 
     #[tokio::test]
@@ -1125,7 +1512,7 @@ mod fs_tests {
         };
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session_dir = layout
-            .prepare_session_dirs(&volume, SessionId::new_v4(), SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, SessionId::new_v4(), SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let owned = |path: &Path| {
@@ -1142,15 +1529,6 @@ mod fs_tests {
         }
         assert_eq!(owned(volume.path()), (me.uid(), me.gid()));
         assert_eq!(owned(&session_dir), (me.uid(), me.gid()));
-    }
-
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<_> = fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        names.sort();
-        names
     }
 
     /// Builds at `root` what an agent or a build can leave: `0555`
@@ -1204,7 +1582,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let settings = session_dir.join("claude/settings.json");
@@ -1216,6 +1594,7 @@ mod fs_tests {
                 &volume,
                 session,
                 SkillsEntry::Link(Some(skills.path().to_owned())),
+                false,
             )
             .await
             .unwrap();
@@ -1247,7 +1626,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let skills = session_dir.join("claude/skills");
@@ -1259,6 +1638,7 @@ mod fs_tests {
                 &volume,
                 session,
                 SkillsEntry::Link(Some(target.path().to_owned())),
+                false,
             )
             .await
             .unwrap();
@@ -1281,7 +1661,7 @@ mod fs_tests {
         let volume = layout.ensure_volume(&key).await.unwrap();
         let session = SessionId::new_v4();
         let session_dir = layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         let settings = session_dir.join("claude/settings.json");
@@ -1294,7 +1674,7 @@ mod fs_tests {
         }
         drop(level);
         layout
-            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched)
+            .prepare_session_dirs(&volume, session, SkillsEntry::Untouched, false)
             .await
             .unwrap();
         assert!(fs::symlink_metadata(&settings).unwrap().is_file());

@@ -3940,10 +3940,19 @@ placeholder revoked by `process_stopping` before the turn's `turn_finished`
 runs, so a revoked placeholder is a normal case at turn end, with nothing
 left to clear.
 
-What remains: a background process left from turn N can still spend turn
-N+1's credential while N+1 runs, whoever its requester is. Only killing the
-processes a turn leaves behind when it ends removes that; the plan's
-Deferred work has an entry.
+T21 recycles the session's container when the party changes, which ends
+every process a turn left running
+([T21](#another-partys-turn-gets-a-new-container)), so a background
+process left from turn N spends only the credentials of its own party's
+later turns while they run (a requester's, or a configured group's). Only
+killing the processes a turn leaves behind when it ends removes that. Some
+files outlive the container, though. When the party changes T21 clears the
+session directory's stray entries, `home/`, `tmp/`, and everything in
+`claude/` but the transcript file and its directory, but what a turn leaves
+in the session's `work/`, in `shared/`, or in the transcript can run or
+instruct code in a later requester's process, which then spends that
+requester's credential.
+The plan's Deferred work has an entry for both.
 
 ### Headers the proxy changes besides the credential
 
@@ -5001,3 +5010,416 @@ Content means no subtype, or `file_share`, `thread_broadcast` or
 - `respond_ephemeral` posts `{"response_type": "ephemeral", "text": …}` to
   the `response_url` with no token. Slack answers `ok` (text or JSON) on
   success; `expired_url`, `used_url`, 404 and 410 are `NotFound`.
+
+## T21: runner sessions, queue and warm pool
+
+### The hooks name the process, not only the session
+
+**Issue.** The plan's `process_stopping(session)` and `turn_finished(session,
+turn)` name only the session. The pool calls `process_stopping` from the
+sandbox's event stream when a container dies, without the session's lock,
+since a turn may be running for many minutes. A death reported for a
+session's old container could then land after the session had stopped it
+and started a new process, and revoke the new process's placeholder and
+agentctl token. T23 would also have had to keep a map from session to
+token to hand the turn's outbox back.
+
+**Solution.** `TurnHooks` has two associated types. `process_starting`
+returns `(ProcessEnv, Self::Process)`, and every later call for that
+process gets the `Process` back, so agentd can keep the placeholder's id
+and the agentctl token in it and a late call for an old process never
+touches a new one. `turn_finished` returns `Self::Finished`, which
+`run_turn` hands to the caller in `TurnReport::finished`: T23 returns the
+turn's `Outbox` there. `SessionManager` is generic over its hooks rather
+than holding a `dyn TurnHooks`.
+
+A death revokes the process at once even while a turn runs in it:
+`a_container_killed_mid_turn_has_its_process_revoked_before_the_turn_ends`
+kills the container under a running turn and holds that turn's
+`turn_finished` until `process_stopping` has run, so the test fails if the
+revocation waits for the turn.
+
+### A turn cut off before its outcome was recorded
+
+**Issue.** A session is marked started after a turn whose `init_seen` is
+true. If agentd dies after the CLI read an unstarted session's first
+message but before that was recorded, the next process starts with
+`--session-id`, which the CLI refuses because the transcript exists, and
+every later turn fails the same way: nothing would ever mark it started.
+
+**Solution.** `sessions` has a `maybe_started` column. It is set in the
+store before a turn goes to an unstarted session's CLI, and cleared when
+the turn's outcome says what happened (`init_seen`, or a refused
+`--resume`). A session with it set starts its next process with
+`--resume`; if there is no transcript after all the CLI refuses, and the
+plan's rerun with `--session-id` takes over. A `--session-id` start that
+crashes without `init_seen` leaves it set too, so a transcript that
+existed after all is resumed next time.
+
+### `lookup_or_create` needs the scope
+
+**Issue.** `lookup_or_create(agent, thread_key)` has no scope to record,
+and a `ThreadKey` can't give one: the router decides that the owner's DM is
+`Private` and another member's is `Dm`. If a thread's session were found
+whatever scope it was made on, a DM that stopped being the owner's (the
+agent changed hands) would keep running on the agent's `Private` volume.
+
+**Solution.** `lookup_or_create(agent, thread, scope)`. A thread's live
+session on another scope is reset and replaced in the same transaction,
+and its warm container stopped in the background, so a session never
+changes volume.
+
+### `create_private` needs the thread
+
+**Issue.** `create_private(agent, consent)` names no thread, but the row's
+thread columns are not null, and T33 posts the task's result to the thread
+recorded with the consent, whose table doesn't exist yet.
+
+**Solution.** `create_private(agent, consent, thread)`, and a `consent_id`
+column, set exactly for `private` rows. The thread columns of a private
+row hold where its result goes; the partial unique index covers normal
+rows only, so they never collide with the thread's own session. A private
+session takes only `TurnKind::PrivateTask` with its own consent, and a
+normal session only `TurnKind::Normal`.
+
+### Idle containers hold places under the caps
+
+**Issue.** With one warm container per active session, idle containers
+fill a scope's cap, and a new session would wait up to the idle timeout
+for the reaper.
+
+**Solution.** A session that needs a container when a cap is full first
+stops an idle one under that cap (a dead one first, then the one idle
+longest), and otherwise waits on the cap's semaphore until a place frees
+up or a turn ends and a container becomes idle. A container is idle when
+its session's lock is free; the pool takes it with `try_lock`, so it never
+waits on another session. The scope cap is per volume, `(agent, scope)`,
+so two agents in one channel don't share one. The global cap defaults to
+32; the Compose sandbox network leaves about 126 addresses.
+
+### Mounts come from the turn's side
+
+**Issue.** A container's mounts are fixed when it starts, and the plan
+doesn't say what decides them: `shared/` read-write or read-only, and
+whether `memory/` is mounted.
+
+**Solution.** The turn's `Side`, on the agent's `Private` volume: the
+owner's side gets `shared/` read-write and `memory/`, the public side (a
+private task a non-owner asked for) `shared/` read-only and no `memory/`.
+Every other volume mounts `shared/` read-write and no `memory/`. A turn
+whose mounts differ from the warm container's stops the container, like a
+credential kind or model change stops the process.
+
+### Another party's turn gets a new container
+
+**Issue.** A warm container is reused across turns of one session, and a
+background process a turn leaves running, such as a `&` job or a Bash-tool
+background shell, survives in it. `turn_starting` points the container's
+placeholder at each turn's credential and records the turn on the agentctl
+token, so a process left from requester A's turn could spend requester B's
+credential, or act through `agentctl`, while B's turn runs. Restarting the
+process on a credential kind change doesn't help: the leftover isn't the CLI,
+and two members' subscriptions are the same kind.
+
+**Solution.** `Held` records the requester whose turn started the container,
+and `ensure_process` stops the whole container, as it does a dead one or one
+with other mounts, when a turn's requester isn't the same party, before it
+looks at the process. Stopping the container ends its PID namespace and
+every process in it; stopping only the CLI would leave the leftovers
+running. It compares the requester, not the `CredentialRef`: a
+community-key turn of another requester also gets the agentctl token, so it
+gets a new container too. An
+agent-to-agent hop runs as the requester it inherits, so it keeps a container
+started for that requester.
+
+Review noted that comparing the full `Requester` recycled the container when
+the requester's account was linked between two turns, flipping `member` from
+`None` to `Some`. It now compares `Requester::key` alone, which is as safe: a
+`MemberKey` names one member at most (`surface_identities` is keyed by it),
+and only ever the same one, since nothing rewrites or deletes an identity's
+member, so the key alone names the person. The credential that changes with a
+link, the community key to the member's subscription, changes the credential
+kind, and the fit check restarts the process in the kept container for it.
+The cost is a container start and a `--resume` of the transcript whenever
+consecutive turns of one session come from different requesters, as in a
+busy channel thread; a requester's own run of turns keeps the warm process.
+Only one party's turns share a warm process: one requester's, or those of a
+configured group (see the next notes). Members of a group on one warm process
+are still each billed their own turn, since T20 bills a turn the rise in the
+process's running total, not the total
+([T20](#total_cost_usd-is-the-processs-running-total)).
+`a_requester_change_replaces_the_container` checks that another
+requester's turn, a community-key one included, replaces the container, and
+that the same requester and a hop carrying it keep it;
+`a_requester_linked_between_turns_keeps_the_container` that a key gaining a
+member between turns keeps the container and restarts only the process.
+
+It ends running processes, not files. `HOME`, `TMPDIR` and `CLAUDE_CONFIG_DIR`
+are the session's `home/`, `tmp/` and `claude/` on its volume, the working
+directory is `work/`, and every container of the session mounts them, with the
+volume's `shared/` (read-only on the public side of `Private`). Only
+`claude/settings.json` and the `claude/skills` entry are rewritten before each
+start, and in the Docker sandbox only `/tmp`, a tmpfs of the container's own,
+goes with the container. So a turn can leave a file that runs or instructs code
+in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
+a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
+`work/` or `shared/`, or text in the transcript. A leftover process can also
+still use its own party's later turns, and the egress allowlist between
+turns. The plan's Deferred work ("Killing leftover processes at turn end")
+records both; the next note clears the session's files.
+
+### A change of party clears the session's files
+
+**Issue.** Recycling ends processes, not the files a turn leaves in `home/`,
+`tmp/` and `claude/`, and `Held::requester` lives in memory only, so after an
+idle reap or a restart the next requester's container would start on another
+requester's files. Some deployments also want trusted requesters to share a
+session's container and files.
+
+**Solution.** `sessions.files_requesters` (a migration of its own) records
+the requesters whose turns have used the session's files since they were last
+cleared: a JSON array of `MemberKey` strings, written sorted and without
+duplicates. A value that doesn't parse counts as unknown, as NULL does for a
+new session or a row from before the column, and is logged with the session's
+id when it is read. `ensure_process` reads it with the session, from the store
+with the slot held. Unless every recorded requester is the same party as the
+turn's, and there is at least one, the warm container goes and the new one
+starts with `SessionSpec::clear_files`: `prepare_session_dirs` removes every
+entry of the session directory but its four subdirectories, empties `home/`
+and `tmp/` and removes everything in `claude/` but `projects/<id>/<id>.jsonl`
+and `projects/<id>/<id>/`, before `settings.json` and `skills` are put back.
+It uses the same handles as its repair and `remove_tree_at` (T17's remover),
+so a tree the agent made unreadable or read-only, or very deep, goes too. The
+transcript file and its directory are kept whole, so anything the agent put
+there carries over as the transcript's text does. The record then becomes the
+turn's requester alone. A group member not yet in it, in a warm container or a
+new one, is added. Either write comes before any process gets the turn; if it
+fails, the container is stopped and the turn fails, since otherwise a later
+turn could skip the clear it needs. A crash between a clear and its record
+costs one extra clear. A clear that fails, as one that runs out of time
+against a process still writing does (the clear and the repair of
+`settings.json` and `skills` after it share one minute of T17's remover
+per start), fails the start and so the turn with a `Sandbox` error and
+leaves the record as it was; what it removed stays removed, and the next
+start clears again and goes on from there.
+
+The warm container's own requester (`Held::requester`) is still checked as
+well: the record says whose turns used the files, and the held requester whose
+processes may still run in the container. They agree while one agentd instance
+writes the record, but not when another rewrites it, as below. Then only the
+held requester keeps another party out of the container, and since that
+party's processes may have written to the files after the other instance
+cleared them, a recycle for it clears too and records the turn's requester
+alone.
+
+`PoolConfig::requester_groups` lists groups of `MemberKey`s. Validation
+refuses a group of fewer than two and a member listed twice, so `same_party`
+is an equivalence, and the one relation decides both the recycle and the
+clear: sharing files already lets one member's leftovers run in another's
+process, so recycling the container between them would buy nothing. The
+record holds every member who used the files, not only the one they were
+cleared for, because the groups are configuration: once a group is removed,
+or a member taken out of one, its former members are no longer the same
+party, so the next turn of any of them clears what the others left. One
+requester alone wouldn't show that a second member had used the files.
+
+The record keeps a restart or an idle reap from skipping a clear for one
+agentd instance; a restart relies on agentd stopping the old instance's
+containers at startup.
+During a blue-green overlap the other instance's warm container of the same
+session, and anything left running in it, can still write to the session's
+files after this instance cleared them, until a turn on the other instance
+recycles that container, which clears them again, so a clear holds only once
+one instance serves the session.
+`another_requesters_turn_clears_the_files_after_an_idle_reap_or_a_restart`,
+`a_trusted_group_shares_the_warm_container_and_the_files`,
+`a_record_changed_under_a_warm_container_recycles_it` and the
+`removing_the_group_clears_*` tests check this.
+
+### `ProcessSandbox` gives every container one address
+
+**Issue.** Review noted that `ProcessSandbox::ip` answers `127.0.0.1` for
+every container, while agentd relies on an address holding one container
+at a time: `put_ctl_token` deletes every other token and lease bound to
+the address, and `Registry::mint` revokes other sessions' placeholders
+there. Two sessions running at once on it with real hooks would revoke
+each other's agentctl token and placeholders.
+
+**Solution.** It stays one address, and its rustdoc and the plan say it
+supports one running container at a time for those rules. Distinct
+loopback addresses per container wouldn't work end to end: its processes
+are local children that don't bind a source address, and Linux gives a
+connection to any `127.0.0.0/8` address the source `127.0.0.1`, so agentd
+would see every process at `127.0.0.1` whatever `ip` returned. T21's
+tests that run two sessions at once use fake hooks, which bind nothing to
+the address. A test that needs two live sessions with real hooks gives
+each its own address another way, as agentctl's integration tests do
+([T15](#one-token-per-container-address-too)).
+
+### How turns queue and survive their caller
+
+**Issue.** The plan asks for a keyed queue in arrival order, and for
+`turn_finished` to finish before the slot is released even when the caller
+is cancelled. A task spawned per turn and then queued would queue in
+whatever order tokio runs the tasks.
+
+**Solution.** Each session's slot is a tokio mutex, which hands the lock
+out in the order it was asked for. `run_turn` asks for it in the caller's
+future, as its first await, and once it has it runs the turn in a spawned
+task that owns the lock guard, so dropping the caller no longer cancels
+anything; the lock is released only after `turn_finished` returns. A
+caller that stops waiting while its turn is still queued leaves the queue
+and its turn never runs. `reset` and `stop` queue the same way, so a reset
+runs after the turns queued before it; turns queued after it fail with
+`RunnerError::SessionReset`.
+
+### Hook failures
+
+**Issue.** The plan doesn't say what a failing hook does.
+
+**Solution.** A failed `process_starting` fails the turn and stops the
+container, and so does a process that fails to start. A failed
+`turn_starting` fails it without sending it, and `turn_finished` is still
+called, since the placeholder may have been pointed. A failed
+`turn_finished` is logged and returned in `TurnReport::finished`, and the
+process is stopped (with `process_stopping`), since the runner can't tell
+whether the placeholder is still pointed. A failed `process_stopping` is
+logged and the stop goes ahead, and unless a later call for that process
+succeeds it runs once more after the container is stopped; a second
+failure is logged and given up on. Retrying only when it was called again
+missed manager-initiated stops: the process is taken from the session
+before the call, and a death event for a container already marked dead is
+ignored, so a failed revocation used to leave the agentctl token valid for
+the next container on the address. A failed revocation also takes the
+container with it, even when the process was seen to exit, since leftover
+processes in the container could otherwise keep using the live token
+between turns.
+
+A panic in `process_starting` is taken for its failure, and one in
+`process_stopping` is logged and the stop goes ahead: otherwise a panic in
+`process_stopping` left the process it was stopping running, taken out of
+the session, and the next turn started a second process in the same
+container. It would also have ended the event follower or the reaper for
+good. A process that panics while starting has `process_stopping` called
+and its container stopped, since it may have been started, and the turn
+fails with `RunnerError::TurnTask`.
+
+A panic in a turn is caught at the turn: one in `turn_starting` or the send
+still has `turn_finished` called, and after any panic, `turn_finished`'s
+included, the turn is recorded if it has an outcome and the process is
+stopped as after a failed `turn_finished`. Only then does the panic resume,
+failing the turn with `RunnerError::TurnTask`. Otherwise the next turn would
+reuse a process whose placeholder may still be pointed, and the store would
+keep `maybe_started` for a turn whose outcome was known. The slot's release
+wakes waiters for an idle container from a drop guard, so a panic doesn't
+leave a session waiting on the caps until the idle timeout.
+
+### A container that fails to stop
+
+**Issue.** When `Sandbox::stop` failed, the pool forgot the container and
+freed its places under the caps, though it may still have been running with
+its process in it. The next turn of the session then started another
+container and another process on the same transcript, past the caps, and
+nothing tried the stop again.
+
+**Solution.** A container whose stop fails stays its session's, marked
+dead, with its places under the caps. A turn that finds it, and `reset`,
+try the stop again and fail with `RunnerError::Sandbox` if it still fails,
+so no second process resumes the transcript. The reaper tries every dead
+container each round, and eviction under a full cap tries it first. A
+container's address is read when a process starts in it, after the
+container is held, so a container whose address can't be read goes the
+same way.
+
+### A normal stop reported as a death
+
+**Issue.** Stopping a container makes the sandbox report it dead, and the
+event can arrive while `Sandbox::stop` is still returning. The pool forgot
+the container only once the stop returned, so the event follower found it
+still tracked and alive, and logged a container death, with a warning, on
+nearly every normal stop.
+
+**Solution.** A session marks its container dead before it stops it. The
+follower takes a dead container's death as already handled, and a stop that
+fails leaves the container marked dead, as before.
+
+### The death-log test missed its own events
+
+**Issue.** `a_normal_stop_is_not_logged_as_a_death` failed once in CI with
+no "stopped a session container" line and nothing captured at all. It
+captured logs with `tracing::subscriber::set_default`. With that one scoped
+subscriber the only dispatcher registered, `tracing-core` works out a
+callsite's interest, the first time the callsite is hit, from the dispatcher
+of the thread that hits it. Another test of the binary, on its own thread
+with no subscriber, that stopped a container first after this test had set
+its subscriber registered the callsite with "never", for every thread, and
+the test's own event was dropped. The same could turn off "a session
+container died" and make the test pass whatever the pool logged. The pool
+was right: the test failed only when another test's thread hit the
+callsite first.
+
+**Solution.** Every harness installs one global subscriber for the test
+binary, once, before any test reaches the pool, and the test reads only the
+lines naming its own session, as the egress log test does.
+
+The other log captures, in agentd's sweeper, command and telemetry tests,
+runner's log test and cred-proxy's logging and egress tests, had the same
+flaw or the same ad hoc fix. Every capture now goes through the shared
+`testkit::Logs`: one global subscriber per test binary (`Logs::global`, or
+`Logs::install` with the binary's own, as agentd installs its JSON one),
+read per test by a field only that test logs (`Logged::matching`) or by a
+span it enters on its own thread (`Logs::tag`). agentd's capture formats only
+events inside such a span, so tests that capture nothing aren't slowed down.
+`Logged::assert_lacks` refuses an empty capture, and every absence check
+sits next to a presence check on the line it expects. The telemetry tests
+check subscribers themselves, so they still set one per test, through
+`Logs::scoped` on the global capture: with the global subscriber registered
+first there are always two dispatchers, and `tracing-core` then asks each of
+them about a new callsite, whichever thread hits it.
+
+A tag keeps only the lines whose span parents lead back to it: a line
+inside a span made before the tag, such as a task's own `instrument` span,
+or logged on another thread, such as by `spawn_blocking`, is missing from
+it. So an absence check reads `Logged::matching` a unique id or the whole
+snapshot, never a tag. `Logs::install` rebuilds the interest cache once
+`set_global_default` has installed the subscriber, since `Dispatch::new`
+rebuilt it before the global dispatcher was set and a callsite first hit in
+between stays off; and it panics when a later call passes a different
+`make`, which would otherwise be ignored. agentd's capture is the lib test
+binary's global subscriber, so `telemetry::init` fails in a lib test that
+reaches it; such a test runs `agentd` as a process, as `tests/binary.rs`
+does.
+
+### A refused `--resume` is known only on a resumed process
+
+**Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
+its shape: an `error_during_execution` error result before `system`/`init`.
+Acting on that shape for any process would mark a session unstarted, and
+run its turn again, after a `--session-id` start or a warm process's later
+turn ended that way for some other reason.
+
+**Solution.** The runner treats it as a refusal only on the first turn sent
+to a process started with `SessionStart::Resume`. Any other turn with that
+outcome is recorded like any turn without `init_seen`, which leaves
+`maybe_started` as it was. The process remembers that nothing was sent to it
+yet, and the send clears it: a resumed process whose first turn failed in
+`turn_starting` is kept warm, and the refusal comes on the next turn, which
+didn't start the process. Judged by whether the turn started the process,
+that refusal came back as an error result, the turn didn't run again, and
+its message was lost.
+
+If the store fails to mark the session unstarted, the turn fails with
+`RunnerError::Store` instead of running again: the session still reads as
+started, so the second run would `--resume` and be refused again.
+
+### What is durable
+
+**Issue.** Queued and in-flight state must survive a restart if anything
+reads it back.
+
+**Solution.** What the runner reads back lives in `sessions`: the ids,
+`started`, `maybe_started`, `last_turn_at` and `reset_at`. The queue of
+waiting turns belongs to its callers' futures, and the warm pool to
+running processes and containers, neither of which survives a restart:
+agentd reaps every sandbox at startup (T17) and purges agentctl tokens
+(T15), and placeholders live in memory (T18). They stay in memory.
