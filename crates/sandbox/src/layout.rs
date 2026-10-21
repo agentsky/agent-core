@@ -206,8 +206,8 @@ impl Layout {
             if clear_files {
                 this.clear_claude_dir(&claude, session, &deadline)?;
             }
-            this.write_settings(&claude)?;
-            this.place_skills(&claude, &skills)?;
+            this.write_settings(&claude, &deadline)?;
+            this.place_skills(&claude, &skills, &deadline)?;
             Ok(dir)
         })
         .await
@@ -252,12 +252,12 @@ impl Layout {
     /// Writes `settings.json` into the `claude/` directory `dir`: a new
     /// file is renamed into place, which replaces a file or a symlink there
     /// at once without following it, and a directory the agent left there
-    /// is removed first. Every step is relative to `dir`, so nothing is
-    /// written outside it.
-    fn write_settings(&self, dir: &File) -> Result<()> {
+    /// is removed first, by `deadline`. Every step is relative to `dir`, so
+    /// nothing is written outside it.
+    fn write_settings(&self, dir: &File, deadline: &Deadline) -> Result<()> {
         const TARGET: &str = "settings.json";
         if kind_at(dir, TARGET)? == Some(FileType::Directory) {
-            remove_tree_at(dir, OsStr::new(TARGET), &Deadline::new())?;
+            remove_tree_at(dir, OsStr::new(TARGET), deadline)?;
         }
         let body = settings_json(self.cleanup_period_days);
         let temp = format!(".settings.json.{}", uuid::Uuid::new_v4());
@@ -283,8 +283,8 @@ impl Layout {
     }
 
     /// Makes `skills` in the `claude/` directory `dir` what `entry` says,
-    /// relative to `dir`.
-    fn place_skills(&self, dir: &File, entry: &SkillsEntry) -> Result<()> {
+    /// relative to `dir`, removing what is there by `deadline`.
+    fn place_skills(&self, dir: &File, entry: &SkillsEntry, deadline: &Deadline) -> Result<()> {
         let target = match entry {
             SkillsEntry::Untouched => return Ok(()),
             SkillsEntry::MountPoint => return self.repair_dir_at(dir, SKILLS_DIR).map(drop),
@@ -293,7 +293,7 @@ impl Layout {
         let what = "linking the skills directory";
         match kind_at(dir, SKILLS_DIR)? {
             Some(_) if target.is_some() => {
-                remove_tree_at(dir, OsStr::new(SKILLS_DIR), &Deadline::new())?;
+                remove_tree_at(dir, OsStr::new(SKILLS_DIR), deadline)?;
             }
             Some(FileType::Symlink) => {
                 rustix::fs::unlinkat(dir, SKILLS_DIR, AtFlags::empty()).map_err(errno(what))?;
@@ -520,9 +520,10 @@ pub fn remove_tree(path: &Path) -> Result<()> {
 /// found missing, because another removal of the same tree took it, is
 /// skipped.
 ///
-/// Each directory gets mode `0700` through its handle before it is listed
-/// or moved, so a tree the agent made unreadable or read-only goes as long
-/// as agentd owns it. It works depth first without recursion, with a
+/// Each directory gets mode `0700` through its handle before it is read,
+/// and before it is moved if a move fails with `EACCES`, as it does for a
+/// directory without write permission, so a tree the agent made unreadable
+/// or read-only goes as long as agentd owns it. It works depth first without recursion, with a
 /// handful of files open and one directory read at a time, as a stream:
 /// files are unlinked and empty directories removed as they are read, and
 /// the first directory found with something in it is moved up into the
@@ -535,7 +536,10 @@ pub fn remove_tree(path: &Path) -> Result<()> {
 /// if that finds it not empty: something added an entry, or the listing
 /// went on from a position that, on a filesystem whose positions count
 /// entries, skipped entries once earlier ones were removed. It fails once
-/// `deadline` passes.
+/// `deadline` passes, and at once when the top directory is found not
+/// empty but `name` no longer names it: another removal took it and
+/// something made a new directory there, and the old one, read through its
+/// handle, only ever reads empty.
 fn remove_tree_at(parent: &File, name: &OsStr, deadline: &Deadline) -> Result<()> {
     let what = "removing a directory tree";
     match kind_at(parent, name)? {
@@ -611,6 +615,12 @@ fn remove_tree_at(parent: &File, name: &OsStr, deadline: &Deadline) -> Result<()
         match removed {
             Ok(()) | Err(Errno::NOENT) if depth == 0 => return Ok(()),
             Ok(()) | Err(Errno::NOENT) => resume = levels.ascend(),
+            Err(Errno::NOTEMPTY | Errno::EXIST) if depth == 0 && replaced(parent, name, &top)? => {
+                return Err(SandboxError::Io {
+                    what,
+                    source: io::Error::other("another directory took its place meanwhile"),
+                });
+            }
             Err(Errno::NOTEMPTY | Errno::EXIST) => {}
             Err(err) => return Err(errno(what)(err)),
         }
@@ -682,6 +692,18 @@ fn move_up(parent: &File, name: &CStr, top: &File, to: &str) -> Result<bool> {
     }
     match rustix::fs::renameat(parent, name, top, to) {
         Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
+        Err(err) => Err(errno(what)(err)),
+    }
+}
+
+/// Whether `name` in `parent` is now another entry than the directory
+/// `dir` is open on; not if it is missing.
+fn replaced(parent: &File, name: &OsStr, dir: &File) -> Result<bool> {
+    let what = "removing a directory tree";
+    let open = rustix::fs::fstat(dir).map_err(errno(what))?;
+    match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(now) => Ok(now.st_dev != open.st_dev || now.st_ino != open.st_ino),
         Err(Errno::NOENT) => Ok(false),
         Err(err) => Err(errno(what)(err)),
     }
@@ -1055,9 +1077,10 @@ mod fs_tests {
         fs::create_dir_all(claude.join("settings.json/nested")).unwrap();
         fs::rename(&claude, session_dir.join("claude-old")).unwrap();
         symlink(outside.path(), &claude).unwrap();
-        layout.write_settings(&handle).unwrap();
+        let deadline = Deadline::new();
+        layout.write_settings(&handle, &deadline).unwrap();
         layout
-            .place_skills(&handle, &SkillsEntry::MountPoint)
+            .place_skills(&handle, &SkillsEntry::MountPoint, &deadline)
             .unwrap();
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
         let old = session_dir.join("claude-old");
@@ -1746,6 +1769,20 @@ mod fs_tests {
         }
         read.sort();
         assert_eq!(read, ["a", "b"]);
+    }
+
+    #[test]
+    fn a_directory_in_the_removed_ones_place_is_told_apart() {
+        let dir = TempDir::new("sandbox-test");
+        let parent = open_dir(dir.path()).unwrap();
+        fs::create_dir(dir.join("t")).unwrap();
+        let top = open_dir(&dir.join("t")).unwrap();
+        assert!(!replaced(&parent, OsStr::new("t"), &top).unwrap());
+        fs::remove_dir(dir.join("t")).unwrap();
+        assert!(!replaced(&parent, OsStr::new("t"), &top).unwrap());
+        fs::create_dir(dir.join("t")).unwrap();
+        fs::write(dir.join("t/x"), "x").unwrap();
+        assert!(replaced(&parent, OsStr::new("t"), &top).unwrap());
     }
 
     #[test]
