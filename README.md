@@ -261,6 +261,9 @@ on the old id apply to the new one too. Apps created before
 agentd listened for that are updated with their owner's configuration
 token, without a new install; `/agent me` lists the ones still waiting.
 
+[`deploy/slack/README.md`](deploy/slack/README.md) is the runbook for the
+manual live checks against a real Slack workspace.
+
 ### Cloud hand-off
 
 A member can hand long repository work, such as a pull request that takes an
