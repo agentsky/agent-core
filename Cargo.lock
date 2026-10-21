@@ -2512,6 +2512,8 @@ dependencies = [
  "futures",
  "hmac",
  "http-body-util",
+ "render",
+ "reqwest",
  "secrecy",
  "serde",
  "serde_json",
@@ -2524,6 +2526,7 @@ dependencies = [
  "tower",
  "tracing",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]
