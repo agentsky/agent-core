@@ -419,14 +419,17 @@ impl Dedup for StoreDedup {
 ///   What is dropped for this is logged at debug level at most once per
 ///   binding per [`WARNING_INTERVAL`], the next line saying how many went
 ///   quiet.
-/// - To an agent's app: a message goes to [`Messages`], without waiting.
+/// - To an agent's app: a message goes to [`Messages`], without waiting,
+///   and a channel id change to
+///   [`SlackAgents::channel_id_changed`](agents::SlackAgents::channel_id_changed),
+///   which records it and settles it in a task of its own.
 ///
 /// Everything else is logged by binding and kind and dropped.
 #[derive(Debug, Clone)]
 pub struct Inbound {
     store: Store,
     manager: Option<(ManagerIdentity, CommandSubmitter)>,
-    agents: Option<Messages>,
+    agents: Option<(Messages, agents::SlackAgents)>,
     outsiders: Arc<Throttle<BindingId>>,
 }
 
@@ -461,9 +464,10 @@ impl Inbound {
         }
     }
 
-    /// Also hands messages to agents' apps to `messages`.
-    pub fn with_agents(mut self, messages: Messages) -> Self {
-        self.agents = Some(messages);
+    /// Also hands messages to agents' apps to `messages`, and the channel
+    /// id changes they are told of to `agents`.
+    pub fn with_agents(mut self, messages: Messages, agents: agents::SlackAgents) -> Self {
+        self.agents = Some((messages, agents));
         self
     }
 
@@ -531,13 +535,16 @@ impl Sink<SlackInbound> for Inbound {
                 tracing::debug!(%binding, kind, team = ?item.team(), "a request to an agent's app from another workspace; dropped it");
                 return Ok(());
             }
-            match item {
-                SlackInbound::Message(event, place) => match &self.agents {
-                    Some(messages) => messages.hand(*event, place),
-                    None => {
-                        tracing::debug!(%binding, "agentd doesn't serve agents' apps; dropped a message")
-                    }
-                },
+            match (item, &self.agents) {
+                (SlackInbound::Message(event, place), Some((messages, _))) => {
+                    messages.hand(*event, place);
+                }
+                (SlackInbound::ChannelIdChanged(changed), Some((_, agents))) => {
+                    agents.channel_id_changed(changed).await;
+                }
+                (SlackInbound::Message(..) | SlackInbound::ChannelIdChanged(_), None) => {
+                    tracing::debug!(%binding, kind, "agentd doesn't serve agents' apps; dropped a request");
+                }
                 _ => {
                     tracing::debug!(%binding, kind, "a request to an agent's app that isn't a message; dropped it")
                 }
@@ -564,6 +571,7 @@ impl Sink<SlackInbound> for Inbound {
                 self.member_left(&event, identity.enterprise.as_ref()).await;
                 None
             }
+            SlackInbound::ChannelIdChanged(_) => None,
             SlackInbound::Interaction(interaction)
                 if interaction.sender_team.as_ref() != Some(&identity.team) =>
             {

@@ -98,7 +98,11 @@
 //!   never reach the queue (see [Agents' apps](#agents-apps)); the manager
 //!   app's, which only its operators can sign, are handed on as they came.
 //! - Other events by `event_id`, under the source `slack:<binding>`, which
-//!   drops Slack's retries.
+//!   drops Slack's retries. A `channel_id_changed` to an agent's app takes
+//!   no token from its owner's bucket, which other members' messages drain:
+//!   Slack sends it once, and dropping it would leave the agent's rules on
+//!   an id the channel no longer has. The app's own rate and in-flight
+//!   places, taken before its 200, bound it.
 //! - Slash commands and interactivity by their signature, under
 //!   `slack:<binding>:request`. Slack doesn't retry them, so a second copy is
 //!   a replay inside the five-minute window.
@@ -154,6 +158,8 @@
 //! - A `message` event's `channel`: `C`, `D` or `G` and 1 to 64 uppercase
 //!   letters or digits; its `ts` and `thread_ts`: 10 to 20 digits, the
 //!   first not a zero, a dot and 6 digits.
+//! - A `channel_id_changed` event's `old_channel_id` and `new_channel_id`,
+//!   both required, shaped like a message's `channel`, and not the same.
 //!
 //! A message's sender is no key, so it is not checked here: [`normalize`]
 //! drops a message whose `user` or `bot_id` isn't shaped like Slack's,
@@ -164,8 +170,11 @@
 //! # Agents' apps
 //!
 //! An agent's app is only a way to reach the agent, so of what it is sent
-//! only `message` events are queued. Its other events, its slash commands
-//! and its interactions get an empty 200 and are dropped, and so is a
+//! only `message` events are queued, and `channel_id_changed`, which says a
+//! private channel its bot is in got a new id as it was shared with
+//! another organization ([`SlackInbound::ChannelIdChanged`]). Its other
+//! events, its slash commands and its interactions get an empty 200 and are
+//! dropped, and so is a
 //! message whose `ts` is more than
 //! [`CONFIRM_WINDOW`](crate::surface::CONFIRM_WINDOW) before it arrived,
 //! which [`Surface::confirm`](core_types::Surface::confirm) would refuse.
@@ -188,7 +197,8 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use core_types::{
-    BindingId, ConvRef, MemberId, MemberKey, Sender, SurfaceKind, TeamId, Throttle, UserId,
+    BindingId, ConvRef, ConversationId, MemberId, MemberKey, Sender, SurfaceKind, TeamId, Throttle,
+    UserId,
 };
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use secrecy::SecretString;
@@ -200,7 +210,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
-use crate::inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
+use crate::inbound::{ChannelIdChanged, Interaction, SlackEvent, SlackInbound, SlashCommand};
 use crate::normalize::{self, is_channel_id, is_event_id, is_team_id, is_ts};
 use crate::surface::within_window;
 use crate::verify::{self, SIGNATURE_HEADER};
@@ -1233,6 +1243,28 @@ struct EventHead {
     kind: Option<String>,
 }
 
+/// The ids a `channel_id_changed` event names.
+#[derive(Deserialize)]
+struct ChannelChangeHead {
+    event: ChannelChangeIds,
+}
+
+#[derive(Deserialize)]
+struct ChannelChangeIds {
+    old_channel_id: Option<String>,
+    new_channel_id: Option<String>,
+}
+
+impl ChannelChangeIds {
+    /// Both ids, when both are there, shaped like a channel's, and not
+    /// the same.
+    fn ids(self) -> Option<(ConversationId, ConversationId)> {
+        let shaped = |id: Option<String>| id.filter(|id| is_channel_id(id));
+        let (old, new) = (shaped(self.old_channel_id)?, shaped(self.new_channel_id)?);
+        (old != new).then(|| (old.into(), new.into()))
+    }
+}
+
 /// The ids a `message` event is deduplicated and kept by.
 #[derive(Deserialize)]
 struct MessageHead {
@@ -1313,9 +1345,11 @@ fn check(
                 serde_json::from_slice(body).map_err(|_| "not an Events API envelope")?;
             match head.kind.as_str() {
                 "event_callback" => Ok(match check_callback(&head, body)? {
-                    None if agent => Checked::Ignore("an agent's app's event other than a message"),
+                    Callback::Other if agent => {
+                        Checked::Ignore("an agent's app's event it doesn't need")
+                    }
                     _ if head.authorizations.0.is_none() => Checked::Uninstalled,
-                    Some(ts)
+                    Callback::Message(ts)
                         if agent
                             && ts
                                 .as_deref()
@@ -1349,12 +1383,20 @@ fn check(
     }
 }
 
-/// Checks an `event_callback`'s ids. `Some` of its `ts`, if it has one,
-/// for a `message` event, and `None` for any other.
-fn check_callback(
-    head: &EnvelopeHead,
-    body: &[u8],
-) -> Result<Option<Option<String>>, &'static str> {
+/// What kind of event an `event_callback` carries, as [`check`] tells
+/// them apart.
+enum Callback {
+    /// A `message`, with its `ts` if it has one.
+    Message(Option<String>),
+    /// A `channel_id_changed`.
+    ChannelIdChanged,
+    /// Any other event.
+    Other,
+}
+
+/// Checks an `event_callback`'s ids, and says what kind of event it
+/// carries.
+fn check_callback(head: &EnvelopeHead, body: &[u8]) -> Result<Callback, &'static str> {
     let Some(event) = &head.event else {
         return Err("an event_callback without an event");
     };
@@ -1364,8 +1406,17 @@ fn check_callback(
     if !head.team_id.as_deref().is_none_or(is_team_id) {
         return Err("the team_id isn't shaped like Slack's");
     }
-    if event.kind.as_deref() != Some("message") {
-        return Ok(None);
+    match event.kind.as_deref() {
+        Some("message") => {}
+        Some("channel_id_changed") => {
+            let ChannelChangeHead { event: ids } = serde_json::from_slice(body)
+                .map_err(|_| "a channel_id_changed event whose channel ids aren't strings")?;
+            ids.ids().ok_or(
+                "a channel_id_changed event without two different channel ids shaped like Slack's",
+            )?;
+            return Ok(Callback::ChannelIdChanged);
+        }
+        _ => return Ok(Callback::Other),
     }
     let MessageHead { event: ids } = serde_json::from_slice(body)
         .map_err(|_| "a message event whose channel, ts or thread_ts isn't a string")?;
@@ -1379,7 +1430,7 @@ fn check_callback(
     {
         return Err("the message's ts or thread_ts isn't shaped like Slack's");
     }
-    Ok(Some(ids.ts))
+    Ok(Callback::Message(ids.ts))
 }
 
 fn command_form(body: &[u8]) -> Result<CommandForm, &'static str> {
@@ -1472,26 +1523,14 @@ async fn process(
         signature,
         place,
     } = queued;
-    let reparsed = |what: &'static str| match note(notes, binding, Note::Reparsed) {
-        Some(quiet) => tracing::warn!(
-            %binding,
-            kind = kind.as_str(),
-            what,
-            dropped_since_last_warning = quiet,
-            "a queued Slack request no longer parses; dropped it"
-        ),
-        None => {
-            tracing::debug!(%binding, kind = kind.as_str(), what, "a queued Slack request no longer parses; dropped it")
-        }
-    };
     match kind {
         Kind::Events => {
             let callback: EventCallback = serde_json::from_slice(&body)
-                .inspect_err(|_| reparsed("the event"))
+                .inspect_err(|_| reparsed(notes, binding, "the event"))
                 .ok()?;
             drop(body);
             let Some(team) = callback.authorizations.0.clone() else {
-                reparsed("the event's installation");
+                reparsed(notes, binding, "the event's installation");
                 return None;
             };
             if workspace.is_some_and(|workspace| *workspace != team) {
@@ -1516,7 +1555,7 @@ async fn process(
         }
         Kind::Commands => {
             let form = command_form(&body)
-                .inspect_err(|_| reparsed("the slash command"))
+                .inspect_err(|_| reparsed(notes, binding, "the slash command"))
                 .ok()?;
             if !first_time(
                 dedup,
@@ -1553,7 +1592,7 @@ async fn process(
                 .ok()
                 .and_then(|form| serde_json::from_str::<Map<String, Value>>(&form.payload).ok())
                 .or_else(|| {
-                    reparsed("the interaction");
+                    reparsed(notes, binding, "the interaction");
                     None
                 })?;
             drop(body);
@@ -1643,18 +1682,40 @@ async fn process_event(
         .to_owned();
     let event = Value::Object(event);
     if event_type != "message" {
+        let changed = if event_type == "channel_id_changed" {
+            let Some(ids) = ChannelChangeIds::deserialize(&event)
+                .ok()
+                .and_then(ChannelChangeIds::ids)
+            else {
+                reparsed(notes, binding, "the channel_id_changed event");
+                return None;
+            };
+            Some(ids)
+        } else {
+            None
+        };
         if !first_time(dedup, &format!("slack:{binding}"), &event_id, binding).await {
             tracing::debug!(%binding, event_id, "dropped a Slack event already handled");
             return None;
         }
-        return Some(SlackInbound::Event(SlackEvent {
-            binding: binding.id(),
-            team: team.clone(),
-            event_id,
-            event_type,
-            event,
-            received_at,
-        }));
+        return Some(match changed {
+            Some((old, new)) => SlackInbound::ChannelIdChanged(ChannelIdChanged {
+                binding: binding.id(),
+                team: team.clone(),
+                event_id,
+                old,
+                new,
+                received_at,
+            }),
+            None => SlackInbound::Event(SlackEvent {
+                binding: binding.id(),
+                team: team.clone(),
+                event_id,
+                event_type,
+                event,
+                received_at,
+            }),
+        });
     }
     let context = normalize::Context {
         binding: binding.id(),
@@ -1709,6 +1770,23 @@ async fn process_event(
         return None;
     }
     Some(SlackInbound::Message(Box::new(message), place))
+}
+
+/// Logs a queued body whose `what` no longer parses, which only a signed,
+/// crafted body can be, at most once per binding per
+/// [`WARNING_INTERVAL`] as a warning.
+fn reparsed(notes: &Notes, binding: BindingRef, what: &'static str) {
+    match note(notes, binding, Note::Reparsed) {
+        Some(quiet) => tracing::warn!(
+            %binding,
+            what,
+            dropped_since_last_warning = quiet,
+            "a queued Slack request no longer parses; dropped it"
+        ),
+        None => {
+            tracing::debug!(%binding, what, "a queued Slack request no longer parses; dropped it")
+        }
+    }
 }
 
 async fn first_time(dedup: &dyn Dedup, source: &str, key: &str, binding: BindingRef) -> bool {
@@ -1914,6 +1992,65 @@ mod tests {
         give_back(&places, again, now + Duration::from_secs(60));
         let taken = places.taken.lock().unwrap();
         assert!(taken.agent_buckets.is_empty() && taken.owner_buckets.is_empty());
+    }
+
+    #[derive(Default)]
+    struct Seen(Mutex<Vec<(String, String)>>);
+
+    #[async_trait::async_trait]
+    impl Dedup for Seen {
+        async fn first_time(&self, source: &str, key: &str) -> Result<bool, BoxError> {
+            let mut seen = self.0.lock().unwrap();
+            let entry = (source.to_owned(), key.to_owned());
+            let first = !seen.contains(&entry);
+            seen.push(entry);
+            Ok(first)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_channel_id_change_is_kept_when_its_owners_bucket_is_empty() {
+        let places = places(64);
+        let (binding, owner) = (BindingId::new_v4(), MemberId::new_v4());
+        let notes = Throttle::new(WARNING_INTERVAL);
+        let team = TeamId::from("T0TEAM001");
+        let context = EventContext {
+            binding: BindingRef::Agent(binding),
+            bot_user: None,
+            team: &team,
+            home_org: None,
+            received_at: OffsetDateTime::now_utc(),
+        };
+        let callback = |event_id: &str| EventCallback {
+            authorizations: Installation(Some(team.clone())),
+            event_id: event_id.to_owned(),
+            event: serde_json::json!({
+                "type": "channel_id_changed",
+                "old_channel_id": "G0PRIVAT1",
+                "new_channel_id": "C0PRIVAT1",
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        };
+        let dedup = Seen::default();
+        let place = places.take(seat(binding, owner), Instant::now()).unwrap();
+        while place.keep(Instant::now()) {}
+        let kept = process_event(&context, callback("Ev0KEPT1"), &dedup, &notes, place).await;
+        assert!(
+            matches!(kept, Some(SlackInbound::ChannelIdChanged(ref changed)) if changed.old.as_str() == "G0PRIVAT1" && changed.new.as_str() == "C0PRIVAT1"),
+            "{kept:?}"
+        );
+        let place = places.take(seat(binding, owner), Instant::now()).unwrap();
+        let again = process_event(&context, callback("Ev0KEPT1"), &dedup, &notes, place).await;
+        assert!(again.is_none(), "{again:?}");
+        assert_eq!(
+            dedup.0.lock().unwrap().clone(),
+            [
+                (format!("slack:{binding}"), "Ev0KEPT1".to_owned()),
+                (format!("slack:{binding}"), "Ev0KEPT1".to_owned())
+            ],
+        );
     }
 
     #[test]

@@ -49,6 +49,7 @@ use time::OffsetDateTime;
 use tokio::sync::Semaphore;
 
 mod agents;
+mod channel_id_changes;
 mod claude_links;
 mod cloud;
 mod community;
@@ -74,6 +75,7 @@ pub use agents::{
     ActiveBot, Agent, AgentBinding, AgentCreation, AgentState, BindingState, DirectoryEntry,
     NewAgent, PendingRetirement, Visibility,
 };
+pub use channel_id_changes::{ChannelIdChange, ChannelIdChangeRecord, KnownChannelIdChange};
 pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink};
 pub use cloud::{
     CLOUD_HANDOFF_WINDOW, CLOUD_NOTICE_GIVE_UP, CLOUD_NOTICE_LEASE, CloudBegun, CloudDeleted,
@@ -93,7 +95,9 @@ pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use sessions::{RESETS_AT_ONCE, Session, SessionKind, ThreadSession};
 pub use skills::{AgentSkill, NewSkill, SkillState};
-pub use slack_apps::{InstallReminder, NewSlackApp, SlackAppBinding, SlackAppKeys};
+pub use slack_apps::{
+    InstallReminder, ManifestUpdate, NewSlackApp, OutdatedSlackApp, SlackAppBinding, SlackAppKeys,
+};
 pub use slack_config_tokens::{
     NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
 };
@@ -424,6 +428,7 @@ mod tests {
                 "agent_skills",
                 "agents",
                 "bans",
+                "channel_id_changes",
                 "claude_link_generations",
                 "claude_links",
                 "cloud_handoffs",

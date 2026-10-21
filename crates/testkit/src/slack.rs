@@ -48,6 +48,11 @@ pub const OUTSIDE_TEAM: &str = "T0THEIRS1";
 pub const HOME_ORG: &str = "E0HOMEORG";
 /// The externally shared channel the Slack Connect fixtures are in.
 pub const SHARED_CHANNEL: &str = "C0SHARED1";
+/// A private channel's id before it was shared with another organization,
+/// in [`CHANNEL_ID_CHANGED`].
+pub const PRIVATE_CHANNEL: &str = "G0PRIVAT1";
+/// [`PRIVATE_CHANNEL`]'s id once it was shared, in [`CHANNEL_ID_CHANGED`].
+pub const PRIVATE_CHANNEL_SHARED: &str = "C0PRIVAT1";
 
 /// A `url_verification` request, whose challenge is [`CHALLENGE`].
 pub const URL_VERIFICATION: &str = include_str!("../fixtures/slack/url_verification.json");
@@ -128,8 +133,13 @@ pub const BLOCK_ACTIONS_WITHOUT_USER_TEAM: &str =
 pub const BLOCK_ACTIONS_OUTSIDE: &str =
     include_str!("../fixtures/slack/block_actions_outside.json");
 
+/// A `channel_id_changed` event to the agent app: [`PRIVATE_CHANNEL`] is
+/// now [`PRIVATE_CHANNEL_SHARED`], in the shape of Slack's documentation of
+/// the event, inside the Events API envelope every event comes in.
+pub const CHANNEL_ID_CHANGED: &str = include_str!("../fixtures/slack/channel_id_changed.json");
+
 /// Every fixture, by file name.
-pub const ALL: [(&str, &str); 23] = [
+pub const ALL: [(&str, &str); 24] = [
     ("url_verification.json", URL_VERIFICATION),
     ("message_mention.json", MESSAGE_MENTION),
     ("message_plain.json", MESSAGE_PLAIN),
@@ -165,6 +175,7 @@ pub const ALL: [(&str, &str); 23] = [
         BLOCK_ACTIONS_WITHOUT_USER_TEAM,
     ),
     ("block_actions_outside.json", BLOCK_ACTIONS_OUTSIDE),
+    ("channel_id_changed.json", CHANNEL_ID_CHANGED),
 ];
 
 /// Slack's `v0` signature of `body` sent at `timestamp` (Unix seconds),
@@ -258,7 +269,10 @@ mod tests {
     #[test]
     fn event_fixtures_are_event_callbacks_from_the_team() {
         for (name, fixture) in ALL {
-            if !name.starts_with("message_") && name != "user_change.json" {
+            if !name.starts_with("message_")
+                && name != "user_change.json"
+                && name != "channel_id_changed.json"
+            {
                 continue;
             }
             let value = json(fixture);
@@ -280,6 +294,9 @@ mod tests {
         assert_eq!(json(MESSAGE_MENTION)["event"]["channel"], CHANNEL);
         assert_eq!(json(MESSAGE_MENTION)["event"]["user"], USER);
         assert_eq!(json(MESSAGE_MPIM)["event"]["user"], OTHER_USER);
+        let changed = &json(CHANNEL_ID_CHANGED)["event"];
+        assert_eq!(changed["old_channel_id"], PRIVATE_CHANNEL);
+        assert_eq!(changed["new_channel_id"], PRIVATE_CHANNEL_SHARED);
     }
 
     #[test]
