@@ -11,6 +11,7 @@
 //! - [`turn`]: who a turn runs for and on which credential.
 //! - [`surface_trait`]: the [`Surface`] trait and the types it uses.
 //! - [`ctl`]: request and response types of the agentctl API.
+//! - [`net`]: [`Cidr`] subnets.
 //!
 //! Every item is re-exported at the crate root, except
 //! [`surface_trait::Result`], which would shadow `std`'s.
@@ -20,6 +21,7 @@
 pub mod ctl;
 pub mod event;
 pub mod ids;
+pub mod net;
 pub mod scope;
 pub mod surface;
 pub mod surface_trait;
@@ -28,6 +30,7 @@ pub mod turn;
 pub use ctl::*;
 pub use event::*;
 pub use ids::*;
+pub use net::*;
 pub use scope::*;
 pub use surface::*;
 pub use surface_trait::{

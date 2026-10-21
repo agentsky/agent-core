@@ -14,6 +14,7 @@ use rand::rngs::SysRng;
 use secrecy::zeroize::Zeroize as _;
 use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
+use tokio::sync::watch;
 
 /// Random bytes in a placeholder, after its prefix.
 const RANDOM_BYTES: usize = 32;
@@ -152,9 +153,14 @@ struct Entry {
 /// A container address belongs to at most one session: minting for an
 /// address revokes other sessions' placeholders bound to it, since Docker
 /// may give a dead container's address to a new one.
+///
+/// Once a session has no live placeholder left, however it lost them, its
+/// egress tunnels close: the egress proxy watches the session through the
+/// registry, so revoking needs no other call.
 #[derive(Clone, Default)]
 pub struct Registry {
     entries: Arc<Mutex<HashMap<PlaceholderId, Entry>>>,
+    watchers: Arc<Mutex<HashMap<SessionId, watch::Sender<()>>>>,
 }
 
 impl fmt::Debug for Registry {
@@ -220,9 +226,17 @@ impl Registry {
         let id = PlaceholderId::of(&token);
         let mut entries = self.lock();
         let before = entries.len();
-        entries.retain(|_, entry| entry.ip != ip || entry.session == session);
+        let mut losers = Vec::new();
+        entries.retain(|_, entry| {
+            let keep = entry.ip != ip || entry.session == session;
+            if !keep && !losers.contains(&entry.session) {
+                losers.push(entry.session);
+            }
+            keep
+        });
         let displaced = before - entries.len();
         if displaced > 0 {
+            self.release_watchers(&entries, &losers);
             tracing::warn!(
                 %session,
                 %ip,
@@ -283,24 +297,66 @@ impl Registry {
         }
     }
 
-    /// Revokes the placeholder. Returns whether it was live.
+    /// Revokes the placeholder. Returns whether it was live. If it was its
+    /// session's last, the session's egress tunnels close.
     pub fn revoke(&self, id: PlaceholderId) -> bool {
-        self.lock().remove(&id).is_some()
+        let mut entries = self.lock();
+        let Some(revoked) = entries.remove(&id) else {
+            return false;
+        };
+        self.release_watchers(&entries, &[revoked.session]);
+        true
     }
 
     /// Revokes every placeholder of `session`, before its container is
-    /// stopped and again when it dies. Returns how many were live.
+    /// stopped and again when it dies, and closes the session's egress
+    /// tunnels. Returns how many were live.
     pub fn revoke_session(&self, session: SessionId) -> usize {
         let mut entries = self.lock();
         let before = entries.len();
         entries.retain(|_, entry| entry.session != session);
+        self.release_watchers(&entries, &[session]);
         before - entries.len()
     }
 
-    /// Whether any live placeholder is bound to `ip`.
-    pub(crate) fn knows(&self, ip: IpAddr) -> bool {
+    /// Drops the watch senders of those of `losers`, the sessions that just
+    /// lost placeholders, with none left in `entries`, which ends their
+    /// receivers. Called with the entries locked, so a session can't be
+    /// watched after its last revocation.
+    fn release_watchers(&self, entries: &HashMap<PlaceholderId, Entry>, losers: &[SessionId]) {
+        let mut watchers = self.watchers.lock().unwrap_or_else(PoisonError::into_inner);
+        for session in losers {
+            if !entries.values().any(|entry| entry.session == *session) {
+                watchers.remove(session);
+            }
+        }
+    }
+
+    /// The session whose live placeholders are bound to `ip`, and a
+    /// receiver whose sender is dropped once that session has no live
+    /// placeholder left.
+    pub(crate) fn watch_source(&self, ip: IpAddr) -> Option<(SessionId, watch::Receiver<()>)> {
         let ip = ip.to_canonical();
-        self.lock().values().any(|entry| entry.ip == ip)
+        let entries = self.lock();
+        let session = entries.values().find(|entry| entry.ip == ip)?.session;
+        let receiver = self
+            .watchers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(session)
+            .or_insert_with(|| watch::Sender::new(()))
+            .subscribe();
+        Some((session, receiver))
+    }
+
+    /// The session whose live placeholders are bound to `ip`, if any. An
+    /// address belongs to at most one session.
+    pub(crate) fn session_at(&self, ip: IpAddr) -> Option<SessionId> {
+        let ip = ip.to_canonical();
+        self.lock()
+            .values()
+            .find(|entry| entry.ip == ip)
+            .map(|entry| entry.session)
     }
 
     /// Checks `token`, presented from `ip` in the header for `kind`.
@@ -497,8 +553,8 @@ mod tests {
         assert_eq!(registry.revoke_session(session), 1);
         assert_eq!(registry.revoke_session(session), 0);
         assert!(!registry.is_live(second.id(), IP));
-        assert!(!registry.knows(IP));
-        assert!(registry.knows(OTHER_IP));
+        assert_eq!(registry.session_at(IP), None);
+        assert_eq!(registry.session_at(OTHER_IP), Some(other));
         assert!(registry.is_live(kept.id(), OTHER_IP));
     }
 
@@ -530,12 +586,50 @@ mod tests {
         registry
             .point(placeholder.id(), CredentialRef::Community)
             .unwrap();
-        assert!(registry.knows(IP));
+        assert_eq!(registry.session_at(IP), Some(session));
         assert!(
             registry
                 .authorize(placeholder.expose_secret(), IP, CredentialKind::ApiKey)
                 .is_ok()
         );
-        assert!(!registry.knows(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(registry.session_at(IpAddr::V6(Ipv6Addr::LOCALHOST)), None);
+    }
+
+    #[test]
+    fn a_session_watch_ends_when_its_last_placeholder_goes() {
+        let registry = Registry::new();
+        let session = SessionId::new_v4();
+        assert!(registry.watch_source(IP).is_none());
+        let first = registry
+            .mint(session, IP, CredentialKind::Subscription)
+            .unwrap();
+        let second = registry.mint(session, IP, CredentialKind::ApiKey).unwrap();
+        let (watched, watch) = registry.watch_source(IP).unwrap();
+        assert_eq!(watched, session);
+        registry.unpoint(first.id());
+        assert!(registry.revoke(first.id()));
+        assert!(watch.has_changed().is_ok());
+        assert!(registry.revoke(second.id()));
+        assert!(watch.has_changed().is_err());
+        assert!(registry.watch_source(IP).is_none());
+
+        registry
+            .mint(session, IP, CredentialKind::Subscription)
+            .unwrap();
+        let (_, watch) = registry.watch_source(IP).unwrap();
+        let (_, other_watch) = {
+            registry
+                .mint(SessionId::new_v4(), OTHER_IP, CredentialKind::Subscription)
+                .unwrap();
+            registry.watch_source(OTHER_IP).unwrap()
+        };
+        assert_eq!(registry.revoke_session(session), 1);
+        assert!(watch.has_changed().is_err());
+        assert!(other_watch.has_changed().is_ok());
+
+        registry
+            .mint(SessionId::new_v4(), OTHER_IP, CredentialKind::Subscription)
+            .unwrap();
+        assert!(other_watch.has_changed().is_err());
     }
 }
