@@ -1,0 +1,54 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "type": "message",
+    "subtype": "file_share",
+    "text": "here is the log",
+    "files": [
+      {
+        "id": "F0FILE0001",
+        "created": 1727698400,
+        "timestamp": 1727698400,
+        "name": "build.log",
+        "title": "build.log",
+        "mimetype": "text/plain",
+        "filetype": "text",
+        "pretty_type": "Plain Text",
+        "user": "U0HUMAN01",
+        "user_team": "T0TEAM001",
+        "editable": true,
+        "size": 2048,
+        "mode": "snippet",
+        "is_external": false,
+        "external_type": "",
+        "is_public": false,
+        "public_url_shared": false,
+        "display_as_bot": false,
+        "username": "",
+        "url_private": "https://files.slack.com/files-pri/T0TEAM001-F0FILE0001/build.log",
+        "url_private_download": "https://files.slack.com/files-pri/T0TEAM001-F0FILE0001/download/build.log",
+        "permalink": "https://example.slack.com/files/U0HUMAN01/F0FILE0001/build.log",
+        "has_rich_preview": false,
+        "file_access": "visible"
+      }
+    ],
+    "upload": false,
+    "user": "U0HUMAN01",
+    "display_as_bot": false,
+    "ts": "1727698400.001000",
+    "client_msg_id": "2c3b1e8e-5d0a-4f0e-9d4c-0c3f1f2a7b08",
+    "channel": "D0DM00001",
+    "event_ts": "1727698400.001000",
+    "channel_type": "im"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0FILE0001",
+  "event_time": 1727698400,
+  "authorizations": [
+    {"enterprise_id": null, "team_id": "T0TEAM001", "user_id": "U0BOT0001", "is_bot": true, "is_enterprise_install": false}
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ"
+}

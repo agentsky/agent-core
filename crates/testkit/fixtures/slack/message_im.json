@@ -1,0 +1,33 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "user": "U0HUMAN01",
+    "type": "message",
+    "ts": "1727697900.000500",
+    "client_msg_id": "2c3b1e8e-5d0a-4f0e-9d4c-0c3f1f2a7b05",
+    "text": "what did we decide yesterday?",
+    "team": "T0TEAM001",
+    "blocks": [
+      {
+        "type": "rich_text",
+        "block_id": "Dm1a",
+        "elements": [
+          {"type": "rich_text_section", "elements": [{"type": "text", "text": "what did we decide yesterday?"}]}
+        ]
+      }
+    ],
+    "channel": "D0DM00001",
+    "event_ts": "1727697900.000500",
+    "channel_type": "im"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0IM000001",
+  "event_time": 1727697900,
+  "authorizations": [
+    {"enterprise_id": null, "team_id": "T0TEAM001", "user_id": "U0BOT0001", "is_bot": true, "is_enterprise_install": false}
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ"
+}

@@ -1,0 +1,37 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "type": "message",
+    "subtype": "message_changed",
+    "message": {
+      "user": "U0HUMAN01",
+      "type": "message",
+      "edited": {"user": "U0HUMAN01", "ts": "1727698500.000000"},
+      "text": "<@U0BOT0001> can you summarize this thread? (edited)",
+      "ts": "1727697600.000100",
+      "source_team": "T0TEAM001",
+      "user_team": "T0TEAM001"
+    },
+    "previous_message": {
+      "user": "U0HUMAN01",
+      "type": "message",
+      "text": "<@U0BOT0001> can you summarize this thread?",
+      "ts": "1727697600.000100"
+    },
+    "channel": "C0CHAN001",
+    "hidden": true,
+    "ts": "1727698500.001100",
+    "event_ts": "1727698500.001100",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0CHANGED1",
+  "event_time": 1727698500,
+  "authorizations": [
+    {"enterprise_id": null, "team_id": "T0TEAM001", "user_id": "U0BOT0001", "is_bot": true, "is_enterprise_install": false}
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ"
+}
