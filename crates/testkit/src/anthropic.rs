@@ -29,7 +29,8 @@ pub async fn fake_anthropic() -> FakeAnthropic {
 ///   `content_block_stop`, `message_delta` with `stop_reason: end_turn` and
 ///   `usage`, and `message_stop`. Any other request gets the same message as
 ///   JSON. A body that isn't JSON gets a 400 `invalid_request_error`.
-/// - Anything else gets a 404.
+/// - Anything else gets a 404, unless a mock added with
+///   [`register`](Self::register) answers it.
 ///
 /// Every request is recorded with its headers and body, whatever the
 /// answer; see [`requests`](Self::requests).
@@ -42,7 +43,16 @@ pub struct FakeAnthropic {
 impl FakeAnthropic {
     /// Starts the server on a free local port.
     pub async fn start() -> Self {
-        let server = MockServer::start().await;
+        Self::serve(MockServer::start().await).await
+    }
+
+    /// Starts the server on `listener`, for a fake at an address fixed in
+    /// advance.
+    pub async fn start_on(listener: std::net::TcpListener) -> Self {
+        Self::serve(MockServer::builder().listener(listener).start().await).await
+    }
+
+    async fn serve(server: MockServer) -> Self {
         let replies = Arc::new(Mutex::new(VecDeque::new()));
         Mock::given(method("HEAD"))
             .and(path("/api/hello"))
@@ -57,6 +67,13 @@ impl FakeAnthropic {
             .mount(&server)
             .await;
         Self { server, replies }
+    }
+
+    /// Adds `mock` to the server, so a request it matches gets its answer
+    /// instead of a 404. At wiremock's default priority it doesn't change
+    /// the answers above, which were mounted first.
+    pub async fn register(&self, mock: Mock) {
+        self.server.register(mock).await;
     }
 
     /// The base URL, `http://127.0.0.1:<port>`, for `ANTHROPIC_BASE_URL`.
@@ -297,5 +314,37 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].headers["x-api-key"], "key-placeholder");
         assert_eq!(messages[0].body, b"not json");
+    }
+
+    #[tokio::test]
+    async fn serves_on_a_given_listener_with_registered_mocks() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let fake = FakeAnthropic::start_on(listener).await;
+        assert_eq!(fake.uri(), format!("http://{address}"));
+        fake.register(
+            Mock::given(method("GET"))
+                .and(path("/api/oauth/profile"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({"ok": true}))),
+        )
+        .await;
+        let profile = client()
+            .get(format!("{}/api/oauth/profile", fake.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(profile.status(), 200);
+        let hello = client()
+            .head(format!("{}/api/hello", fake.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(hello.status(), 200);
+        let other = client()
+            .get(format!("{}/v1/models", fake.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(other.status(), 404);
     }
 }
