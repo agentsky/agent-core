@@ -185,15 +185,16 @@ impl Harness {
             .collect()
     }
 
-    /// Whether the work directory is empty within ten seconds, since a
-    /// work directory goes in a blocking task once its guard drops.
+    /// Whether the work directory is empty within the remover's minute,
+    /// since a work directory goes in a blocking task once its guard drops.
     async fn work_is_empty(&self) -> bool {
         let empty = || {
             std::fs::read_dir(self.data.join(WORK_DIR))
                 .map(|mut entries| entries.next().is_none())
                 .unwrap_or(true)
         };
-        for _ in 0..400 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+        while tokio::time::Instant::now() < deadline {
             if empty() {
                 return true;
             }

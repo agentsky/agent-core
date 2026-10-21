@@ -3649,9 +3649,11 @@ running as the sandbox user without root's override of file modes, gets
 **Solution.** `remove_tree_at` works through handles and never follows a
 symlink: each entry is looked up with `AT_SYMLINK_NOFOLLOW` and opened
 with `O_NOFOLLOW` relative to its parent, and each directory gets mode
-`0700` through its handle before it is read or moved. It goes depth first
-without recursion: files are unlinked and empty directories removed as
-they are read, and the first directory found with something in it is
+`0700` through its handle before it is read, and before it is moved if a
+move fails with `EACCES`, as it does for a directory without write
+permission. It goes depth first without recursion: files are unlinked
+and empty directories removed as they are read, and the first directory
+found with something in it is
 renamed into the top directory as `.removing-<uuid>-<n>`, `n` its level,
 and emptied next. Only a count of the levels is kept, so a tree of any
 depth takes a handful of file descriptors and constant memory beyond the
@@ -3668,13 +3670,15 @@ entries as had been removed before it.
 The moves use plain `renameat`; `renameat2` flags such as
 `RENAME_NOREPLACE` fail on NFS, and the names are unique anyway. Any step
 that finds its entry missing counts it as removed, so two removals of one
-tree, as two agentd instances can make, both succeed. A removal, or all
-the removals of one clear, gives up after a minute, so a process that
-keeps adding entries can't hold a blocking thread, and the session start
-waiting for it, for ever; what was removed by then stays removed, so the
-next attempt goes on from there. The sandbox crate exports the same
-remover as `remove_tree` for agentd's own directories that hold what an
-agent wrote.
+tree, as two agentd instances can make, both succeed; one whose top
+directory another removal took, and whose name something then made a new
+directory at, fails at once instead of reading the old one again. A
+removal, or all the removals of one session start, gives up after a
+minute, so a process that keeps adding entries can't hold a blocking
+thread, and the session start waiting for it, for ever; what was removed
+by then stays removed, so the next attempt goes on from there. The
+sandbox crate exports the same remover as `remove_tree` for agentd's own
+directories that hold what an agent wrote.
 
 ### Several agentd, or test runs, on one Docker host
 
@@ -4637,10 +4641,11 @@ new one, is added. Either write comes before any process gets the turn; if it
 fails, the container is stopped and the turn fails, since otherwise a later
 turn could skip the clear it needs. A crash between a clear and its record
 costs one extra clear. A clear that fails, as one that runs out of time
-against a process still writing does (T17's remover gives a clear a
-minute), fails the start and so the turn with a `Sandbox` error and leaves
-the record as it was; what it removed stays removed, and the next start
-clears again and goes on from there.
+against a process still writing does (the clear and the repair of
+`settings.json` and `skills` after it share one minute of T17's remover
+per start), fails the start and so the turn with a `Sandbox` error and
+leaves the record as it was; what it removed stays removed, and the next
+start clears again and goes on from there.
 
 The warm container's own requester (`Held::requester`) is still checked as
 well: the record says whose turns used the files, and the held requester whose
@@ -6223,12 +6228,13 @@ confirmation fenced out after its move doesn't undo it: whoever holds the
 lease now owns the name, and putting the old skill back could put it under
 their row, so the moved files stay live for the roll forward below. Unlike
 a crash, which leaves the skill they replaced in the work directory for
-startup's purge, the work directory's guard removes it at once. `LEASE_TTL`
-is two minutes: a change makes two store calls, each of which may wait the
-pool's 30-second acquire timeout and then the 5-second busy timeout, about
-70 seconds at worst, and a lease a crash left keeps the name busy for those
-two minutes. The sweeper deletes ended leases, so names nothing changes
-again don't keep rows.
+startup's purge, the work directory's guard hands it to a blocking task
+that removes it once the change is done, or, if agentd stops first, to the
+next purge. `LEASE_TTL` is two minutes: a change makes two store calls,
+each of which may wait the pool's 30-second acquire timeout and then the
+5-second busy timeout, about 70 seconds at worst, and a lease a crash left
+keeps the name busy for those two minutes. The sweeper deletes ended
+leases, so names nothing changes again don't keep rows.
 
 With changes serialized, `confirm` checks the pending directory in place
 and moves it straight into the live one; the move into a work
@@ -8808,9 +8814,11 @@ from taking over meanwhile. It then stops each of the consent's private sessions
 here, and deletes its directory, then records the work finished and
 deletes the staged files. The directories go before the record, so a crash
 between the two leaves nothing: the next claim finishes again and finds
-them gone. A private task's own turn also has its session stopped as soon
-as `run_turn` returns, an error included, so a turn whose send failed
-doesn't leave an owner-side container warm. The test fails the send with a
+them gone. A directory whose removal fails, or runs out of the remover's
+minute, is logged with its path and isn't tried again. A private task's
+own turn also has its session stopped as soon as `run_turn` returns, an
+error included, so a turn whose send failed doesn't leave an owner-side
+container warm. The test fails the send with a
 store trigger, and checks the container is stopped at once and the
 directory gone once the next claim reports the task interrupted.
 
