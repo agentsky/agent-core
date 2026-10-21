@@ -84,14 +84,20 @@ pub(crate) fn skip_reason(message: &Message) -> Option<Skip> {
 
 /// The conversation kind of a room, or `None` for a room type agents don't
 /// take part in, such as omnichannel.
+///
+/// A direct message is a one-to-one [`ConvKind::Dm`] only when its member
+/// count or member list says it has at most two members. One that reports
+/// neither is a [`ConvKind::GroupDm`], since a DM counts as private and
+/// others may be reading.
 pub(crate) fn conv_kind(room: &RoomInfo) -> Option<ConvKind> {
     match room.room_type {
         RoomType::Channel | RoomType::Group => Some(ConvKind::Channel),
         RoomType::Direct => {
-            let members = room
-                .users_count
-                .unwrap_or(0)
-                .max(u64::try_from(room.uids.len()).unwrap_or(u64::MAX));
+            let listed = u64::try_from(room.uids.len()).unwrap_or(u64::MAX);
+            if room.users_count.is_none() && listed == 0 {
+                return Some(ConvKind::GroupDm);
+            }
+            let members = room.users_count.unwrap_or(0).max(listed);
             Some(if members > 2 {
                 ConvKind::GroupDm
             } else {
@@ -247,6 +253,7 @@ mod tests {
         assert_eq!(conv_kind(&room("d", Some(2), &[])), Some(ConvKind::Dm));
         assert_eq!(conv_kind(&room("d", None, &["a", "b"])), Some(ConvKind::Dm));
         assert_eq!(conv_kind(&room("d", None, &["a"])), Some(ConvKind::Dm));
+        assert_eq!(conv_kind(&room("d", None, &[])), Some(ConvKind::GroupDm));
         assert_eq!(conv_kind(&room("d", Some(3), &[])), Some(ConvKind::GroupDm));
         assert_eq!(
             conv_kind(&room("d", None, &["a", "b", "c"])),

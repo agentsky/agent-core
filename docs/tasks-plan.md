@@ -1138,12 +1138,18 @@ Deliverables:
 
 - `crates/agentd/src/commands/`: a dispatcher from `(MemberKey, Command,
   Origin)` to a handler. `Origin` is `SlackSlash { response_url }`,
-  `RocketChatDm` or `RocketChatChannel { room }`.
+  `RocketChatDm { room }` or `RocketChatChannel { room }`. The DM's room
+  saves a `users.info` and `im.create` per reply
+  ([impl-notes](impl-notes.md#a-dm-to-a-member-needs-their-username)).
 - Private reply plumbing: a `reply_private(origin, text)` helper. On Rocket.Chat
   it sends a manager-bot DM; the Slack arm is filled in T30.
 - Rocket.Chat wiring:
   - A DM to the manager bot is parsed whole as a command.
   - A channel message starting with `!agent` is parsed after the prefix.
+  - A `CommandIntake` runs the commands that any connection feeds it, since
+    only the connection that records a message first delivers it
+    ([impl-notes](impl-notes.md#every-bot-connection-has-to-look-for-commands)).
+    The manager bot's connection is its first feeder.
 - Handlers:
   - `login`: start the login and send the link privately.
   - `login <code>`: complete the login.
@@ -1161,7 +1167,12 @@ Deliverables:
   task sends a member exactly when it sets `claude_links.broken_at`, whoever
   asked for the token (a command, or T18's proxy on a session's behalf), so
   there is one notice per failure and none is lost when the caller goes away.
-  Callers that get `RelinkRequired` send nothing themselves.
+  Callers that get `RelinkRequired` send nothing themselves. The channel only
+  wakes the notifier: the notice owed is recorded in the store
+  (`claude_links.relink_notified_at`) and claimed there with a lease before
+  sending, so it survives a restart and a crash mid-send, is sent by one
+  instance, and is retried with a capped backoff when the DM fails, until
+  the attempts run out ([impl-notes](impl-notes.md#the-relink-channel-is-in-memory-the-notice-has-to-be-durable)).
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
@@ -1222,13 +1233,24 @@ Deliverables:
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
-  each surface with a store-backed `Dedup` and one `BotRoles` over the
-  manager's client, shared by every surface
+  each surface with a store-backed `Dedup` (T13's `StoreDedup`) and the one
+  `BotRoles` over the manager's client that T13 keeps in
+  `app::RocketChatManager`, shared by every surface
   ([impl-notes](impl-notes.md#messages-dont-carry-the-senders-roles)).
+- Every connection, each agent's and the manager bot's, delivers through a
+  `CommandFeed` of T13's one `CommandIntake` (`into_sender(onward)`), so the
+  connection that records a message first hands a command to the intake and
+  passes only other messages onward, the manager bot's included; a command
+  is never also taken as a turn
+  ([impl-notes](impl-notes.md#every-bot-connection-has-to-look-for-commands)).
 
 Acceptance: tests with `FakeRest` and `FakeDdp` for create, a name collision,
 persona edit by a non-owner (refused), pause (events ignored), delete, and
-restart restoring connections.
+restart restoring connections. With the manager's and an agent's
+connections running as agentd starts them: `!agent me` in a room both are
+in gets exactly one reply whichever connection records it first, and is
+not taken as a turn; `!agent me` in a room without the manager bot gets a
+reply; `!agent login <code>` in a DM with the agent's bot is refused.
 
 Live check (manual): create two agents on the Compose Rocket.Chat and mention
 each in a channel. Before T23 the reply can be a fixed acknowledgement; record

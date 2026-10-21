@@ -1,6 +1,6 @@
 //! `members` and `surface_identities`.
 
-use core_types::{MemberId, MemberKey};
+use core_types::{MemberId, MemberKey, SurfaceKind};
 use sqlx::SqliteConnection;
 use time::OffsetDateTime;
 
@@ -16,6 +16,37 @@ impl Store {
     pub async fn member_for_identity(&self, key: &MemberKey) -> Result<Option<MemberId>> {
         let mut conn = self.pool.acquire().await?;
         lookup(&mut conn, key).await
+    }
+
+    /// Every surface identity of `member`, ordered by surface, team and
+    /// user.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`](crate::StoreError::Database) if the query
+    /// fails, [`StoreError::Corrupt`](crate::StoreError::Corrupt) if a
+    /// surface name doesn't parse.
+    pub async fn member_identities(&self, member: MemberId) -> Result<Vec<MemberKey>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT surface, team_id, user_id FROM surface_identities \
+             WHERE member_id = ? ORDER BY surface, team_id, user_id",
+        )
+        .bind(member.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(surface, team, user)| {
+                Ok(MemberKey {
+                    surface: parse_column::<SurfaceKind>(
+                        &surface,
+                        "surface_identities",
+                        "surface",
+                    )?,
+                    team: team.into(),
+                    user: user.into(),
+                })
+            })
+            .collect()
     }
 
     /// The member that owns the surface identity `key`, created at `now`
@@ -167,6 +198,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(members, 1);
+    }
+
+    #[tokio::test]
+    async fn member_identities_lists_only_that_members_identities() {
+        let store = memory_store().await;
+        let member = store
+            .ensure_member(&member_key("u1"), "Ada", at(1_000))
+            .await
+            .unwrap();
+        store
+            .ensure_member(&member_key("u2"), "Bob", at(1_000))
+            .await
+            .unwrap();
+        let slack = MemberKey {
+            surface: SurfaceKind::Slack,
+            team: TeamId::new("T1"),
+            user: UserId::new("U1"),
+        };
+        sqlx::query(
+            "INSERT INTO surface_identities (surface, team_id, user_id, member_id) \
+             VALUES ('slack', 'T1', 'U1', ?)",
+        )
+        .bind(member.to_string())
+        .execute(&store.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            store.member_identities(member).await.unwrap(),
+            [member_key("u1"), slack]
+        );
+        assert!(
+            store
+                .member_identities(core_types::MemberId::new_v4())
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

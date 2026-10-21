@@ -15,7 +15,8 @@
 //!   `table/column/primary key`.
 //!
 //! Repository methods are grouped by table: [`members`](Store::ensure_member),
-//! [`claude_links`](Store::put_claude_link),
+//! [`claude_links`](Store::put_claude_link) and their
+//! [relink notices](Store::claim_relink_notice),
 //! [`pending_logins`](Store::put_pending_login),
 //! [`processed_events`](Store::mark_event_processed),
 //! [`ctl_tokens`](Store::put_ctl_token),
@@ -37,6 +38,7 @@ mod ctl;
 mod events;
 mod members;
 mod pending_logins;
+mod relink_notices;
 mod seal;
 mod volumes;
 
@@ -44,6 +46,7 @@ pub use claude_links::{ClaudeLink, ClaudeLinkStatus, ClaudeTokens, NewClaudeLink
 pub use ctl::{CtlPurged, CtlToken, CtlTurn, NewCtlToken, TokenHash};
 pub use events::{PROCESSED_EVENT_RETENTION, Swept};
 pub use pending_logins::PendingLogin;
+pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use volumes::Volume;
 

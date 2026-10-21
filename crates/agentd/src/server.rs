@@ -42,6 +42,8 @@ use tokio::task::{JoinError, JoinSet};
 use tower::Service as _;
 
 use crate::app::App;
+use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
+use crate::commands::rocketchat::{self, CommandIntake};
 use crate::net::RefuseSubnet;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
@@ -207,7 +209,10 @@ impl Server {
     /// 3. The store is closed.
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
-    /// routers' [`Worker`]s.
+    /// routers' [`Worker`]s, the relink notifier and, with `[rocketchat]`,
+    /// the manager bot's connection, which feeds the commands it hears to
+    /// the [`CommandIntake`]. The intake finishes the commands it received
+    /// once the connection stops.
     ///
     /// # Errors
     ///
@@ -255,10 +260,38 @@ impl Server {
             });
         }
         let store = app.store().clone();
+        let sweeping = stopping.clone();
         tasks.spawn(async move {
-            sweeper::run(store, SWEEP_INTERVAL, stopping).await;
+            sweeper::run(store, SWEEP_INTERVAL, sweeping).await;
             "sweeper"
         });
+        let notifier = RelinkNotifier::new(app.store().clone(), app.commands().replies().clone());
+        let wake = app.auth().take_relink_notices();
+        let notifying = stopping.clone();
+        tasks.spawn(async move {
+            notifier.run(wake, RELINK_SWEEP_INTERVAL, notifying).await;
+            "relink notifier"
+        });
+        if let Some(manager) = app.rocketchat() {
+            let (intake, feed) =
+                CommandIntake::new(app.commands().clone(), manager.binding.clone());
+            tasks.spawn(async move {
+                intake.run().await;
+                "Rocket.Chat command intake"
+            });
+            let connection = rocketchat::listen(
+                manager.surface.clone(),
+                manager.binding.clone(),
+                feed.into_sender(None),
+                stopping,
+            );
+            tasks.spawn(async move {
+                if let Err(err) = connection.await {
+                    tracing::error!(error = %err, "the Rocket.Chat manager bot's connection ended");
+                }
+                "Rocket.Chat manager bot's connection"
+            });
+        }
         tracing::info!(
             public = %addrs.public,
             proxy = %addrs.proxy,
