@@ -31,6 +31,9 @@ const MAX_BUCKETS: usize = 4096;
 /// (`MethodsRateLimits` in `slackapi/java-slack-sdk`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Tier {
+    /// "1+" requests per minute, with small bursts tolerated: the limiter
+    /// allows 5.
+    Tier1,
     /// 20 requests per minute.
     Tier2,
     /// 50 requests per minute.
@@ -47,6 +50,7 @@ impl Tier {
     /// The calls allowed per minute in one bucket.
     pub(crate) const fn per_minute(self) -> usize {
         match self {
+            Self::Tier1 => 5,
             Self::Tier2 => 20,
             Self::Tier3 => 50,
             Self::Tier4 => 100,

@@ -12,7 +12,9 @@
 //! - [`web`]: the Web API client. [`SlackClient`] holds the connection pool
 //!   and a per-token rate limiter by method tier; [`WebApi`] acts with one
 //!   binding's bot token. [`SlackClient::respond_ephemeral`] answers a slash
-//!   command or interaction privately through its `response_url`.
+//!   command or interaction privately through its `response_url`, and
+//!   [`SlackClient::rotate_config_token`] renews a member's app
+//!   configuration token.
 //! - [`directory`]: the per-workspace caches: members by name from
 //!   `users.list`, for `@Name` mentions, and bot users by bot id from
 //!   `bots.info`.
@@ -39,4 +41,4 @@ pub use directory::{MemberDirectory, TeamDirectory};
 pub use inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
 pub use ingress::{BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, ingress};
 pub use surface::SlackSurface;
-pub use web::{SlackClient, WebApi};
+pub use web::{ConfigToken, SlackClient, WebApi};

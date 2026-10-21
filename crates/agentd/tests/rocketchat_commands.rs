@@ -7,7 +7,8 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
-use agentd::commands::rocketchat::{CommandIntake, RocketChatDms, StoreDedup, listen};
+use agentd::commands::intake::CommandIntake;
+use agentd::commands::rocketchat::{CommandFeed, RocketChatDms, StoreDedup, listen};
 use agentd::commands::{Commands, ManagerBot, Replies};
 use agentd::server::{Routers, Server};
 use agentd::{App, Config};
@@ -239,8 +240,9 @@ async fn every_bot_connection_feeds_commands_to_the_one_intake() {
         manager_surface.clone(),
         Arc::new(RocketChatDms(manager_rest)),
     ));
-    let commands = Commands::new(store, auth, Replies::new(Some(bot)), None);
-    let (intake, feed) = CommandIntake::new(commands, manager.clone());
+    let commands = Commands::new(store, auth, Replies::new(Some(bot)), None, None);
+    let (intake, submitter) = CommandIntake::new(commands);
+    let feed = CommandFeed::new(submitter, manager.clone());
     let (onward_tx, mut onward) = mpsc::unbounded_channel();
     let (stop, stopping) = watch::channel(false);
     let manager_connection = tokio::spawn(listen(

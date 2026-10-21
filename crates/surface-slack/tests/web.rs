@@ -930,6 +930,242 @@ mod response_url {
     }
 }
 
+mod config_tokens {
+    use super::*;
+
+    const REFRESH: &str = "xoxe-1-REFRESH-secret-0001";
+    const NEW_TOKEN: &str = "xoxe.xoxp-1-NEWTOKEN-secret-0002";
+    const NEW_REFRESH: &str = "xoxe-1-NEWREFRESH-secret-0003";
+
+    async fn client(server: &MockServer) -> SlackClient {
+        SlackClient::new(&format!("{}/api/", server.uri()))
+            .unwrap()
+            .with_max_retry_wait(Duration::from_secs(5))
+    }
+
+    #[tokio::test]
+    async fn rotate_sends_the_refresh_token_in_the_body_only() {
+        use secrecy::ExposeSecret as _;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/tooling.tokens.rotate"))
+            .respond_with(ok(json!({
+                "token": NEW_TOKEN,
+                "refresh_token": NEW_REFRESH,
+                "team_id": "T0TEAM001",
+                "user_id": "U0HUMAN01",
+                "iat": 1_727_700_000,
+                "exp": 1_727_743_200,
+            })))
+            .mount(&server)
+            .await;
+        let rotated = client(&server)
+            .await
+            .rotate_config_token(&SecretString::from(REFRESH))
+            .await
+            .unwrap();
+        assert_eq!(rotated.token.expose_secret(), NEW_TOKEN);
+        assert_eq!(rotated.refresh_token.expose_secret(), NEW_REFRESH);
+        assert_eq!(rotated.team.as_str(), "T0TEAM001");
+        assert_eq!(rotated.user.as_str(), "U0HUMAN01");
+        assert_eq!(rotated.expires_at.unix_timestamp(), 1_727_743_200);
+        let debug = format!("{rotated:?}");
+        for secret in [NEW_TOKEN, NEW_REFRESH] {
+            assert!(!debug.contains(secret), "{debug}");
+        }
+
+        let sent = requests(&server).await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].headers.get("authorization").is_none());
+        assert!(!sent[0].url.as_str().contains(REFRESH));
+        assert_eq!(form(&sent[0])["refresh_token"], REFRESH);
+    }
+
+    #[tokio::test]
+    async fn a_refused_refresh_token_is_unauthorized_without_repeating_it() {
+        for code in ["invalid_refresh_token", "token_revoked", "invalid_auth"] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(failed(code))
+                .mount(&server)
+                .await;
+            let err = client(&server)
+                .await
+                .rotate_config_token(&SecretString::from(REFRESH))
+                .await
+                .unwrap_err();
+            assert_eq!(err, SurfaceError::Unauthorized, "{code}");
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ok(json!({"token": NEW_TOKEN})))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .await
+            .rotate_config_token(&SecretString::from(REFRESH))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+        let text = format!("{err} {err:?}");
+        for secret in [REFRESH, NEW_TOKEN] {
+            assert!(!text.contains(secret), "{text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_slack_never_shows_the_refresh_token() {
+        let client = SlackClient::new("http://127.0.0.1:9/api/").unwrap();
+        let err = client
+            .rotate_config_token(&SecretString::from(REFRESH))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
+        assert!(!format!("{err} {err:?}").contains(REFRESH));
+    }
+}
+
+#[tokio::test]
+async fn open_dm_returns_the_channel() {
+    let (opened, api) = server().await;
+    mount(
+        &opened,
+        "conversations.open",
+        ok(json!({"channel": {"id": "D0DM00001"}})),
+    )
+    .await;
+    let channel = api.open_dm(&UserId::new("U0HUMAN01")).await.unwrap();
+    assert_eq!(channel.as_str(), "D0DM00001");
+    let sent = requests(&opened).await;
+    assert_eq!(form(&sent[0])["users"], "U0HUMAN01");
+    assert_token_only_in_header(&sent[0]);
+
+    let (missing, api) = server().await;
+    mount(&missing, "conversations.open", failed("user_not_found")).await;
+    let err = api.open_dm(&UserId::new("U0GONE")).await.unwrap_err();
+    assert_eq!(err, SurfaceError::NotFound("user_not_found".into()));
+}
+
+mod downloads {
+    use core_types::InFile;
+
+    use super::*;
+
+    fn file(url: String, size: Option<u64>) -> InFile {
+        InFile {
+            id: "F0FILE001".into(),
+            name: "persona.md".into(),
+            mime_type: Some("text/markdown".into()),
+            size,
+            url,
+        }
+    }
+
+    async fn serve(server: &MockServer, response: ResponseTemplate) {
+        Mock::given(method("GET"))
+            .and(path("/files-pri/T0-F0FILE001/download/persona.md"))
+            .respond_with(response)
+            .mount(server)
+            .await;
+    }
+
+    fn url(server: &MockServer) -> String {
+        format!(
+            "{}/files-pri/T0-F0FILE001/download/persona.md",
+            server.uri()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_file_is_downloaded_with_the_bot_token() {
+        let (server, api) = server().await;
+        serve(
+            &server,
+            ResponseTemplate::new(200).set_body_string("You are terse."),
+        )
+        .await;
+        let data = api
+            .download_file(&file(url(&server), Some(14)), 1024)
+            .await
+            .unwrap();
+        assert_eq!(data, b"You are terse.");
+        let sent = requests(&server).await;
+        assert_eq!(
+            sent[0].headers.get("authorization").unwrap(),
+            format!("Bearer {TOKEN}").as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_over_the_limit_is_refused() {
+        let (server, api) = server().await;
+        serve(
+            &server,
+            ResponseTemplate::new(200).set_body_string("x".repeat(100)),
+        )
+        .await;
+        let err = api
+            .download_file(&file(url(&server), Some(100)), 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::TooLarge(_)), "{err:?}");
+        assert!(
+            requests(&server).await.is_empty(),
+            "the declared size is checked first"
+        );
+
+        let err = api
+            .download_file(&file(url(&server), None), 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SurfaceError::TooLarge(_)), "{err:?}");
+        assert!(!err.to_string().contains("files-pri"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_download_is_an_error_without_the_url() {
+        let (server, api) = server().await;
+        serve(
+            &server,
+            ResponseTemplate::new(302).insert_header("location", "https://example.slack.com/"),
+        )
+        .await;
+        let err = api
+            .download_file(&file(url(&server), None), 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SurfaceError::Api("the file download was refused (HTTP 302)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_token_goes_only_to_slack() {
+        let (server, api) = server().await;
+        for url in [
+            "https://files.slack.com.evil.example/x".to_owned(),
+            "https://evilslack.com/x".to_owned(),
+            "http://files.slack.com/x".to_owned(),
+            "https://files.slack.com:8443/x".to_owned(),
+            "not a url".to_owned(),
+            format!("{}/x", server.uri().replace("127.0.0.1", "localhost")),
+        ] {
+            let err = api
+                .download_file(&file(url.clone(), None), 1024)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err,
+                SurfaceError::Api("the file's URL is not a Slack URL".into()),
+                "{url}"
+            );
+        }
+        assert!(requests(&server).await.is_empty());
+    }
+}
+
 #[test]
 fn message_debug_shows_the_text_length_not_the_text() {
     let message = Message {

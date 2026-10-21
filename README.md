@@ -54,7 +54,8 @@ tunnels in all and per sandbox.
 `GET /healthz` on the public listener answers 200 while the database does.
 It also serves Slack's request URLs, `/slack/b/<binding>/events`,
 `…/interactivity` and `…/commands`; the manager app's binding is `manager`,
-and its requests are verified with `AGENTD_SLACK_MANAGER_SIGNING_SECRET`.
+and its requests are verified with `AGENTD_SLACK_MANAGER_SIGNING_SECRET`
+(see [Slack](#slack) below).
 The ctl listener serves the agentctl API that sandboxed agents call back
 through; at startup agentd deletes every agentctl token and scope lock and
 empties `ctl-outbox/` under `store.data_dir`, since the containers they
@@ -90,6 +91,44 @@ On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
 requests `server.drain_timeout_secs` to finish; a second signal drops them at
 once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
+
+### Slack
+
+agentd serves one Slack workspace through its manager app, the one app that
+declares `/agent`. Install it once:
+
+1. Put agentd's public listener behind a TLS terminator at a public HTTPS
+   URL, such as `https://agentd.example.com`. Slack sends every event,
+   command and interaction there.
+2. Fill in the manifest template with that URL:
+
+   ```bash
+   PUBLIC_URL=https://agentd.example.com envsubst '$PUBLIC_URL' \
+     < deploy/slack/manager-manifest.yaml > manager-manifest.yaml
+   ```
+
+3. At <https://api.slack.com/apps>, choose "Create New App", "From a
+   manifest", pick the workspace and paste the result. Then install the app
+   to the workspace ("Install App").
+4. Give agentd the app's secrets: the "Signing Secret" under "Basic
+   Information" as `AGENTD_SLACK_MANAGER_SIGNING_SECRET`, and the "Bot User
+   OAuth Token" (`xoxb-…`) under "OAuth & Permissions" as
+   `AGENTD_SLACK_MANAGER_BOT_TOKEN`. Restart agentd. At startup it asks
+   Slack which workspace, bot user and app the token belongs to, and doesn't
+   start if Slack refuses the token.
+5. Slack checks the events URL when it creates the app, and agentd answers
+   only once it has the signing secret. If "Event Subscriptions" says the
+   request URL isn't verified, click "Retry" there now.
+
+Members then send `/agent login` to link their Claude account; its reply,
+like every command reply, is visible only to them. To let agentd create
+their agents' apps, each member generates an app configuration token under
+"Your App Configuration Tokens" at <https://api.slack.com/apps> and sends
+`/agent slack-token <token> <refresh token>`. agentd renews it before its 12
+hours run out and stores it encrypted; `/agent logout` deletes it, and so
+does leaving the workspace. A direct message to the manager app works as a
+command too, like on Rocket.Chat, and `/agent me` names the app answering,
+so members notice if another app takes `/agent` over.
 
 ## Development stack
 

@@ -22,7 +22,8 @@
 //! [`ctl_tokens`](Store::put_ctl_token),
 //! [`scope_locks`](Store::acquire_scope_lock),
 //! [`volumes`](Store::put_volume), [`sessions`](Store::session_for_thread),
-//! and [`agents`](Store::create_agent) with their bindings and
+//! [`slack_config_tokens`](Store::put_slack_config_token), and
+//! [`agents`](Store::create_agent) with their bindings and
 //! [retirements](Store::claim_retirement).
 
 #![warn(missing_docs)]
@@ -44,6 +45,7 @@ mod pending_logins;
 mod relink_notices;
 mod seal;
 mod sessions;
+mod slack_config_tokens;
 mod volumes;
 
 pub use agents::{
@@ -57,6 +59,9 @@ pub use pending_logins::PendingLogin;
 pub use relink_notices::PendingRelinkNotice;
 pub use seal::{KeyError, SealError, Sealer};
 pub use sessions::{Session, SessionKind, ThreadSession};
+pub use slack_config_tokens::{
+    NewSlackConfigToken, SlackConfigToken, SlackConfigTokenRef, SlackConfigTokenStatus,
+};
 pub use volumes::Volume;
 
 use seal::Aad;
@@ -335,6 +340,7 @@ mod tests {
                 "processed_events",
                 "scope_locks",
                 "sessions",
+                "slack_config_tokens",
                 "surface_identities",
                 "volumes",
             ]

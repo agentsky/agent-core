@@ -1,9 +1,10 @@
 //! Private replies: command replies and notices only the member sees.
 //!
 //! On Rocket.Chat every private reply is a direct message from the manager
-//! bot. On Slack a slash command is answered through its `response_url` and
-//! anything else by a manager DM; that arm is added with the Slack manager
-//! app (T30), and until then it fails with [`ReplyError::SlackUnavailable`].
+//! bot. On Slack a slash command is answered through its `response_url`, as
+//! an ephemeral message only the member sees, unless the reply needs more
+//! messages than Slack accepts there; that one, and anything else, goes by
+//! a DM from the manager app.
 
 use std::fmt;
 use std::sync::Arc;
@@ -12,15 +13,26 @@ use async_trait::async_trait;
 use core_types::{
     ConvRef, ConversationId, MemberKey, ReplyTarget, Surface, SurfaceError, SurfaceKind,
 };
+use secrecy::SecretString;
+use surface_slack::SlackClient;
 
 use super::Origin;
+
+/// How many times Slack accepts a response through one `response_url`.
+pub(crate) const RESPONSE_URL_USES: usize = 5;
+
+/// The ephemeral answer to a slash command whose reply was too long for
+/// its `response_url` and went to the member's DM instead.
+const LONG_REPLY_IN_DM: &str = "That reply is too long to show here, so I sent it to you in a DM.";
+
+/// The note after the start of a slash command reply that was too long
+/// for its `response_url` and couldn't be sent whole by DM either.
+const LONG_REPLY_CUT: &str =
+    "That reply is too long to show here in full, and I couldn't send all of it to you in a DM.";
 
 /// Why a private reply couldn't be sent. The message names no text.
 #[derive(Debug, thiserror::Error)]
 pub enum ReplyError {
-    /// Private replies on Slack come with the Slack manager app (T30).
-    #[error("private replies on Slack are not available yet")]
-    SlackUnavailable,
     /// No manager bot serves the member's surface and team.
     #[error("no manager bot serves this member's {0} workspace")]
     NoManagerBot(SurfaceKind),
@@ -72,6 +84,11 @@ impl ManagerBot {
         member.surface == self.identity.surface && member.team == self.identity.team
     }
 
+    /// Markdown `text` rendered and split for the surface.
+    pub fn render(&self, text: &str) -> Vec<String> {
+        self.surface.render(text)
+    }
+
     /// Posts Markdown `text` in `room`, rendered and split for the surface.
     ///
     /// # Errors
@@ -109,24 +126,82 @@ impl ManagerBot {
 #[derive(Debug, Clone, Default)]
 pub struct Replies {
     rocketchat: Option<Arc<ManagerBot>>,
+    slack: Option<SlackReplies>,
+}
+
+/// The Slack manager app's bot, and the client that answers through a
+/// `response_url`.
+#[derive(Debug, Clone)]
+struct SlackReplies {
+    bot: Arc<ManagerBot>,
+    client: SlackClient,
 }
 
 impl Replies {
     /// Replies through `rocketchat`, the Rocket.Chat manager bot, if agentd
     /// serves Rocket.Chat.
     pub fn new(rocketchat: Option<Arc<ManagerBot>>) -> Self {
-        Self { rocketchat }
+        Self {
+            rocketchat,
+            slack: None,
+        }
+    }
+
+    /// Also replies on Slack: DMs through `bot`, the Slack manager app's
+    /// bot, and slash command replies through their `response_url` with
+    /// `client`.
+    pub fn with_slack(mut self, bot: Arc<ManagerBot>, client: SlackClient) -> Self {
+        self.slack = Some(SlackReplies { bot, client });
+        self
     }
 
     fn bot_for(&self, member: &MemberKey) -> Result<&ManagerBot, ReplyError> {
-        match member.surface {
-            SurfaceKind::Slack => Err(ReplyError::SlackUnavailable),
-            SurfaceKind::RocketChat => self
-                .rocketchat
-                .as_deref()
-                .filter(|bot| bot.serves(member))
-                .ok_or(ReplyError::NoManagerBot(member.surface)),
+        let bot = match member.surface {
+            SurfaceKind::Slack => self.slack.as_ref().map(|slack| &*slack.bot),
+            SurfaceKind::RocketChat => self.rocketchat.as_deref(),
+        };
+        bot.filter(|bot| bot.serves(member))
+            .ok_or(ReplyError::NoManagerBot(member.surface))
+    }
+
+    /// Answers `member`'s slash command privately through its
+    /// `response_url`, with Markdown `text` rendered and split for Slack.
+    ///
+    /// A reply in more chunks than [`RESPONSE_URL_USES`] goes to the
+    /// member's DM with the manager app instead, and the `response_url`
+    /// says so. If that DM fails, even after some of it was posted, the
+    /// `response_url` gets the reply's first chunks and a note that the
+    /// rest is missing.
+    async fn respond(
+        &self,
+        member: &MemberKey,
+        response_url: &SecretString,
+        text: &str,
+    ) -> Result<(), ReplyError> {
+        let slack = self
+            .slack
+            .as_ref()
+            .ok_or(ReplyError::NoManagerBot(SurfaceKind::Slack))?;
+        let chunks = slack.bot.render(text);
+        let ephemeral: Vec<&str> = if chunks.len() <= RESPONSE_URL_USES {
+            chunks.iter().map(String::as_str).collect()
+        } else {
+            match self.dm(member, text).await {
+                Ok(()) => vec![LONG_REPLY_IN_DM],
+                Err(err) => {
+                    tracing::warn!(%member, error = %err, "couldn't DM a slash command reply too long for its response_url; answered with its start");
+                    chunks[..RESPONSE_URL_USES - 1]
+                        .iter()
+                        .map(String::as_str)
+                        .chain([LONG_REPLY_CUT])
+                        .collect()
+                }
+            }
+        };
+        for chunk in ephemeral {
+            slack.client.respond_ephemeral(response_url, chunk).await?;
         }
+        Ok(())
     }
 
     /// Whether a manager bot can DM `member`.
@@ -135,14 +210,16 @@ impl Replies {
     }
 
     /// Sends Markdown `text` privately to `member`, who sent a command from
-    /// `origin`: in the manager bot's DM on Rocket.Chat (the DM the command
-    /// came from, or a new one for a channel command). Slack replies come
-    /// with T30.
+    /// `origin`: through the `response_url` of a Slack slash command, as an
+    /// ephemeral message, or in the Slack manager app's DM if it is too long
+    /// for that; in the Slack manager app's DM a command came from;
+    /// and in the manager bot's DM on Rocket.Chat (the DM the command came
+    /// from, or a new one for a channel command).
     ///
     /// # Errors
     ///
-    /// [`ReplyError::SlackUnavailable`] for a Slack origin,
-    /// [`ReplyError::NoManagerBot`] if no manager bot serves the member, and
+    /// [`ReplyError::NoManagerBot`] if no manager bot serves the member (a
+    /// slash command needs only the Slack manager app), and
     /// [`ReplyError::Surface`] if posting fails.
     pub async fn reply_private(
         &self,
@@ -151,8 +228,10 @@ impl Replies {
         text: &str,
     ) -> Result<(), ReplyError> {
         match origin {
-            Origin::SlackSlash { .. } => Err(ReplyError::SlackUnavailable),
-            Origin::RocketChatDm { room } => Ok(self.bot_for(member)?.post(room, text).await?),
+            Origin::SlackSlash { response_url } => self.respond(member, response_url, text).await,
+            Origin::SlackDm { channel: room } | Origin::RocketChatDm { room } => {
+                Ok(self.bot_for(member)?.post(room, text).await?)
+            }
             Origin::RocketChatChannel { .. } => self.dm(member, text).await,
         }
     }
