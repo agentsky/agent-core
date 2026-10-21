@@ -298,7 +298,8 @@ impl Ctl {
             outbox: Outbox::new(turn.id, staging),
             uploading: 0,
         };
-        self.outboxes().insert(hash, entry);
+        let replaced = self.outboxes().insert(hash, entry);
+        drop(replaced);
         match self.store().set_ctl_turn(&hash, Some(&turn)).await {
             Ok(true) => Ok(()),
             Ok(false) => {
