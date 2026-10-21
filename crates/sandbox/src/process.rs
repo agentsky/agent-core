@@ -42,6 +42,10 @@ use crate::{
 ///   process group, and passes `LLVM_PROFILE_FILE` through from agentd's
 ///   environment (unless `exec`'s `env` sets it), so instrumented test
 ///   binaries keep their coverage. No `PATH` is set unless given.
+/// - Spawns are serialized across all process sandboxes. As long as
+///   nothing else in agentd forks outside that lock, a child's pipes are
+///   open only in the child (and whatever it starts) and in agentd: once
+///   its stdin is closed, a write to it fails.
 /// - [`ip`](Sandbox::ip) is `127.0.0.1` while the container runs.
 /// - [`stop`](Sandbox::stop) kills each process group it started whose
 ///   leader hasn't been reaped, and reports the container
@@ -182,7 +186,11 @@ impl Sandbox for ProcessSandbox {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        let mut child = command.spawn().map_err(|source| SandboxError::Io {
+        let spawned = {
+            let _spawning = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+            command.spawn()
+        };
+        let mut child = spawned.map_err(|source| SandboxError::Io {
             what: "spawning a process",
             source,
         })?;
@@ -260,6 +268,19 @@ impl Sandbox for ProcessSandbox {
         .boxed()
     }
 }
+
+/// Held around every spawn, by every process sandbox in the process.
+///
+/// A child starts with a copy of each of agentd's descriptors and holds it
+/// until its exec closes it. Without the lock, a spawn on another thread
+/// could fork a child while this spawn's pipes were open, or while a file
+/// was open for writing, and a child that waited to be scheduled held them
+/// on into the life of the process spawned here: a write to a process that
+/// had closed its stdin found a reader and succeeded, and an executable
+/// just written failed to start with `ETXTBSY`. A spawn returns only once
+/// its child has exec'd, so with one spawn at a time no pre-exec child is
+/// left holding another's pipes or files.
+static SPAWNING: Mutex<()> = Mutex::new(());
 
 /// Sends SIGKILL to process group `pgid`. It is a plain `kill(2)`, which
 /// returns at once, so `Drop` can call it too.

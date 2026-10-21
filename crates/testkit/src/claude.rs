@@ -58,6 +58,11 @@
 //!    [`Turn::extra_lines`], then prints the reply as an `assistant` line
 //!    and a `result` line, and appends it to the transcript.
 //!
+//! A result's `usage` is the turn's own, and its `total_cost_usd` is the
+//! process's running total, as the real CLI reports them: each reply adds
+//! [`REPLY_COST_USD`], an error result nothing, and a new process, resumed
+//! or not, counts from 0.
+//!
 //! With the OAuth token, the first successful turn of each process also
 //! prints a `rate_limit_event` line right after its first `assistant` line,
 //! shaped like the one in [`fixtures::TOOL_TURNS`](crate::fixtures::TOOL_TURNS).
@@ -82,6 +87,10 @@ use serde::{Deserialize, Serialize};
 
 /// The environment variable naming the script file.
 pub const SCRIPT_ENV: &str = "FAKE_CLAUDE_SCRIPT";
+
+/// What each reply adds to the running `total_cost_usd` of its process's
+/// results. A power of two, so the totals are exact.
+pub const REPLY_COST_USD: f64 = 0.0009765625;
 
 /// The exit status of a turn with [`Turn::crash`] set.
 pub const CRASH_EXIT_CODE: i32 = 70;
