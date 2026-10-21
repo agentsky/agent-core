@@ -8787,9 +8787,11 @@ from taking over meanwhile. It then stops each of the consent's private sessions
 here, and deletes its directory, then records the work finished and
 deletes the staged files. The directories go before the record, so a crash
 between the two leaves nothing: the next claim finishes again and finds
-them gone. A private task's own turn also has its session stopped as soon
-as `run_turn` returns, an error included, so a turn whose send failed
-doesn't leave an owner-side container warm. The test fails the send with a
+them gone. A directory whose removal fails, or runs out of the remover's
+minute, is logged with its path and isn't tried again. A private task's
+own turn also has its session stopped as soon as `run_turn` returns, an
+error included, so a turn whose send failed doesn't leave an owner-side
+container warm. The test fails the send with a
 store trigger, and checks the container is stopped at once and the
 directory gone once the next claim reports the task interrupted.
 
