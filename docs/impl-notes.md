@@ -6183,12 +6183,13 @@ confirmation fenced out after its move doesn't undo it: whoever holds the
 lease now owns the name, and putting the old skill back could put it under
 their row, so the moved files stay live for the roll forward below. Unlike
 a crash, which leaves the skill they replaced in the work directory for
-startup's purge, the work directory's guard removes it at once. `LEASE_TTL`
-is two minutes: a change makes two store calls, each of which may wait the
-pool's 30-second acquire timeout and then the 5-second busy timeout, about
-70 seconds at worst, and a lease a crash left keeps the name busy for those
-two minutes. The sweeper deletes ended leases, so names nothing changes
-again don't keep rows.
+startup's purge, the work directory's guard hands it to a blocking task
+that removes it once the change is done, or, if agentd stops first, to the
+next purge. `LEASE_TTL` is two minutes: a change makes two store calls,
+each of which may wait the pool's 30-second acquire timeout and then the
+5-second busy timeout, about 70 seconds at worst, and a lease a crash left
+keeps the name busy for those two minutes. The sweeper deletes ended
+leases, so names nothing changes again don't keep rows.
 
 With changes serialized, `confirm` checks the pending directory in place
 and moves it straight into the live one; the move into a work
