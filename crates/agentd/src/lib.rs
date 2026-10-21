@@ -9,6 +9,8 @@
 //! - [`app`]: [`App`], the shared state.
 //! - [`agents`]: agents' bot identities on Rocket.Chat and the connections
 //!   agentd keeps as them.
+//! - [`cloud`]: firing a member's Claude Code routine for a cloud
+//!   hand-off.
 //! - [`commands`]: `/agent` command dispatch, the account and agent commands, and
 //!   the relink notice.
 //! - [`community`]: the community API key, which the credential proxy
@@ -34,6 +36,7 @@
 pub mod agents;
 pub mod app;
 pub mod cli;
+pub mod cloud;
 pub mod commands;
 pub mod community;
 pub mod config;

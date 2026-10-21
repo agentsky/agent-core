@@ -171,7 +171,14 @@ line if there is one already.
 
 Then add the example's `[rocketchat]` section, with `base_url =
 "http://rocketchat:3000"` (Rocket.Chat on the `egress` network), a `team`
-name, and the manager's user id as `manager_user_id`. agentd refuses to
+name, and the manager's user id as `manager_user_id`. agentd calls a plain
+`http://` URL directly, whatever `HTTPS_PROXY`, `ALL_PROXY` or `NO_PROXY`
+say, so a proxy never reads its token in clear, and calls a loopback IP
+address directly too, since a proxy would resolve it on its own host.
+`https://` URLs elsewhere honor `HTTPS_PROXY` (or `ALL_PROXY`) and
+`NO_PROXY`, or their lowercase forms `https_proxy`, `all_proxy` and
+`no_proxy`. Rocket.Chat's realtime connection never uses a proxy, so the
+server must be reachable directly. agentd refuses to
 start with the section and no `AGENTD_RC_MANAGER_TOKEN`. agentd runs turns
 with the example's `[sandbox]` section; add `host_data_dir` to it:
 

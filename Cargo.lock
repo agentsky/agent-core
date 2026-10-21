@@ -58,6 +58,7 @@ dependencies = [
  "log",
  "rand",
  "render",
+ "reqwest",
  "router",
  "runner",
  "rustix",

@@ -27,6 +27,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 rand.workspace = true
 render.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
 router.workspace = true
 rustix = { workspace = true, features = ["std"] }
 runner.workspace = true
