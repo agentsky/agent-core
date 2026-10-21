@@ -258,7 +258,8 @@ jobs:
   # Tests that need a Docker daemon: every test named `docker_*` in the
   # workspace. They are marked `#[ignore = "needs docker"]`, so the other
   # jobs skip them, and they run here with `--ignored`. The runner has a
-  # Docker daemon; the tests pull the images they use.
+  # Docker daemon; the tests pull the images they use, except the sandbox
+  # image, which the job builds first.
   docker-tests:
     name: Docker tests
     needs: changes
@@ -274,6 +275,11 @@ jobs:
 
       - name: Show the Docker daemon
         run: docker version
+
+      # docker_real_claude_starts in crates/agentd runs the real `claude`
+      # from the sandbox image, under this tag.
+      - name: Build the sandbox image
+        run: docker build -f images/sandbox/Dockerfile -t agent-core/sandbox:dev .
 
       - name: Run Docker tests
         run: cargo test --locked --workspace --all-features -- --ignored docker_

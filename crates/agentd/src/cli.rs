@@ -14,6 +14,7 @@ use tokio::sync::watch;
 
 use crate::app::{self, App};
 use crate::config::Config;
+use crate::pipeline::{self, TurnSettings, Turns};
 use crate::server::{Routers, Server};
 use crate::telemetry;
 
@@ -145,21 +146,30 @@ pub async fn migrate(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `agentd serve`: opens the store, binds the listeners, and serves until
-/// `shutdown` completes, then shuts down gracefully, cutting the drain short
-/// if `abort` completes (see [`Server::run`]).
+/// `agentd serve`: opens the store, connects to the Docker daemon for
+/// `[sandbox]` and stops the sandboxes left from before, binds the
+/// listeners, starts the runner, and serves until `shutdown` completes, then
+/// shuts down gracefully, cutting the drain short if `abort` completes (see
+/// [`Server::run`]). Without `[sandbox]` it runs no turns.
 ///
 /// # Errors
 ///
-/// If the store can't be opened, a listener can't be bound, or a listener
-/// fails while serving.
+/// If the store can't be opened, the Docker daemon can't be reached, a
+/// listener can't be bound, or a listener fails while serving.
 pub async fn serve<F, G>(config: Config, shutdown: F, abort: G) -> anyhow::Result<()>
 where
     F: Future<Output = ()> + Send,
     G: Future<Output = ()> + Send,
 {
     let app = App::open(config).await?;
-    let server = Server::bind(app.clone(), Routers::new(&app)).await?;
+    let sandbox = pipeline::connect_docker(&app).await?;
+    let mut server = Server::bind(app.clone(), Routers::new(&app)?).await?;
+    match (sandbox, TurnSettings::from_config(app.config())) {
+        (Some(sandbox), Some(settings)) => {
+            server = server.with_turns(Turns::start(&app, sandbox, settings)?);
+        }
+        _ => tracing::warn!("no [sandbox] section: agentd runs no turns"),
+    }
     server.run(shutdown, abort).await
 }
 

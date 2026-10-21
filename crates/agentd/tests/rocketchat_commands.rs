@@ -87,7 +87,9 @@ async fn the_manager_bot_runs_dm_and_channel_commands() {
     ];
     let app = App::open(Config::parse(&text, env).unwrap()).await.unwrap();
     assert!(app.rocketchat().is_some());
-    let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
+    let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+        .await
+        .unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
     let task = tokio::spawn(server.run(
         async {

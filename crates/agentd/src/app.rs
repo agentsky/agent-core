@@ -5,6 +5,7 @@ use std::sync::Arc;
 use anyhow::Context as _;
 use auth::Auth;
 use core_types::{Binding, BindingId, MemberKey, SurfaceKind, TeamId, UserId};
+use cred_proxy::Registry;
 use store::Store;
 use surface_rocketchat::rest::{Credentials, RestClient};
 use surface_rocketchat::{BotRoles, RocketChatConfig, RocketChatSurface};
@@ -16,10 +17,9 @@ use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
 use crate::ctl::{Ctl, CtlSettings, NoSurfaces, SurfaceLookup};
 use crate::slack::manager::SlackManager;
 
-/// The shared state: the configuration, the store, the agentctl API,
-/// account linking, command dispatch and the manager bots of Rocket.Chat and
-/// Slack, and later the agents' surfaces, the runner and the credential
-/// proxy.
+/// The shared state: the configuration, the store, the agentctl API, the
+/// credential proxy's placeholders, account linking, command dispatch and
+/// the manager bots of Rocket.Chat and Slack.
 ///
 /// Cloning is cheap: every clone shares the same state. Axum handlers take it
 /// as their state.
@@ -28,6 +28,7 @@ pub struct App {
     config: Arc<Config>,
     store: Store,
     ctl: Ctl,
+    registry: Registry,
     auth: Arc<Auth>,
     commands: Commands,
     rocketchat: Option<RocketChatManager>,
@@ -102,6 +103,7 @@ impl App {
             config: Arc::new(config),
             store,
             ctl,
+            registry: Registry::new(),
             auth,
             commands,
             rocketchat: rocketchat.map(|(manager, _)| manager),
@@ -148,6 +150,12 @@ impl App {
     /// The agentctl API.
     pub fn ctl(&self) -> &Ctl {
         &self.ctl
+    }
+
+    /// The live placeholders: the credential proxy checks them, and the
+    /// turn hooks mint, point and revoke them.
+    pub fn registry(&self) -> &Registry {
+        &self.registry
     }
 
     /// Claude account linking.

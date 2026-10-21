@@ -179,7 +179,7 @@ impl Running {
 
 /// Routers like [`Routers::new`], but with the Slack queue feeding `out`.
 fn routers_into(app: &App, out: mpsc::UnboundedSender<SlackInbound>) -> Routers {
-    let mut routers = Routers::new(app);
+    let mut routers = Routers::new(app).unwrap();
     let (slack_routes, queue) = slack::routes(app);
     routers.public = public_router(app.clone()).merge(slack_routes);
     routers.workers = vec![Worker::new(
@@ -199,7 +199,7 @@ async fn next(out: &mut mpsc::UnboundedReceiver<SlackInbound>) -> SlackInbound {
 #[tokio::test]
 async fn without_a_signing_secret_the_manager_urls_are_404() {
     let app = App::open(config(None)).await.unwrap();
-    let running = Running::start(app.clone(), Routers::new(&app)).await;
+    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
     for kind in ["events", "commands", "interactivity"] {
         let path = format!("/slack/b/manager/{kind}");
         let response = running
@@ -214,7 +214,7 @@ async fn without_a_signing_secret_the_manager_urls_are_404() {
 async fn the_manager_answers_the_challenge_and_verifies_everything_else() {
     let slack = fake_slack().await;
     let app = App::open(config(Some(&slack))).await.unwrap();
-    let running = Running::start(app.clone(), Routers::new(&app)).await;
+    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
     let challenge = running
         .post(
             "/slack/b/manager/events",
@@ -370,7 +370,7 @@ async fn a_stalled_body_does_not_hold_up_shutdown() {
     let slack = fake_slack().await;
     let app = App::open(config(Some(&slack))).await.unwrap();
     let arrived = Arc::new(Notify::new());
-    let mut routers = Routers::new(&app);
+    let mut routers = Routers::new(&app).unwrap();
     routers.public = routers.public.layer(MapRequestLayer::new({
         let arrived = Arc::clone(&arrived);
         move |request: axum::extract::Request| {
@@ -409,7 +409,7 @@ async fn a_stalled_body_does_not_hold_up_shutdown() {
 async fn a_signed_slash_command_is_answered_through_its_response_url() {
     let slack = fake_slack().await;
     let app = App::open(config(Some(&slack))).await.unwrap();
-    let running = Running::start(app.clone(), Routers::new(&app)).await;
+    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
     let command = slash_command(&slack, "me", "me-reply");
     assert_eq!(
         running
@@ -432,7 +432,7 @@ async fn a_signed_slash_command_is_answered_through_its_response_url() {
 async fn a_dm_to_the_manager_app_is_answered_in_the_dm() {
     let slack = fake_slack().await;
     let app = App::open(config(Some(&slack))).await.unwrap();
-    let running = Running::start(app.clone(), Routers::new(&app)).await;
+    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
     let dm = fixtures::MESSAGE_IM.replace("what did we decide yesterday?", "me");
     assert_eq!(
         running.signed("/slack/b/manager/events", &dm).await.status,

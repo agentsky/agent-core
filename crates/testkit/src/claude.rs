@@ -243,10 +243,25 @@ pub fn write_script(path: &Path, turns: &[Turn]) -> io::Result<()> {
 /// If the build fails or reports no executable.
 pub fn fake_claude_path() -> &'static Path {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| build_bin("fake-claude"))
+    PATH.get_or_init(|| build_bin("testkit", "fake-claude"))
 }
 
-fn build_bin(name: &str) -> PathBuf {
+/// The path of the `agentctl` binary, built on first use, for tests that
+/// let `fake-claude` run agentctl commands: put its directory on the
+/// script's `PATH`.
+///
+/// It is built the way [`fake_claude_path`] builds `fake-claude`, with the
+/// same blocking first call, so call it before starting any timeout too.
+///
+/// # Panics
+///
+/// If the build fails or reports no executable.
+pub fn agentctl_path() -> &'static Path {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| build_bin("agentctl", "agentctl"))
+}
+
+fn build_bin(package: &str, name: &str) -> PathBuf {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
     let mut command = Command::new(&cargo);
@@ -254,7 +269,7 @@ fn build_bin(name: &str) -> PathBuf {
         .arg("build")
         .arg("--manifest-path")
         .arg(&manifest)
-        .args(["--locked", "-p", "testkit", "--bin", name])
+        .args(["--locked", "-p", package, "--bin", name])
         .arg("--message-format=json");
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = target_dir(&exe)
@@ -387,6 +402,6 @@ mod tests {
     #[test]
     #[should_panic(expected = "building no-such-bin failed")]
     fn a_failed_build_panics_with_cargo_output() {
-        build_bin("no-such-bin");
+        build_bin("testkit", "no-such-bin");
     }
 }

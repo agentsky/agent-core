@@ -5,6 +5,7 @@
 //! - The `fake-claude` binary, a stand-in for the Claude Code CLI, which
 //!   other crates find with [`fake_claude_path`] and script with
 //!   [`claude::Turn`]. [`claude`] documents what it checks and prints.
+//!   [`agentctl_path`] builds `agentctl` for scripts that run it.
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
 //! - [`child`]: whether dropping a child's handles killed it before closing
 //!   its stdin.
@@ -30,7 +31,7 @@ pub mod surface;
 mod temp_dir;
 
 pub use anthropic::{FakeAnthropic, fake_anthropic};
-pub use claude::{Turn, fake_claude_path, write_script};
+pub use claude::{Turn, agentctl_path, fake_claude_path, write_script};
 pub use held::{Held, Hold};
 pub use logs::{Logged, Logs};
 pub use surface::{Call, MockSurface, Op, UploadedFile};

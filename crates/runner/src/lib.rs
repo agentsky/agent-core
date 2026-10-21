@@ -19,7 +19,9 @@
 //!    [`TurnResult`], a [`Crashed`](TurnOutcome::Crashed) process, or a
 //!    [`TimedOut`](TurnOutcome::TimedOut) turn whose process was killed.
 //!    A result's [`cost_usd`](TurnResult::cost_usd) is the turn's own,
-//!    although the CLI reports a running total for its process.
+//!    although the CLI reports a running total for its process, except on
+//!    the first turn of a process started with `--resume`, whose running
+//!    total the CLI starts from the session's saved total.
 //! 3. [`ClaudeProcess::stop`] closes stdin and waits for the process.
 //!
 //! A kill doesn't always end a process: it can fail, and under Docker

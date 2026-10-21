@@ -226,7 +226,9 @@ impl Running {
 
     async fn start_with(chat: &Chat, config: Config) -> Self {
         let app = App::open(config).await.unwrap();
-        let server = Server::bind(app.clone(), Routers::new(&app)).await.unwrap();
+        let server = Server::bind(app.clone(), Routers::new(&app).unwrap())
+            .await
+            .unwrap();
         let (stop, stopped) = oneshot::channel::<()>();
         let task = tokio::spawn(server.run(
             async {
