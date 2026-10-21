@@ -558,6 +558,29 @@ async fn usernames_rooms_and_files_go_through_the_manager() {
         .mount(h.fake.server())
         .await;
     assert!(h.agents.user_named("alice").await.is_err());
+    h.fake.add_room("PUBLIC", "c", "public");
+    h.fake.add_room("HIDDEN", "p", "hidden");
+    let named = |name: &str| RoomRef::Name(name.to_owned());
+    assert_eq!(
+        h.agents.public_channel(&named("public")).await.unwrap(),
+        Some(ConversationId::new("PUBLIC"))
+    );
+    assert_eq!(
+        h.agents.public_channel(&named("nowhere")).await.unwrap(),
+        None
+    );
+    assert_eq!(
+        h.agents.public_channel(&named("hidden")).await.unwrap(),
+        None
+    );
+    Mock::given(path("/api/v1/rooms.info"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(h.fake.server())
+        .await;
+    let err = h.agents.public_channel(&named("public")).await.unwrap_err();
+    assert!(matches!(err, SurfaceError::Api(_)), "{err:?}");
     h.fake.add_room("DM", "d", "");
     let err = h
         .agents

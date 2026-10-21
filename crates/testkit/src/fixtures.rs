@@ -37,6 +37,21 @@ pub const RESUME_MISSING: &str = include_str!("../fixtures/stream-json/resume-mi
 /// skip.
 pub const API_RETRY: &str = include_str!("../fixtures/stream-json/api-retry.jsonl");
 
+/// A session's transcript as the CLI 2.1.285 wrote it for one `-p` turn,
+/// `--session-id 3b0f5c2e-8d41-4a6b-9c1e-2f7a5d9e0b13` and
+/// `--permission-mode bypassPermissions`, against a local server that
+/// streamed a `Write` call and then a text reply: queue operations, the
+/// prompt, attachments, the `assistant` line with the `tool_use`, the
+/// `user` line with its `tool_result`, the reply, `last-prompt`,
+/// `atis-latch`, and the `cost-state` line the CLI appended when it
+/// exited, with `totalCostUSD` 0.0112. It is in
+/// `crates/testkit/fixtures/transcript/`, captured on 2026-09-30 in the
+/// runner's Docker test (the session directory mounted at `/volume/s`),
+/// with the four longest attachment lines (`agent_listing_delta`,
+/// `skill_listing` and two `prompt_snapshot`s) left out. It is not in
+/// [`ALL`], which holds stdout.
+pub const TOOL_TURN_TRANSCRIPT: &str = include_str!("../fixtures/transcript/tool-turn.jsonl");
+
 /// Every capture, by file name.
 pub const ALL: [(&str, &str); 5] = [
     ("unreachable.jsonl", UNREACHABLE),

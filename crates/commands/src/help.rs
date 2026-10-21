@@ -102,7 +102,8 @@ pub(crate) const SPECS: &[Spec] = &[
     Spec::new(
         "limits",
         "limits <name> [turns=N/day] [hops=N]",
-        "set an agent's daily turn limit and agent-to-agent hop limit, in either order",
+        "set an agent's daily turn limit and agent-to-agent hop limit, in either order; \
+         off removes one",
     ),
     Spec::new("pause", "pause <name>", "stop an agent from answering"),
     Spec::new("resume", "resume <name>", "let a paused agent answer again"),

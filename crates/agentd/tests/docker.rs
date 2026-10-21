@@ -218,6 +218,14 @@ fn process_total(outcome: &TurnOutcome) -> f64 {
     }
 }
 
+/// A finished turn's own cost, as the runner bills it.
+fn turn_cost(outcome: &TurnOutcome) -> f64 {
+    match outcome {
+        TurnOutcome::Finished(result) => result.cost_usd.unwrap(),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test]
 #[ignore = "needs docker"]
 async fn docker_startup_reaps_only_this_instances_sandboxes() {
@@ -430,6 +438,11 @@ async fn docker_real_claude_starts() {
     assert!(
         (second_total - 2.0 * first_total).abs() < first_total / 100.0,
         "a resumed process restores the session's total cost: {first_total} then {second_total}"
+    );
+    let second_cost = turn_cost(&second.outcome);
+    assert!(
+        (second_cost - first_total).abs() < first_total / 100.0,
+        "the runner takes the restored total off the resumed turn's cost: {second_cost}"
     );
     sessions.stop(session.id).await;
 

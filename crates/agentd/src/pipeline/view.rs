@@ -1,13 +1,20 @@
 //! [`StoreView`]: the router's view of the world, loaded from the store
 //! for one event and one candidate agent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use core_types::{AgentId, BindingId, InboundEvent, MemberId, MemberKey, MsgRef, Requester};
-use router::{AgentPolicy, AgentState, Attribution, LinkState, ManagedBot, RouterView};
+use core_types::{
+    AgentId, BindingId, InboundEvent, MemberId, MemberKey, MsgRef, Requester, ThreadKey,
+};
+use router::{
+    AgentPolicy, AgentState, Attribution, LinkState, ManagedBot, RouterView, ThreadBudget,
+};
 use store::{MessageRef, Store, StoreError};
+use time::OffsetDateTime;
 use tokio::time::Instant;
+
+use crate::policy::{Limits, agent_policy};
 
 /// How long the attribution of a message an agent's bot sent is waited
 /// for: agentd records it just after posting, and the platform may deliver
@@ -48,11 +55,19 @@ async fn attribution(
 /// the event's message and whether its reply-to message is the agent's,
 /// the members of the sender and of an attributed requester, whether the
 /// owner and those members have a link and whether it broke, and whether a
-/// community admin has set the community API key. A member lookup the store
-/// fails leaves that identity unknown, so the router refuses with
+/// community admin has set the community API key; then whether any of those
+/// members is banned, the agent's policy with the turns it took today, and,
+/// outside a one-to-one DM, what agents spent in the event's thread. A
+/// sender or attributed requester whose identity is a community admin's is
+/// never banned, as [`Commands`](crate::commands::Commands) never holds an
+/// admin back, so a ban row left on an admin's member can't silence them.
+///
+/// Those last three fail closed on their own: a lookup that fails is logged
+/// and leaves its answer `None`, which the router refuses, rather than
+/// failing the whole view. So does a member lookup the store fails: it
+/// leaves that identity unknown, so the router refuses with
 /// [`PolicyUnavailable`](router::RefuseReason::PolicyUnavailable) rather
-/// than taking the sender for a stranger. Until T27, `policy` answers
-/// [`AgentPolicy::default`] and `is_banned` `Some(false)`.
+/// than taking the sender for a stranger.
 ///
 /// The attribution is waited for only when the router reads it: another
 /// agent's bot sent the message, mentioning this agent. A post of an
@@ -68,17 +83,36 @@ pub(crate) struct StoreView {
     members: HashMap<MemberKey, Option<MemberId>>,
     links: HashMap<MemberId, LinkState>,
     community_key: bool,
+    admins: Vec<MemberKey>,
+    banned: Option<HashSet<MemberId>>,
+    policy: Option<AgentPolicy>,
+    thread: Option<ThreadBudget>,
+}
+
+/// What [`StoreView::load`] needs besides the store and the event.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ViewContext<'a> {
+    /// The manager bots' identities.
+    pub(crate) managers: &'a [MemberKey],
+    /// The community admins' identities, whom a ban never holds back.
+    pub(crate) admins: &'a [MemberKey],
+    /// The thread the event is in, as its turn would run.
+    pub(crate) thread: &'a ThreadKey,
+    /// The community's caps.
+    pub(crate) limits: &'a Limits,
+    /// Now, for today's and this hour's counts.
+    pub(crate) now: OffsetDateTime,
 }
 
 impl StoreView {
-    /// Loads the view of `event` for `agent`. `managers` are the manager
-    /// bots' identities.
+    /// Loads the view of `event` for `agent`.
     pub(crate) async fn load(
         store: &Store,
         event: &InboundEvent,
         agent: AgentId,
-        managers: &[MemberKey],
+        context: ViewContext<'_>,
     ) -> Result<Self, StoreError> {
+        let managers = context.managers;
         let mut view = Self::default();
         if let Some(row) = store.agent(agent).await? {
             let state = match row.state {
@@ -139,8 +173,58 @@ impl StoreView {
             view.replied = Some((reply_to.clone(), poster));
         }
         view.member(store, &event.sender).await?;
+        view.admins = std::iter::once(&event.sender)
+            .chain(
+                view.attribution
+                    .as_ref()
+                    .map(|(_, attributed)| &attributed.requester.key),
+            )
+            .filter(|key| context.admins.contains(key))
+            .cloned()
+            .collect();
         view.community_key = store.community_api_key_set().await?;
+        view.banned = view.bans(store, agent).await;
+        view.policy = policy(store, agent, context).await;
+        if !event.is_dm() {
+            view.thread = match store.thread_spend(context.thread, context.now).await {
+                Ok(spend) => Some(context.limits.thread_budget(spend)),
+                Err(err) => {
+                    tracing::warn!(%agent, error = %err, "couldn't read what agents spent in a thread");
+                    None
+                }
+            };
+        }
         Ok(view)
+    }
+
+    /// Which of the members the view knows are banned, or `None` if the
+    /// store couldn't say.
+    async fn bans(&self, store: &Store, agent: AgentId) -> Option<HashSet<MemberId>> {
+        let members: HashSet<MemberId> = self
+            .members
+            .values()
+            .copied()
+            .flatten()
+            .chain(
+                self.attribution
+                    .as_ref()
+                    .and_then(|(_, attribution)| attribution.requester.member),
+            )
+            .collect();
+        let mut banned = HashSet::new();
+        for member in members {
+            match store.is_banned(member).await {
+                Ok(true) => {
+                    banned.insert(member);
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    tracing::warn!(%agent, error = %err, "couldn't read whether a requester is banned");
+                    return None;
+                }
+            }
+        }
+        Some(banned)
     }
 
     /// Records the member `key` belongs to, or that it belongs to none,
@@ -224,11 +308,50 @@ impl RouterView for StoreView {
             .is_some_and(|(known, poster)| known == msg && *poster == agent)
     }
 
-    fn policy(&self, _agent: AgentId) -> Option<AgentPolicy> {
-        Some(AgentPolicy::default())
+    fn policy(&self, agent: AgentId) -> Option<AgentPolicy> {
+        self.policy
+            .clone()
+            .filter(|_| self.agent.is_some_and(|(known, _, _)| known == agent))
     }
 
-    fn is_banned(&self, _requester: &Requester) -> Option<bool> {
-        Some(false)
+    fn is_banned(&self, requester: &Requester) -> Option<bool> {
+        if self.admins.contains(&requester.key) {
+            return Some(false);
+        }
+        let banned = self.banned.as_ref()?;
+        Some(
+            requester
+                .member
+                .into_iter()
+                .chain(self.member_for(&requester.key).flatten())
+                .any(|member| banned.contains(&member)),
+        )
+    }
+
+    fn thread_budget(&self) -> Option<ThreadBudget> {
+        self.thread
+    }
+}
+
+/// `agent`'s policy under `context`'s limits, with the turns it took
+/// today, or `None` if the store couldn't say or its rules don't read.
+async fn policy(store: &Store, agent: AgentId, context: ViewContext<'_>) -> Option<AgentPolicy> {
+    let loaded = async {
+        let settings = store.agent_settings(agent).await?;
+        let turns = store.capped_turns_on(agent, context.now).await?;
+        Ok::<_, StoreError>((settings, turns))
+    };
+    match loaded.await {
+        Ok((settings, turns)) => match agent_policy(&settings, context.limits, turns) {
+            Ok(policy) => Some(policy),
+            Err(err) => {
+                tracing::warn!(%agent, kind = ?err.classify(), column = err.column(), "an agent's allow and deny rules don't read");
+                None
+            }
+        },
+        Err(err) => {
+            tracing::warn!(%agent, error = %err, "couldn't read an agent's policy");
+            None
+        }
     }
 }

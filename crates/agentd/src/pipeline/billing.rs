@@ -125,7 +125,7 @@ mod tests {
             terminal_reason: None,
             api_error_status: None,
             usage: None,
-            cost_usd: None,
+            cost_usd: Err(runner::CostUnknown::NoTotal),
             process_total_cost_usd: None,
             session_id: None,
             stats: TurnStats::default(),
