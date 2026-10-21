@@ -255,6 +255,7 @@ async fn register_config_token(store: &Store, member: MemberId) {
             now,
         )
         .await
+        .unwrap()
         .unwrap();
 }
 

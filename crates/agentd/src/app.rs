@@ -11,6 +11,7 @@ use surface_rocketchat::rest::{Credentials, RestClient};
 use surface_rocketchat::{BotRoles, RocketChatConfig, RocketChatSurface};
 
 use crate::agents::RocketChatAgents;
+use crate::cloud::FireClient;
 use crate::commands::rocketchat::{RocketChatDms, StoreDedup};
 use crate::commands::{Commands, ManagerBot, Replies};
 use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
@@ -23,8 +24,9 @@ use crate::slack::bots::SlackBots;
 use crate::slack::manager::SlackManager;
 
 /// The shared state: the configuration, the store, the agentctl API, the
-/// credential proxy's placeholders, account linking, command dispatch, the
-/// manager bots of Rocket.Chat and Slack, and agents' Slack apps.
+/// credential proxy's placeholders, account linking, command dispatch
+/// (firing members' routines with `[cloud]`), the manager bots of
+/// Rocket.Chat and Slack, and agents' Slack apps.
 ///
 /// Cloning is cheap: every clone shares the same state. Axum handlers take it
 /// as their state.
@@ -71,7 +73,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// If the HTTP clients for Claude or Rocket.Chat can't be built.
+    /// If the HTTP clients for Claude, Rocket.Chat or `[cloud]` can't be
+    /// built.
     pub fn new(config: Config, store: Store, slack: Option<SlackManager>) -> anyhow::Result<Self> {
         Self::build(config, store, slack, None)
     }
@@ -82,7 +85,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// If the HTTP clients for Claude or Rocket.Chat can't be built.
+    /// If the HTTP clients for Claude, Rocket.Chat or `[cloud]` can't be
+    /// built.
     pub fn with_surfaces(
         config: Config,
         store: Store,
@@ -148,6 +152,9 @@ impl App {
         .with_consents(ctl.consents().clone());
         if let Some(slack_agents) = &slack_agents {
             commands = commands.with_slack_agents(slack_agents.clone());
+        }
+        if let Some(cloud) = &config.cloud {
+            commands = commands.with_cloud(FireClient::new(cloud).context("[cloud]")?);
         }
         Ok(Self {
             config: Arc::new(config),
