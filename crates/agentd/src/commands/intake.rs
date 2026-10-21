@@ -11,6 +11,11 @@
 //! [`FollowUp`](super::FollowUp) (a reset waiting for a running turn),
 //! goes on in the same task without holding up the member's next command,
 //! and the intake waits for it at shutdown as for the command itself.
+//!
+//! A Slack manager DM's home check runs there too, first
+//! ([Who may run them](super#who-may-run-them)), so a slow `users.info`
+//! holds up only that member's commands, never the Slack queue that
+//! submitted it.
 
 use std::collections::HashMap;
 use std::fmt;

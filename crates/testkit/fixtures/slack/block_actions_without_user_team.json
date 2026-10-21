@@ -1,0 +1,54 @@
+{
+  "type": "block_actions",
+  "user": {
+    "id": "U0HUMAN01",
+    "username": "ada",
+    "name": "ada"
+  },
+  "api_app_id": "A0MANAGER",
+  "token": "fakeVerificationToken0",
+  "container": {
+    "type": "message",
+    "message_ts": "1727698700.001300",
+    "channel_id": "D0MGRDM01",
+    "is_ephemeral": false
+  },
+  "trigger_id": "7800000000002.7700000000001.fakefakefakefakefakefakefakefake",
+  "team": {
+    "id": "T0TEAM001",
+    "domain": "example"
+  },
+  "enterprise": null,
+  "is_enterprise_install": false,
+  "channel": {
+    "id": "D0MGRDM01",
+    "name": "directmessage"
+  },
+  "message": {
+    "type": "message",
+    "user": "U0MANAGER",
+    "ts": "1727698700.001300",
+    "bot_id": "B0MANAGER",
+    "text": "grace asks helper to run a private task",
+    "team": "T0TEAM001"
+  },
+  "state": {
+    "values": {}
+  },
+  "response_url": "https://hooks.slack.com/actions/T0TEAM001/7800000000003/fakeResponseUrlToken",
+  "actions": [
+    {
+      "action_id": "consent_approve",
+      "block_id": "consent",
+      "text": {
+        "type": "plain_text",
+        "text": "Approve",
+        "emoji": true
+      },
+      "value": "0b9f6f3e-7c4f-4c55-9d7b-7f2a6c1e5d10",
+      "style": "primary",
+      "type": "button",
+      "action_ts": "1727698710.123456"
+    }
+  ]
+}

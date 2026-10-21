@@ -1,0 +1,63 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "context_team_id": "T0TEAM001",
+  "context_enterprise_id": null,
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "user": "U0HUMAN01",
+    "type": "message",
+    "ts": "1727697820.000300",
+    "client_msg_id": "2c3b1e8e-5d0a-4f0e-9d4c-0c3f1f2a7b00",
+    "text": "<@U0BOT0001> please draft the reply",
+    "team": "T0TEAM001",
+    "user_team": "T0TEAM001",
+    "source_team": "T0TEAM001",
+    "user_profile": {
+      "avatar_hash": "g0home",
+      "display_name": "ada",
+      "real_name": "Ada Home",
+      "team": "T0TEAM001",
+      "is_restricted": false,
+      "is_ultra_restricted": false
+    },
+    "blocks": [
+      {
+        "type": "rich_text",
+        "block_id": "Cn00",
+        "elements": [
+          {
+            "type": "rich_text_section",
+            "elements": [
+              {
+                "type": "user",
+                "user_id": "U0BOT0001"
+              },
+              {
+                "type": "text",
+                "text": "please draft the reply"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "channel": "C0SHARED1",
+    "event_ts": "1727697820.000300",
+    "channel_type": "channel"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0CONNECT3",
+  "event_time": 1727697820,
+  "authorizations": [
+    {
+      "enterprise_id": null,
+      "team_id": "T0TEAM001",
+      "user_id": "U0BOT0001",
+      "is_bot": true,
+      "is_enterprise_install": false
+    }
+  ],
+  "is_ext_shared_channel": true,
+  "event_context": "4-fakeEventContextEv0CONNECT3"
+}

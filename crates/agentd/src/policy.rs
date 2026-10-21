@@ -333,6 +333,7 @@ mod tests {
             &Requester {
                 member: None,
                 key: key(user),
+                outside: None,
             },
             &conv(room),
         )

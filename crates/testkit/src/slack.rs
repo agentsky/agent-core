@@ -12,6 +12,19 @@
 //! documentation, with made-up ids. Every Events API fixture is from team
 //! [`TEAM`]; the agent app receiving them has the bot user [`BOT_USER`].
 //! None of them holds a real token.
+//!
+//! # Slack Connect
+//!
+//! The Slack Connect fixtures ([`MESSAGE_CONNECT_NO_ACTOR_TEAM`],
+//! [`MESSAGE_CONNECT_THEIR_TEAM`], [`MESSAGE_CONNECT_HOME`],
+//! [`MESSAGE_HOME_ORG`], [`MESSAGE_WITHOUT_AUTHORIZATIONS`],
+//! [`BLOCK_ACTIONS_WITHOUT_USER_TEAM`], [`BLOCK_ACTIONS_OUTSIDE`]) are
+//! still written by hand: the first after `slackapi/bolt-python`'s
+//! `slack_connect_events_api_no_actor_team_requests`, the rest after the
+//! design's reading of Slack's documentation. T36e replaces them with
+//! redacted captures from a real shared channel. An outside member is
+//! [`OUTSIDE_USER`], of [`OUTSIDE_TEAM`]; the home workspace's Enterprise
+//! Grid organization is [`HOME_ORG`].
 
 use hmac::{Hmac, KeyInit as _, Mac as _};
 use sha2::Sha256;
@@ -26,6 +39,15 @@ pub const USER: &str = "U0HUMAN01";
 pub const OTHER_USER: &str = "U0HUMAN02";
 /// The public channel most fixtures are in.
 pub const CHANNEL: &str = "C0CHAN001";
+/// A member of another organization, in a channel shared with it.
+pub const OUTSIDE_USER: &str = "U0OUTSID1";
+/// [`OUTSIDE_USER`]'s own workspace.
+pub const OUTSIDE_TEAM: &str = "T0THEIRS1";
+/// The Enterprise Grid organization [`TEAM`] belongs to, in
+/// [`MESSAGE_HOME_ORG`].
+pub const HOME_ORG: &str = "E0HOMEORG";
+/// The externally shared channel the Slack Connect fixtures are in.
+pub const SHARED_CHANNEL: &str = "C0SHARED1";
 
 /// A `url_verification` request, whose challenge is [`CHALLENGE`].
 pub const URL_VERIFICATION: &str = include_str!("../fixtures/slack/url_verification.json");
@@ -77,8 +99,37 @@ pub const SLASH_COMMAND: &str = include_str!("../fixtures/slack/slash_command.tx
 /// sends it.
 pub const BLOCK_ACTIONS: &str = include_str!("../fixtures/slack/block_actions.json");
 
+/// [`OUTSIDE_USER`] mentioning [`BOT_USER`] in [`SHARED_CHANNEL`], with
+/// the envelope's `team_id` and the event's `team` both the installing
+/// team, and [`OUTSIDE_TEAM`] only in `user_team`, `source_team` and
+/// `user_profile.team`, as in bolt-python's
+/// `slack_connect_events_api_no_actor_team_requests`.
+pub const MESSAGE_CONNECT_NO_ACTOR_TEAM: &str =
+    include_str!("../fixtures/slack/message_connect_no_actor_team.json");
+/// [`OUTSIDE_USER`] mentioning [`BOT_USER`] in [`SHARED_CHANNEL`], with
+/// [`OUTSIDE_TEAM`] in the envelope's `team_id` and in every team field of
+/// the event, and the installation, [`TEAM`], only in `authorizations`.
+pub const MESSAGE_CONNECT_THEIR_TEAM: &str =
+    include_str!("../fixtures/slack/message_connect_their_team.json");
+/// [`USER`], a home member, mentioning [`BOT_USER`] in [`SHARED_CHANNEL`],
+/// with every team field [`TEAM`].
+pub const MESSAGE_CONNECT_HOME: &str = include_str!("../fixtures/slack/message_connect_home.json");
+/// [`USER`] mentioning [`BOT_USER`] from an Enterprise Grid workspace,
+/// with [`HOME_ORG`] in `user_team` and `user_profile.team`.
+pub const MESSAGE_HOME_ORG: &str = include_str!("../fixtures/slack/message_home_org.json");
+/// [`MESSAGE_MENTION`] without `authorizations`, under its own event id.
+pub const MESSAGE_WITHOUT_AUTHORIZATIONS: &str =
+    include_str!("../fixtures/slack/message_without_authorizations.json");
+/// [`BLOCK_ACTIONS`] without `user.team_id`.
+pub const BLOCK_ACTIONS_WITHOUT_USER_TEAM: &str =
+    include_str!("../fixtures/slack/block_actions_without_user_team.json");
+/// [`BLOCK_ACTIONS`] clicked by [`OUTSIDE_USER`], whose `user.team_id` is
+/// [`OUTSIDE_TEAM`].
+pub const BLOCK_ACTIONS_OUTSIDE: &str =
+    include_str!("../fixtures/slack/block_actions_outside.json");
+
 /// Every fixture, by file name.
-pub const ALL: [(&str, &str); 16] = [
+pub const ALL: [(&str, &str); 23] = [
     ("url_verification.json", URL_VERIFICATION),
     ("message_mention.json", MESSAGE_MENTION),
     ("message_plain.json", MESSAGE_PLAIN),
@@ -95,6 +146,25 @@ pub const ALL: [(&str, &str); 16] = [
     ("app_rate_limited.json", APP_RATE_LIMITED),
     ("slash_command.txt", SLASH_COMMAND),
     ("block_actions.json", BLOCK_ACTIONS),
+    (
+        "message_connect_no_actor_team.json",
+        MESSAGE_CONNECT_NO_ACTOR_TEAM,
+    ),
+    (
+        "message_connect_their_team.json",
+        MESSAGE_CONNECT_THEIR_TEAM,
+    ),
+    ("message_connect_home.json", MESSAGE_CONNECT_HOME),
+    ("message_home_org.json", MESSAGE_HOME_ORG),
+    (
+        "message_without_authorizations.json",
+        MESSAGE_WITHOUT_AUTHORIZATIONS,
+    ),
+    (
+        "block_actions_without_user_team.json",
+        BLOCK_ACTIONS_WITHOUT_USER_TEAM,
+    ),
+    ("block_actions_outside.json", BLOCK_ACTIONS_OUTSIDE),
 ];
 
 /// Slack's `v0` signature of `body` sent at `timestamp` (Unix seconds),
@@ -193,8 +263,18 @@ mod tests {
             }
             let value = json(fixture);
             assert_eq!(value["type"], "event_callback", "{name}");
-            assert_eq!(value["team_id"], TEAM, "{name}");
             assert!(value["event_id"].is_string(), "{name}");
+            if fixture == MESSAGE_WITHOUT_AUTHORIZATIONS {
+                assert!(value.get("authorizations").is_none());
+                continue;
+            }
+            assert_eq!(value["authorizations"][0]["team_id"], TEAM, "{name}");
+            let envelope = if fixture == MESSAGE_CONNECT_THEIR_TEAM {
+                OUTSIDE_TEAM
+            } else {
+                TEAM
+            };
+            assert_eq!(value["team_id"], envelope, "{name}");
         }
         assert_eq!(json(URL_VERIFICATION)["challenge"], CHALLENGE);
         assert_eq!(json(MESSAGE_MENTION)["event"]["channel"], CHANNEL);
@@ -215,6 +295,37 @@ mod tests {
         assert_eq!(form.len(), 1);
         assert_eq!(form[0].0, "payload");
         assert_eq!(json(&form[0].1)["type"], "block_actions");
+    }
+
+    #[test]
+    fn the_slack_connect_fixtures_name_the_teams_they_say() {
+        let event = |fixture: &str| json(fixture)["event"].clone();
+        let no_actor = event(MESSAGE_CONNECT_NO_ACTOR_TEAM);
+        assert_eq!(no_actor["user"], OUTSIDE_USER);
+        assert_eq!(no_actor["team"], TEAM);
+        for field in [
+            &no_actor["user_team"],
+            &no_actor["source_team"],
+            &no_actor["user_profile"]["team"],
+        ] {
+            assert_eq!(field, OUTSIDE_TEAM);
+        }
+        assert_eq!(event(MESSAGE_CONNECT_THEIR_TEAM)["team"], OUTSIDE_TEAM);
+        let home = event(MESSAGE_CONNECT_HOME);
+        assert_eq!(home["channel"], SHARED_CHANNEL);
+        assert_eq!(home["user_team"], TEAM);
+        assert_eq!(event(MESSAGE_HOME_ORG)["user_team"], HOME_ORG);
+        assert_eq!(
+            json(MESSAGE_HOME_ORG)["authorizations"][0]["enterprise_id"],
+            HOME_ORG
+        );
+        assert!(
+            json(BLOCK_ACTIONS_WITHOUT_USER_TEAM)["user"]
+                .get("team_id")
+                .is_none()
+        );
+        assert_eq!(json(BLOCK_ACTIONS)["user"]["team_id"], TEAM);
+        assert_eq!(json(BLOCK_ACTIONS_OUTSIDE)["user"]["team_id"], OUTSIDE_TEAM);
     }
 
     #[test]

@@ -62,6 +62,10 @@ async fn fake_slack() -> MockServer {
             json!({"channel": {"id": "D0DM00001"}}),
         ),
         ("users.list", json!({"members": []})),
+        (
+            "users.info",
+            json!({"user": {"id": fixtures::USER, "team_id": fixtures::TEAM}}),
+        ),
     ] {
         Mock::given(method("POST"))
             .and(path(format!("/api/{name}")))
@@ -465,6 +469,87 @@ async fn a_dm_to_the_manager_app_is_answered_in_the_dm() {
         "{text}"
     );
     running.stop().await;
+}
+
+#[tokio::test]
+async fn a_manager_dm_through_an_installation_elsewhere_is_dropped() {
+    let slack = fake_slack().await;
+    let app = App::open(config(Some(&slack))).await.unwrap();
+    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
+    let mut elsewhere: Value =
+        serde_json::from_str(&fixtures::MESSAGE_IM.replace("what did we decide yesterday?", "me"))
+            .unwrap();
+    elsewhere["authorizations"][0]["team_id"] = json!("T0ELSE001");
+    elsewhere["event_id"] = json!("Ev0ELSEWHR");
+    assert_eq!(elsewhere["team_id"], fixtures::TEAM);
+    let mut uninstalled = elsewhere.clone();
+    uninstalled
+        .as_object_mut()
+        .unwrap()
+        .remove("authorizations");
+    uninstalled["event_id"] = json!("Ev0NOINSTAL");
+    for body in [elsewhere, uninstalled] {
+        assert_eq!(
+            running
+                .signed("/slack/b/manager/events", &body.to_string())
+                .await
+                .status,
+            200
+        );
+    }
+    let home = fixtures::MESSAGE_IM
+        .replace("what did we decide yesterday?", "me")
+        .replace("Ev0IM000001", "Ev0HOMEDM01")
+        .replace("1727697900.000500", "1727697901.000500");
+    assert_eq!(
+        running
+            .signed("/slack/b/manager/events", &home)
+            .await
+            .status,
+        200
+    );
+    wait_for_request(&slack, "/api/chat.postMessage").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let posts: Vec<Request> = slack
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/api/chat.postMessage")
+        .collect();
+    assert_eq!(posts.len(), 1, "only the DM installed here was answered");
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn agentd_does_not_start_when_auth_test_names_no_workspace() {
+    for (answer, named) in [
+        (
+            json!({"ok": true, "team_id": "E0ORG0001", "enterprise_id": "E0ORG0001", "is_enterprise_install": true, "user_id": "U0MANAGER", "bot_id": "B0MANAGER"}),
+            "an organization-wide install (is_enterprise_install)",
+        ),
+        (
+            json!({"ok": true, "team_id": "", "user_id": "U0MANAGER", "bot_id": "B0MANAGER"}),
+            "no workspace",
+        ),
+    ] {
+        let slack = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/auth.test"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(answer))
+            .mount(&slack)
+            .await;
+        let err = App::open(config(Some(&slack))).await.unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("AGENTD_SLACK_MANAGER_BOT_TOKEN"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "auth.test named {named}: install the manager app in each workspace, not organization-wide"
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("transport error"), "{text}");
+    }
 }
 
 #[tokio::test]
