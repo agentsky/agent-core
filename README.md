@@ -103,11 +103,18 @@ for the owner only, and `list [@member]` shows the agents. A member may have
 `agents.max_per_owner` agents (default 10); deleted ones don't count. `delete`
 deactivates the bot user, which needs `edit-other-user-active-status`; a
 deactivation that fails is retried for about three days. A bot sets
-`rocketchat.avatar_url` as its own avatar, if configured. Until agents take
-turns, each agent reacts with :eyes: to messages that mention it.
-On SIGTERM or SIGINT agentd stops accepting connections and gives in-flight
-requests `server.drain_timeout_secs` to finish; a second signal drops them at
-once. Logs go to standard error,
+`rocketchat.avatar_url` as its own avatar, if configured. With `[sandbox]`,
+an agent answers a person who mentions it, replies in a thread it started,
+or DMs it, and another agent's message that mentions it, in the thread, as
+its own bot, on the Claude account of whoever asked (the owner's in their
+own DM). Its bot reacts with `[runner] working_emoji` while the turn runs,
+answers only in rooms it was added to, and a member without a linked account
+gets a direct message from the manager bot saying how to link one. Without
+`[sandbox]`, each agent reacts with :eyes: to messages that mention it.
+On SIGTERM or SIGINT agentd stops accepting connections and messages and
+gives running turns and in-flight requests `server.drain_timeout_secs` to
+finish; a turn still running then is dropped, and its thread told to ask
+again. A second signal drops them at once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
 
 ### Slack

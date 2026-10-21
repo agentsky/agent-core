@@ -21,6 +21,7 @@ name = "agentctl"
 version = "0.1.0"
 dependencies = [
  "agentd",
+ "async-trait",
  "axum",
  "clap",
  "core-types",
@@ -56,6 +57,8 @@ dependencies = [
  "hyper-util",
  "log",
  "rand",
+ "render",
+ "router",
  "runner",
  "sandbox",
  "secrecy",

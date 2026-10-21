@@ -14,7 +14,8 @@ use crate::agents::RocketChatAgents;
 use crate::commands::rocketchat::{RocketChatDms, StoreDedup};
 use crate::commands::{Commands, ManagerBot, Replies};
 use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
-use crate::ctl::{Ctl, CtlSettings, NoSurfaces, SurfaceLookup};
+use crate::ctl::{Ctl, CtlSettings, SurfaceLookup};
+use crate::pipeline::StoreSurfaces;
 use crate::slack::manager::SlackManager;
 
 /// The shared state: the configuration, the store, the agentctl API, the
@@ -28,6 +29,7 @@ pub struct App {
     config: Arc<Config>,
     store: Store,
     ctl: Ctl,
+    surfaces: Arc<dyn SurfaceLookup>,
     registry: Registry,
     auth: Arc<Auth>,
     commands: Commands,
@@ -57,18 +59,19 @@ pub struct RocketChatManager {
 
 impl App {
     /// An `App` over an already open `store`, with the Slack manager app
-    /// `slack` if agentd serves Slack (see [`SlackManager::from_config`]),
-    /// and no surfaces for `agentctl history` yet.
+    /// `slack` if agentd serves Slack (see [`SlackManager::from_config`]).
+    /// Agents' bots act through [`StoreSurfaces`], over their bindings.
     ///
     /// # Errors
     ///
     /// If the HTTP clients for Claude or Rocket.Chat can't be built.
     pub fn new(config: Config, store: Store, slack: Option<SlackManager>) -> anyhow::Result<Self> {
-        Self::with_surfaces(config, store, slack, Arc::new(NoSurfaces))
+        Self::build(config, store, slack, None)
     }
 
     /// An `App` over an already open `store`, with the Slack manager app
-    /// `slack`, whose agentctl API finds surfaces through `surfaces`.
+    /// `slack`, whose agents' bots act through `surfaces`, for agentctl and
+    /// the turn pipeline.
     ///
     /// # Errors
     ///
@@ -79,12 +82,39 @@ impl App {
         slack: Option<SlackManager>,
         surfaces: Arc<dyn SurfaceLookup>,
     ) -> anyhow::Result<Self> {
-        let ctl = Ctl::new(store.clone(), CtlSettings::from_config(&config), surfaces);
+        Self::build(config, store, slack, Some(surfaces))
+    }
+
+    fn build(
+        config: Config,
+        store: Store,
+        slack: Option<SlackManager>,
+        surfaces: Option<Arc<dyn SurfaceLookup>>,
+    ) -> anyhow::Result<Self> {
         let auth = Arc::new(
             Auth::new(config.claude_oauth.clone(), store.clone())
                 .context("setting up Claude account linking")?,
         );
         let rocketchat = rocketchat_manager(&config, &store)?;
+        let surfaces = surfaces.unwrap_or_else(|| {
+            Arc::new(StoreSurfaces::new(
+                store.clone(),
+                rocketchat
+                    .as_ref()
+                    .map(|(manager, _)| (manager.surface_config.clone(), manager.bots.clone())),
+                slack.as_ref().map(|slack| {
+                    (
+                        slack.client().clone(),
+                        Arc::clone(slack.surface().directory()),
+                    )
+                }),
+            ))
+        });
+        let ctl = Ctl::new(
+            store.clone(),
+            CtlSettings::from_config(&config),
+            Arc::clone(&surfaces),
+        );
         let mut replies = Replies::new(rocketchat.as_ref().map(|(_, bot)| Arc::clone(bot)));
         if let Some(slack) = &slack {
             replies = replies.with_slack(Arc::new(slack.manager_bot()), slack.client().clone());
@@ -103,6 +133,7 @@ impl App {
             config: Arc::new(config),
             store,
             ctl,
+            surfaces,
             registry: Registry::new(),
             auth,
             commands,
@@ -150,6 +181,11 @@ impl App {
     /// The agentctl API.
     pub fn ctl(&self) -> &Ctl {
         &self.ctl
+    }
+
+    /// The surfaces agents' bots act through.
+    pub fn surfaces(&self) -> &Arc<dyn SurfaceLookup> {
+        &self.surfaces
     }
 
     /// The live placeholders: the credential proxy checks them, and the

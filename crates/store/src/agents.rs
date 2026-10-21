@@ -824,6 +824,27 @@ impl Store {
         .transpose()
     }
 
+    /// The agent whose binding, in any state, has the bot user `bot`: every
+    /// bot user agentd ever created for an agent, so a paused or deleted
+    /// agent's bot is never taken for a person.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails, [`StoreError::Corrupt`]
+    /// if the row doesn't parse.
+    pub async fn agent_of_bot_user(&self, bot: &MemberKey) -> Result<Option<AgentId>> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT agent_id FROM agent_bindings              WHERE surface = ? AND team_id = ? AND bot_user_id = ?              ORDER BY state = 'active' DESC, state_changed_at DESC LIMIT 1",
+        )
+        .bind(bot.surface.as_str())
+        .bind(bot.team.as_str())
+        .bind(bot.user.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(agent,)| parse_column(&agent, BINDINGS, "agent_id"))
+            .transpose()
+    }
+
     /// The agent of `binding`, if the binding is `active`.
     ///
     /// # Errors

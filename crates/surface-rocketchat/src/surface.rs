@@ -251,7 +251,14 @@ impl RocketChatConfig {
 ///   message only if [`Dedup`] records it first. A bot's own messages are
 ///   delivered too; the pipeline and the router decide what to ignore.
 /// - Posting, editing, reacting, uploading and reading history go through
-///   the REST client as the bot.
+///   the REST client as the bot. `chat.postMessage` joins the poster to a
+///   public channel it isn't in, so [`post`](Surface::post) and
+///   [`upload`](Surface::upload) first check with `subscriptions.getOne`
+///   that the bot is in the room, and refuse with
+///   [`SurfaceError::Forbidden`] otherwise
+///   ([`can_post`](Surface::can_post)). Membership is asked afresh every
+///   time: a bot removed from a room a moment ago must not post there,
+///   since the post would add it back.
 /// - [`render`](Surface::render) converts with
 ///   [`render::rocketchat::to_markdown`] and splits to the message limit.
 ///   `@Name` mentions are left as written: `Surface::render` has no
@@ -310,6 +317,24 @@ impl RocketChatSurface {
                 "conversation on another surface or server".into(),
             ))
         }
+    }
+
+    /// `conv`'s room, if the bot is in it; [`SurfaceError::Forbidden`]
+    /// otherwise, since posting there would join it.
+    async fn member_room<'c>(&self, conv: &'c ConvRef) -> Result<&'c ConversationId> {
+        let room = self.room(conv)?;
+        if self.is_joined(room).await? {
+            Ok(room)
+        } else {
+            Err(SurfaceError::Forbidden(
+                "the bot is not in this room, and posting would join it".into(),
+            ))
+        }
+    }
+
+    /// Whether the bot is in `room` now, from `subscriptions.getOne`.
+    async fn is_joined(&self, room: &ConversationId) -> Result<bool> {
+        Ok(self.rest.subscription(room).await?.is_some())
     }
 
     fn cached_rooms(&self) -> MutexGuard<'_, Cache<ConversationId, RoomInfo>> {
@@ -492,7 +517,7 @@ impl Surface for RocketChatSurface {
     }
 
     async fn post(&self, to: &ReplyTarget, text: &str) -> Result<MsgRef> {
-        let room = self.room(&to.conv)?;
+        let room = self.member_room(&to.conv).await?;
         let posted = self
             .rest
             .post_message(room, text, to.thread_root.as_ref())
@@ -513,8 +538,18 @@ impl Surface for RocketChatSurface {
         self.rest.react(&msg.id, emoji).await
     }
 
+    async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<()> {
+        self.room(&msg.conv)?;
+        self.rest.unreact(&msg.id, emoji).await
+    }
+
+    async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
+        let room = self.room(conv)?;
+        self.is_joined(room).await
+    }
+
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {
-        let room = self.room(&to.conv)?;
+        let room = self.member_room(&to.conv).await?;
         for file in files {
             self.rest
                 .upload(room, to.thread_root.as_ref(), file)

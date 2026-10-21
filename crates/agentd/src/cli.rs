@@ -14,7 +14,7 @@ use tokio::sync::watch;
 
 use crate::app::{self, App};
 use crate::config::Config;
-use crate::pipeline::{self, TurnSettings, Turns};
+use crate::pipeline::{self, Pipeline, TurnSettings, Turns};
 use crate::server::{Routers, Server};
 use crate::telemetry;
 
@@ -166,7 +166,8 @@ where
     let mut server = Server::bind(app.clone(), Routers::new(&app)?).await?;
     match (sandbox, TurnSettings::from_config(app.config())) {
         (Some(sandbox), Some(settings)) => {
-            server = server.with_turns(Turns::start(&app, sandbox, settings)?);
+            let turns = Turns::start(&app, sandbox, settings)?;
+            server = server.with_pipeline(Pipeline::for_app(&app, turns));
         }
         _ => tracing::warn!("no [sandbox] section: agentd runs no turns"),
     }

@@ -331,6 +331,18 @@ impl Surface for SlackSurface {
         self.api.add_reaction(channel, &msg.id, emoji).await
     }
 
+    async fn unreact(&self, msg: &MsgRef, emoji: &str) -> Result<()> {
+        let channel = self.channel(&msg.conv)?;
+        self.api.remove_reaction(channel, &msg.id, emoji).await
+    }
+
+    /// Slack never joins a bot to a conversation it posts in; it refuses
+    /// the post with `not_in_channel` instead. So this only checks that the
+    /// conversation is in this surface's workspace.
+    async fn can_post(&self, conv: &ConvRef) -> Result<bool> {
+        self.channel(conv).map(|_| true)
+    }
+
     async fn upload(&self, to: &ReplyTarget, files: &[OutFile]) -> Result<()> {
         let channel = self.channel(&to.conv)?;
         self.api

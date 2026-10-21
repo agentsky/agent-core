@@ -15,8 +15,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use core_types::{
     Ack, AskAgentRequest, AttachRequest, AttachResponse, CtlError, CtlErrorCode, CtlRequest,
-    Cursor, HistoryRequest, HistoryResponse, LockRequest, LockResponse, OutFile, PostRequest,
-    PrivateRequest, ReactRequest, SurfaceError, TurnKind,
+    Cursor, HistoryRequest, HistoryResponse, LockRequest, LockResponse, MsgRef, OutFile,
+    PostRequest, PrivateRequest, ReactRequest, SurfaceError, TurnKind,
 };
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
@@ -427,7 +427,16 @@ async fn react(
 ) -> Result<Json<Ack>, ApiError> {
     let request: ReactRequest = json_body(body, "react")?;
     let emoji = target::emoji_name(&request.emoji)?;
-    let msg = target::react_target(&caller.turn, request.message.as_deref())?;
+    let msg = match short_message(&ctl, &caller, request.message.as_deref()).await? {
+        Some(msg) if msg.conv == caller.turn.thread.conv => msg,
+        Some(_) => {
+            return Err(error(
+                CtlErrorCode::Refused,
+                "agentctl react may only react to messages in this conversation",
+            ));
+        }
+        None => target::react_target(&caller.turn, request.message.as_deref())?,
+    };
     ctl.queue(&caller, |outbox| {
         outbox
             .push_reaction(QueuedReaction { msg, emoji })
@@ -459,15 +468,25 @@ async fn history(
             format!("--limit must be between 1 and {MAX_HISTORY_LIMIT}"),
         ));
     }
-    let before = request
-        .before
-        .as_deref()
-        .map(|id| target::message_id(id.trim()).map(Cursor::from))
-        .transpose()?;
     let thread = &caller.turn.thread;
+    let before = match short_message(&ctl, &caller, request.before.as_deref()).await? {
+        Some(msg) if msg.conv == thread.conv => Some(Cursor::from(msg.id)),
+        Some(_) => {
+            return Err(error(
+                CtlErrorCode::BadRequest,
+                "--before must name a message in this conversation",
+            ));
+        }
+        None => request
+            .before
+            .as_deref()
+            .map(|id| target::message_id(id.trim()).map(Cursor::from))
+            .transpose()?,
+    };
     let surface = ctl
         .surfaces()
         .surface(caller.token.agent, &thread.conv)
+        .await
         .ok_or_else(|| {
             error(
                 CtlErrorCode::NotAvailable,
@@ -496,6 +515,40 @@ async fn history(
             }
         })?;
     Ok(Json(HistoryResponse { messages }))
+}
+
+/// The message a short id names, when `text` is one: `#` and up to nine
+/// digits, as the turn message shows them, resolved in the caller's
+/// session. `None` when `text` isn't a short id, so it is read as a
+/// platform message id, which never starts with `#`.
+async fn short_message(
+    ctl: &Ctl,
+    caller: &Authorized,
+    text: Option<&str>,
+) -> Result<Option<MsgRef>, ApiError> {
+    let Some(short_id) = text.and_then(|text| short_id(text.trim())) else {
+        return Ok(None);
+    };
+    let found = ctl
+        .store()
+        .message_ref_by_short_id(caller.token.session, short_id)
+        .await
+        .map_err(|err| internal("reading a message id", &err))?;
+    match found {
+        Some(row) => Ok(Some(row.msg)),
+        None => Err(error(
+            CtlErrorCode::NotFound,
+            format!("no message #{short_id} in this session"),
+        )),
+    }
+}
+
+/// `3` from `#3`: a short id, 1 to 9 digits after `#`.
+fn short_id(text: &str) -> Option<u32> {
+    let digits = text.strip_prefix('#')?;
+    (!digits.is_empty() && digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| digits.parse().ok())
+        .flatten()
 }
 
 /// `POST /v1/lock`: one step of a lease on the volume's `shared/` lock.
@@ -620,6 +673,15 @@ mod tests {
                 CtlErrorCode::BadRequest,
                 "{bad:?}"
             );
+        }
+    }
+
+    #[test]
+    fn short_ids_are_a_hash_and_up_to_nine_digits() {
+        assert_eq!(short_id("#3"), Some(3));
+        assert_eq!(short_id("#123456789"), Some(123_456_789));
+        for not in ["3", "#", "#1234567890", "#3a", "#-3", "1.2", "#C123"] {
+            assert_eq!(short_id(not), None, "{not}");
         }
     }
 

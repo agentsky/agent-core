@@ -25,6 +25,7 @@ rustix.workspace = true
 
 [dev-dependencies]
 agentd.workspace = true
+async-trait.workspace = true
 axum.workspace = true
 store.workspace = true
 testkit.workspace = true
