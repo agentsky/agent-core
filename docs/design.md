@@ -536,7 +536,9 @@ Proxy rules:
    and session. Several sessions in one scope can run at the same time for
    different requesters, and a shared placeholder would give the proxy no way to
    tell which member's credential a request belongs to. The runner points the
-   process's placeholder at the current turn's credential when the turn starts.
+   process's placeholder at the current turn's credential when the turn starts,
+   and clears the pointer when the turn ends, however it ended, so between turns
+   the placeholder authorizes nothing.
    Turns within a process are serialized, so the mapping cannot change under a
    request in flight. The mapping is bound to the container's network identity,
    and is revoked when the container is reaped. Another session cannot read the
