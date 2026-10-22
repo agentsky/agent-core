@@ -27,7 +27,7 @@ Rocket.Chat, and its stack is the one these checks run on.
 | A Slack workspace for development, on a plan whose limits you know: the free plan allows 10 app installs, the manager app included | every check |
 | A public HTTPS hostname that stays the same across restarts, with a TLS terminator or tunnel to the host's `127.0.0.1:8443`. Slack bakes the URL into every agent's app when it is created, so a hostname that changes leaves those apps behind | every check |
 | A second hostname, or a second path on the terminator, for the capture endpoint below | T32, T36d, T36e, and the interactivity check |
-| A Docker host for the Compose stack, with `isolate-sandbox.sh`'s rules | every check that runs a turn |
+| A Docker host for the Compose stack, with `isolate-sandbox.sh`'s rules, or a GitHub runner with a Cloudflare tunnel ([below](#or-on-a-github-runner)) | every check that runs a turn |
 | A Claude Pro or Max account to link | linking, and every turn on a member's account |
 | A community API key for the Claude API | turns of a member with no linked account |
 | Three people or test accounts in the workspace: the owner of the agents, who is also a community admin; a second member who never links an account; and, for the requester checks, a third member with an account of their own to link | C3, C4, D1 |
@@ -102,6 +102,43 @@ at startup: start from an empty `data/`, or reset it.
 `docker compose logs -f agentd` is where most of what the checks record
 shows up. agentd logs no message text, token or payload, only ids, kinds
 and counts; a raw payload has to come from the capture endpoint.
+
+### Or on a GitHub runner
+
+The `Slack live server` workflow
+([`slack-live.yml`](../../.github/workflows/slack-live.yml)) does steps 1
+to 4 on a runner, behind a Cloudflare tunnel, with
+[`scripts/ci/slack-live-server.sh`](../../scripts/ci/slack-live-server.sh),
+and keeps agentd up for `wait-minutes` (60 by default, at most 300). Start
+it from the Actions tab with "Run workflow"; GitHub offers that only once
+the workflow is on the default branch. Cancelling the run stops agentd
+early, and a second run waits for the first.
+
+1. Create a tunnel in Cloudflare's dashboard and give it a public hostname
+   whose service is `http://localhost:8443`.
+2. Set the repository secrets `CF_TOKEN`, the tunnel's token, and
+   `CF_URL_BASE`, the hostname as `https://<public host>`, which becomes
+   `public_url`. The run's `CF_TOKEN` and `CF_URL_BASE` inputs override them
+   for one run, but anyone who can read the repository's runs can read an
+   input, so keep the token in the secret.
+3. Run it once without the manager app's secrets to create the app (A1),
+   then set them as the secrets `AGENTD_SLACK_MANAGER_SIGNING_SECRET` and
+   `AGENTD_SLACK_MANAGER_BOT_TOKEN` and run it again. Put the owner's
+   `slack:<team id>:<user id>` in the `community-admins` input.
+
+The run's log is agentd's when `show-agentd-log` is on, as it is by
+default. This repository's run logs are public: agentd logs Slack ids but
+no token or message text. A run starts from an empty database and throws it
+away at the end, with the agents, linked accounts, configuration token and
+community key:
+
+- `/agent delete` the agents before the run ends, or their apps stay
+  behind in Slack with no agentd to delete them.
+- A renewed configuration token's refresh token is gone with the run;
+  generate a new pair for the next one.
+- The checks that need a shell on agentd's host, A3's forced renewal, B6's
+  restart and C3's `docker ps`, and the capture endpoint, need a host of
+  your own.
 
 ## 2. Recording a result
 
