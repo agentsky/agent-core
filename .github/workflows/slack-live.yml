@@ -1,0 +1,124 @@
+name: Slack live server
+
+# Runs agentd for the Slack live checks in deploy/slack/README.md on a
+# runner, reachable through a Cloudflare tunnel, for wait-minutes; see
+# scripts/ci/slack-live-server.sh. It is started by hand only, and stops on
+# its own or when the run is cancelled.
+#
+# Repository secrets:
+#
+#   CF_TOKEN     The tunnel's token. Its public hostname's service in
+#                Cloudflare's dashboard must be http://localhost:8443.
+#   CF_URL_BASE  That hostname as an https:// URL, agentd's [slack]
+#                public_url.
+#   AGENTD_SLACK_MANAGER_SIGNING_SECRET, AGENTD_SLACK_MANAGER_BOT_TOKEN
+#                The manager app's secrets, once the app exists.
+#
+# The CF_TOKEN and CF_URL_BASE inputs override the secrets of those names
+# for one run. An input is stored with the run, where anyone who can read
+# this repository's runs can read it, so a token belongs in the secret.
+
+on:
+  workflow_dispatch:
+    inputs:
+      wait-minutes:
+        description: How long agentd stays up once the tunnel answers, in minutes (1 to 300)
+        type: number
+        default: 60
+      CF_TOKEN:
+        description: The tunnel's token, instead of the CF_TOKEN secret. Readable by anyone who can read this run; prefer the secret
+        type: string
+        default: ''
+      CF_URL_BASE:
+        description: The tunnel's https:// URL, instead of the CF_URL_BASE secret
+        type: string
+        default: ''
+      community-admins:
+        description: Community admins, separated by spaces, each slack:<team id>:<user id>
+        type: string
+        default: ''
+      show-agentd-log:
+        description: Print agentd's log in this run's public log (Slack ids, no tokens or message text)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+# The tunnel has one hostname, so a second run would share it with the
+# first: it waits instead.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  serve:
+    name: agentd for the Slack live checks
+    runs-on: ubuntu-24.04
+    # The image builds, at most 300 minutes up, and cleaning up, within a
+    # hosted runner's six hours.
+    timeout-minutes: 355
+    steps:
+      # The inputs are read from the event file rather than an expression,
+      # which the step's log would show before they are masked.
+      - name: Check the settings
+        env:
+          SECRET_CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          SECRET_CF_URL_BASE: ${{ secrets.CF_URL_BASE }}
+          WAIT_MINUTES: ${{ inputs.wait-minutes }}
+        run: |
+          token=$(jq -r '.inputs.CF_TOKEN // ""' "$GITHUB_EVENT_PATH")
+          url=$(jq -r '.inputs.CF_URL_BASE // ""' "$GITHUB_EVENT_PATH")
+          if [ -n "$token" ]; then echo "::add-mask::$token"; fi
+          if [ -n "$url" ]; then echo "::add-mask::$url"; fi
+          [ -n "${token:-$SECRET_CF_TOKEN}" ] || { echo "::error::Set the CF_TOKEN secret or input"; exit 1; }
+          case ${url:-$SECRET_CF_URL_BASE} in
+            https://?*) ;;
+            *) echo "::error::CF_URL_BASE must be an https:// URL"; exit 1 ;;
+          esac
+          case $WAIT_MINUTES in
+            '' | *[!0-9]*) echo "::error::wait-minutes must be a whole number"; exit 1 ;;
+          esac
+          if [ "$WAIT_MINUTES" -lt 1 ] || [ "$WAIT_MINUTES" -gt 300 ]; then
+            echo "::error::wait-minutes must be from 1 to 300"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Show Docker
+        run: |
+          docker version
+          docker compose version
+
+      - name: Build the images
+        run: |
+          DOCKER_GID="$(stat -c %g /var/run/docker.sock)" \
+            docker compose -f deploy/compose/compose.yaml --profile sandbox build
+
+      - name: Add the sandbox isolation rules
+        run: sudo sh deploy/compose/isolate-sandbox.sh
+
+      - name: Serve
+        env:
+          SECRET_CF_TOKEN: ${{ secrets.CF_TOKEN }}
+          SECRET_CF_URL_BASE: ${{ secrets.CF_URL_BASE }}
+          AGENTD_SLACK_MANAGER_SIGNING_SECRET: ${{ secrets.AGENTD_SLACK_MANAGER_SIGNING_SECRET }}
+          AGENTD_SLACK_MANAGER_BOT_TOKEN: ${{ secrets.AGENTD_SLACK_MANAGER_BOT_TOKEN }}
+          WAIT_MINUTES: ${{ inputs.wait-minutes }}
+          COMMUNITY_ADMINS: ${{ inputs.community-admins }}
+          SHOW_LOG: ${{ inputs.show-agentd-log }}
+        run: |
+          CF_TOKEN=$(jq -r '.inputs.CF_TOKEN // ""' "$GITHUB_EVENT_PATH")
+          CF_URL_BASE=$(jq -r '.inputs.CF_URL_BASE // ""' "$GITHUB_EVENT_PATH")
+          CF_TOKEN=${CF_TOKEN:-$SECRET_CF_TOKEN}
+          CF_URL_BASE=${CF_URL_BASE:-$SECRET_CF_URL_BASE}
+          export CF_TOKEN CF_URL_BASE
+          unset SECRET_CF_TOKEN SECRET_CF_URL_BASE
+          sh scripts/ci/slack-live-server.sh
+
+      - name: Remove the sandbox isolation rules
+        if: always()
+        run: sudo sh deploy/compose/isolate-sandbox.sh remove
