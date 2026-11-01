@@ -3652,19 +3652,19 @@ with `O_NOFOLLOW` relative to its parent, and each directory gets mode
 move fails with `EACCES`, as it does for a directory without write
 permission. It goes depth first without recursion: files are unlinked
 and empty directories removed as they are read, and the first directory
-found with something in it is
-renamed into the top directory as `.removing-<uuid>-<n>`, `n` its level,
-and emptied next. Only a count of the levels is kept, so a tree of any
-depth takes a handful of file descriptors and constant memory beyond the
-read positions below. A directory is read as a stream, a few entries at a
-time, and when the remover comes back up to a level its listing goes on
-from the position where it stopped, kept for the deepest 1,024 levels;
-reading a directory of a million entries from the start again after
-every subdirectory would make the work quadratic. A directory read to the
-end is removed, and read again from the start if it is found not empty:
-something added an entry, or the filesystem's positions count entries
-(tmpfs before Linux 6.6 does), so a resumed listing skipped as many live
-entries as had been removed before it.
+found with something in it is renamed into the top directory as
+`.removing-<uuid>-<n>`, `n` its level, and emptied next. Only a count of
+the levels is kept, so a tree of any depth takes a handful of file
+descriptors and constant memory beyond the read positions below. A
+directory is read as a stream, a few entries at a time, and when the
+remover comes back up to a level its listing goes on from the position
+where it stopped, kept for the deepest 1,024 levels; reading a directory
+of a million entries from the start again after every subdirectory would
+make the work quadratic. A directory read to the end is removed, and
+read again from the start if it is found not empty: something added an
+entry, or the filesystem's positions count entries (tmpfs before Linux
+6.6 does), so a resumed listing skipped as many live entries as had been
+removed before it.
 
 The moves use plain `renameat`; `renameat2` flags such as
 `RENAME_NOREPLACE` fail on NFS, and the names are unique anyway. Any step
