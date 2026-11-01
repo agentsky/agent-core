@@ -450,13 +450,12 @@ fn kind_at<P: rustix::path::Arg>(parent: &File, name: P) -> Result<Option<FileTy
     }
 }
 
-/// How long one removal, or the removals that make one clear, may take.
+/// How long one removal, or the removals of one session start, may take.
 const REMOVAL_TIME: Duration = Duration::from_secs(60);
 
 /// When a removal gives up, so a writer adding entries as fast as they go
 /// can't keep it, and the session start or task waiting for it, busy for
-/// ever. One deadline can be shared by several removals that together make
-/// one clear.
+/// ever. One deadline can be shared by the removals of one session start.
 pub(crate) struct Deadline(Instant);
 
 impl Deadline {
@@ -523,14 +522,15 @@ pub fn remove_tree(path: &Path) -> Result<()> {
 /// Each directory gets mode `0700` through its handle before it is read,
 /// and before it is moved if a move fails with `EACCES`, as it does for a
 /// directory without write permission, so a tree the agent made unreadable
-/// or read-only goes as long as agentd owns it. It works depth first without recursion, with a
-/// handful of files open and one directory read at a time, as a stream:
-/// files are unlinked and empty directories removed as they are read, and
-/// the first directory found with something in it is moved up into the
-/// top directory and emptied next, and its parent's listing goes on from
-/// where it stopped once it is gone ([`Levels`]). So the top directory
-/// holds the directories still being emptied, at most one per level, a
-/// parent whose last entry was the moved directory being removed at once.
+/// or read-only goes as long as agentd owns it. It works depth first
+/// without recursion, with a handful of files open and one directory read
+/// at a time, as a stream: files are unlinked and empty directories removed
+/// as they are read, and the first directory found with something in it is
+/// moved up into the top directory and emptied next, and its parent's
+/// listing goes on from where it stopped once it is gone ([`Levels`]). So
+/// the top directory holds the directories still being emptied, at most one
+/// per level, a parent whose last entry was the moved directory being
+/// removed at once.
 ///
 /// A directory read to the end is removed, and read again from the start
 /// if that finds it not empty: something added an entry, or the listing
