@@ -60,12 +60,17 @@ at startup: start from an empty `data/`, or reset it.
          - AGENTD_SLACK_MANAGER_BOT_TOKEN
    ```
 
-4. Add to `agentd.toml`:
+4. `agentd.toml`, which step 1 copied from the example, already has
+   `[slack]` and `[community]` sections. Change these keys in them rather
+   than adding the sections again, which agentd refuses as tables declared
+   twice:
 
    ```toml
    [slack]
+   # Commented out in the example.
    public_url = "https://<public host>"
-   # So the install reminder (B2) comes within a minute or two.
+   # 3600 in the example. So the install reminder (B2) comes within a
+   # minute or two.
    install_reminder_secs = 60
 
    [community]
