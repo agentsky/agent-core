@@ -46,7 +46,15 @@ use crate::{
 ///   nothing else in agentd forks outside that lock, a child's pipes are
 ///   open only in the child (and whatever it starts) and in agentd: once
 ///   its stdin is closed, a write to it fails.
-/// - [`ip`](Sandbox::ip) is `127.0.0.1` while the container runs.
+/// - [`ip`](Sandbox::ip) is `127.0.0.1` while the container runs. Every
+///   running container shares it, so it supports one running container at
+///   a time wherever agentd counts on an address holding one container:
+///   storing a process's agentctl token, or minting its credential
+///   placeholders, revokes those of every other session at the address.
+///   Distinct loopback addresses wouldn't help, since its processes don't
+///   bind a source address, and Linux gives their connections to any
+///   loopback address the source `127.0.0.1`. Two sessions running at once
+///   on it need hooks that bind nothing to the address.
 /// - [`stop`](Sandbox::stop) kills each process group it started whose
 ///   leader hasn't been reaped, and reports the container
 ///   [`Died`](ContainerEvent::Died).
@@ -132,6 +140,7 @@ impl Sandbox for ProcessSandbox {
                 &spec.volume,
                 spec.session,
                 SkillsEntry::Link(spec.skills_dir.clone()),
+                spec.clear_files,
             )
             .await?;
         let paths = SessionPaths {
