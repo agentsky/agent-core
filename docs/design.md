@@ -544,7 +544,7 @@ built on a Markdown parse tree (`pulldown-cmark`), not regexes:
 | `/agent slack-token <token> <refresh token>` | Linked member on Slack | Register the app configuration token used to create agent apps |
 | `/agent create <name> [persona]` | Linked member | Create the identity and a default persona |
 | `/agent persona <name> <text>` | Owner | Edit the system prompt, or upload `persona.md` in the DM |
-| `/agent skill add\|rm <name> <source>` | Owner | Manage skills |
+| `/agent skill add <name> <source>`, `/agent skill rm <name> <skill>` | Owner | Manage skills |
 | `/agent allow\|deny <name> <target>` | Owner | Who may mention the agent and where |
 | `/agent limits <name> turns=N/day hops=N` | Owner | Per-agent limits |
 | `/agent pause\|resume\|delete <name>` | Owner | Lifecycle. Delete deactivates the bot identity |
