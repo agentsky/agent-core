@@ -116,7 +116,7 @@ associated data, so a ciphertext copied into another row fails to decrypt.
 | Errors | `thiserror` in libraries, `anyhow` in the two binaries |
 | Logging | `tracing`, `tracing-subscriber` with JSON output in production |
 | Secrets | `secrecy` for every token, key and secret in memory. `Debug` never prints them. |
-| Serialization | `serde`, `serde_json`, `toml` |
+| Serialization | `serde`, `serde_json`, `toml`, and `serde_path_to_error` so configuration errors name the key |
 | IDs | `uuid` with `v4` and `serde` |
 | Time | `time` with `serde` and `formatting` (not `chrono`) |
 | Crypto | `chacha20poly1305`, `sha2`, `hmac`, `base64`, `rand`, `subtle` for constant-time compares |
@@ -185,7 +185,9 @@ description, and must pass T02's policy.
   | ctl | agentd's `sandbox` address, port 8081 | sandboxes | agentctl API |
 
 - Each listener binds its own address, never `0.0.0.0`, so a sandbox can't
-  reach the public routes. As a second guard, the public listener also refuses
+  reach the public routes. Configuration validation refuses an unspecified
+  address in any form, a public address inside the sandbox subnet, and a
+  proxy or ctl address outside it (T10). As a second guard, the public listener also refuses
   connections from the sandbox subnet. T16 has a Docker test that a sandbox
   reaches only ports 8080 and 8081.
 - A container's network identity is its IP on the `sandbox` network, read from
@@ -999,7 +1001,7 @@ Deliverables:
 - An axum public listener with `GET /healthz`, which checks the store. The
   internal listeners are placeholders that later tasks fill.
 - Graceful shutdown on SIGTERM: stop accepting, then drain for a configurable
-  timeout.
+  timeout. A second SIGTERM or SIGINT drops in-flight work at once.
 - An `App` struct holding the shared state (config, store, later the surfaces,
   runner and proxy) that later tasks extend. Keep it in
   `crates/agentd/src/app.rs`.
