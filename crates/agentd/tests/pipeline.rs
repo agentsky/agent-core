@@ -17,6 +17,7 @@ use agentd::pipeline::{
     Turns, USAGE_LIMIT_TEXT,
 };
 use agentd::server::{Routers, Server};
+use agentd::skills::{Added, Confirmed, Source};
 use agentd::{App, Config};
 use core_types::{
     AgentId, Binding, BindingId, Caps, ConvKind, ConvRef, Cursor, InboundEvent, MemberId,
@@ -711,6 +712,62 @@ async fn a_mention_runs_a_turn_and_the_reply_is_delivered_in_the_thread() {
     assert_eq!(bobs.requester.key, key("bob"));
     assert_ne!(bobs.session, first_session);
 
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn skills_are_in_every_session_and_their_confirmed_hosts_extend_egress() {
+    let stack = start().await;
+    let skill =
+        "---\nname: docs\ndescription: Read the docs.\nallowed-hosts: [docs.skill.invalid]\n---\n";
+    let added = stack
+        .app
+        .skills()
+        .add(
+            stack.agent,
+            Source::Upload {
+                name: "SKILL.md",
+                bytes: skill.as_bytes(),
+            },
+            stack.alice,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(added, Added::Pending(_)), "{added:?}");
+    assert!(matches!(
+        stack
+            .app
+            .skills()
+            .confirm(stack.agent, "docs")
+            .await
+            .unwrap(),
+        Confirmed::Active(_)
+    ));
+
+    let probe = "{ ls \"$CLAUDE_CONFIG_DIR/skills\"; sed -n 2p \"$CLAUDE_CONFIG_DIR/skills/docs/SKILL.md\"; \
+                 for host in docs.skill.invalid other.skill.invalid; do \
+                 curl -s -o /dev/null -w '%{http_connect}\\n' --proxy \"$ANTHROPIC_BASE_URL\" \"https://$host/\"; \
+                 done; } > skills.txt 2>&1; agentctl attach skills.txt";
+    stack.next_turn(Turn::reply("Checked.").with_command(["sh", "-c", probe]));
+    stack
+        .handle(stack.event("alice", "GENERAL", ConvKind::Channel, "s1", None, &[BOT]))
+        .await;
+    let calls = stack.calls_since(0);
+    let uploaded = calls
+        .iter()
+        .find_map(|call| match call {
+            Call::Upload { files, .. } => {
+                Some(String::from_utf8(files[0].contents.clone()).unwrap())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no upload: {calls:#?}"));
+    assert_eq!(
+        uploaded, "agentctl\ndocs\nname: docs\n502\n403\n",
+        "both skills are in the session; the skill's host passes the allowlist and fails only \
+         to resolve, another host is refused"
+    );
     stack.stop().await;
 }
 

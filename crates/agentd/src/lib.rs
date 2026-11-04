@@ -17,6 +17,8 @@
 //! - [`pipeline`]: the runner's sessions and sandboxes, and the turn hooks
 //!   that give each process its placeholder and agentctl token.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
+//! - [`skills`]: agents' skills, the bundled `agentctl` skill, and the
+//!   egress hosts skills declare.
 //! - [`slack`]: the Slack request URLs' signing secrets, deduplication and
 //!   queue.
 //! - [`sweeper`]: deleting expired rows every minute.
@@ -35,9 +37,11 @@ pub mod ctl;
 pub mod net;
 pub mod pipeline;
 pub mod server;
+pub mod skills;
 pub mod slack;
 pub mod sweeper;
 pub mod telemetry;
+mod throttle;
 
 pub use app::App;
 pub use config::Config;

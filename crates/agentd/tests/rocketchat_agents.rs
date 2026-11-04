@@ -487,6 +487,93 @@ async fn only_the_owner_changes_the_persona() {
 }
 
 #[tokio::test]
+async fn skills_are_added_from_files_attached_in_the_managers_dm() {
+    let chat = Chat::start().await;
+    let data = TempDir::new("agentd-test");
+    let config = Config::parse(
+        &format!(
+            "{}\n[rocketchat]\nbase_url = \"{}\"\nwebsocket_url = \"{}\"\nteam = \"{TEAM}\"\n\
+             manager_user_id = \"{}\"\n",
+            CONFIG.replace("/nonexistent/agentd", &data.path().display().to_string()),
+            chat.fake.uri(),
+            chat.ddp.url(),
+            FakeRest::MANAGER_ID,
+        ),
+        vec![
+            ("AGENTD_MASTER_KEY".to_owned(), chat.master_key.clone()),
+            (
+                "AGENTD_RC_MANAGER_TOKEN".to_owned(),
+                FakeRest::MANAGER_TOKEN.to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let running = Running::start_with(&chat, config).await;
+    running.link(&chat.alice).await;
+    chat.create(&running, "alice", "helper").await;
+    let agent = running.agent(&chat.alice, "helper").await.unwrap();
+    let skills = runner::skills_dir(data.path(), agent.id);
+
+    let skill = b"---\nname: notes\ndescription: Keep notes.\n---\nWrite them down.\n";
+    let file = chat.fake.add_file("SKILL.md", skill);
+    let attached = json!({
+        "files": [{ "_id": file, "name": "SKILL.md", "type": "text/markdown", "size": skill.len() }],
+    });
+    let before = chat.posted("DM-ALICE").await.len();
+    chat.say("alice", "DM-ALICE", "skill add helper", attached);
+    let replies = chat.wait_for_posts("DM-ALICE", before + 1).await;
+    assert_eq!(
+        replies[before],
+        "Added the skill `notes` to `helper`. Its files are in its sandboxes now, though a \
+         conversation already running may not use it until it next starts."
+    );
+    assert_eq!(std::fs::read(skills.join("notes/SKILL.md")).unwrap(), skill);
+
+    let bob_file = chat.fake.add_file("SKILL.md", skill);
+    let before_bob = chat.posted("DM-BOB").await.len();
+    chat.say(
+        "bob",
+        "DM-BOB",
+        "skill add helper",
+        json!({ "files": [{ "_id": bob_file, "name": "SKILL.md" }] }),
+    );
+    let replies = chat.wait_for_posts("DM-BOB", before_bob + 1).await;
+    assert_eq!(
+        replies[before_bob],
+        "You have no agent named `helper`. Only an agent's owner can change it."
+    );
+
+    let big = chat
+        .fake
+        .add_file("skill.zip", &vec![0; 10 * 1024 * 1024 + 1]);
+    let before = chat.posted("DM-ALICE").await.len();
+    chat.say(
+        "alice",
+        "DM-ALICE",
+        "skill add helper",
+        json!({ "files": [{ "_id": big, "name": "skill.zip" }] }),
+    );
+    let replies = chat.wait_for_posts("DM-ALICE", before + 1).await;
+    assert_eq!(replies[before], "That file is over the 10 MB limit.");
+
+    let bad = chat.fake.add_file("SKILL.md", b"no front matter");
+    let before = chat.posted("DM-ALICE").await.len();
+    chat.say(
+        "alice",
+        "DM-ALICE",
+        "skill add helper",
+        json!({ "files": [{ "_id": bad, "name": "SKILL.md" }] }),
+    );
+    let replies = chat.wait_for_posts("DM-ALICE", before + 1).await;
+    assert!(
+        replies[before].starts_with("SKILL.md must start with front matter"),
+        "{}",
+        replies[before]
+    );
+    running.stop().await;
+}
+
+#[tokio::test]
 async fn a_paused_agent_ignores_messages_until_resumed() {
     let chat = Chat::start().await;
     let running = Running::start(&chat, "sqlite::memory:").await;

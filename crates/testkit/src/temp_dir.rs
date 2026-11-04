@@ -1,5 +1,7 @@
-//! [`TempDir`]: a directory for one test, removed when the test ends.
+//! [`TempDir`]: a directory for one test, removed when the test ends, and
+//! [`deep_tree`], a chain of directories too deep for one path.
 
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
@@ -45,6 +47,21 @@ impl Drop for TempDir {
     }
 }
 
+/// Makes the directory `top`, and its missing parents, and under it a
+/// chain of `depth` directories each named `d`. Each is made through its
+/// parent's handle, since the whole chain is longer than a path may be.
+/// Remove it before the [`TempDir`] holding it goes, with a remover that
+/// copes with that depth.
+pub fn deep_tree(top: &Path, depth: usize) {
+    std::fs::create_dir_all(top).unwrap_or_else(|e| panic!("creating {}: {e}", top.display()));
+    let mut level = std::fs::File::open(top).unwrap_or_else(|e| panic!("opening a directory: {e}"));
+    for _ in 0..depth {
+        let next = Path::new(&format!("/proc/self/fd/{}", level.as_raw_fd())).join("d");
+        std::fs::create_dir(&next).unwrap_or_else(|e| panic!("creating a directory: {e}"));
+        level = std::fs::File::open(&next).unwrap_or_else(|e| panic!("opening a directory: {e}"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,6 +89,14 @@ mod tests {
         }));
         assert!(result.is_err());
         assert!(!path.unwrap().exists());
+    }
+
+    #[test]
+    fn a_deep_tree_is_a_chain_of_d() {
+        let dir = TempDir::new("testkit-temp-dir");
+        deep_tree(&dir.join("top"), 3);
+        assert!(dir.join("top/d/d/d").is_dir());
+        assert!(!dir.join("top/d/d/d/d").exists());
     }
 
     #[test]
