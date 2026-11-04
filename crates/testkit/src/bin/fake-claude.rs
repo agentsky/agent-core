@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use clap::{ArgGroup, CommandFactory, Parser, error::ErrorKind};
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
-use testkit::claude::{API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, SCRIPT_ENV, Turn};
+use testkit::claude::{
+    API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, REPLY_COST_USD, SCRIPT_ENV, Turn,
+};
 use tokio::io::{AsyncBufReadExt, BufReader as AsyncBufReader};
 use uuid::Uuid;
 
@@ -133,6 +135,7 @@ struct Session {
     credential: Credential,
     http: reqwest::Client,
     rate_limit_reported: Cell<bool>,
+    total_cost_usd: Cell<f64>,
 }
 
 struct ApiError {
@@ -221,6 +224,7 @@ async fn run(args: Args) -> Result<ExitCode, String> {
             .build()
             .map_err(|err| format!("building the HTTP client: {err}"))?,
         rate_limit_reported: Cell::new(false),
+        total_cost_usd: Cell::new(0.0),
     };
 
     let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
@@ -547,13 +551,17 @@ impl Session {
         started: Instant,
     ) -> Result<(), String> {
         let (input, output) = if is_error { (0, 0) } else { (10, 1) };
+        if !is_error {
+            self.total_cost_usd
+                .set(self.total_cost_usd.get() + REPLY_COST_USD);
+        }
         emit(&json!({
             "type": "result",
             "subtype": "success",
             "is_error": is_error,
             "result": text,
             "session_id": self.id,
-            "total_cost_usd": 0,
+            "total_cost_usd": self.total_cost_usd.get(),
             "usage": usage(input, output),
             "terminal_reason": if is_error { "api_error" } else { "completed" },
             "api_error_status": status,
