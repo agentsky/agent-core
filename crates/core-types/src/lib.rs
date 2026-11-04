@@ -13,7 +13,9 @@
 //! - [`turn`]: who a turn runs for and on which credential.
 //! - [`surface_trait`]: the [`Surface`] trait and the types it uses.
 //! - [`ctl`]: request and response types of the agentctl API.
-//! - [`net`]: [`Cidr`] subnets.
+//! - [`net`]: [`Cidr`] subnets, and which hosts plain HTTP may reach and
+//!   which a client reaches without a proxy.
+//! - [`error`]: [`error_chain`], an error and its causes on one line.
 //! - [`throttle`]: [`Throttle`], which lets a repeated log line through
 //!   once per interval.
 //!
@@ -24,6 +26,7 @@
 
 pub mod cloud;
 pub mod ctl;
+pub mod error;
 pub mod event;
 pub mod ids;
 pub mod net;
@@ -35,6 +38,7 @@ pub mod turn;
 
 pub use cloud::*;
 pub use ctl::*;
+pub use error::error_chain;
 pub use event::*;
 pub use ids::*;
 pub use net::*;
