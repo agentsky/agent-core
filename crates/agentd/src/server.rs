@@ -7,7 +7,7 @@
 //! | --- | --- | --- |
 //! | public | `server.listen` | `/healthz`, and later Slack and OAuth routes |
 //! | proxy | `internal.proxy_listen` | the credential proxy (placeholder) |
-//! | ctl | `internal.ctl_listen` | the agentctl API (placeholder) |
+//! | ctl | `internal.ctl_listen` | the agentctl API ([`ctl`](crate::ctl)) |
 //!
 //! The public listener also refuses connections from
 //! `internal.sandbox_subnet`. Every request carries the peer address as
@@ -54,14 +54,14 @@ pub struct Routers {
 }
 
 impl Routers {
-    /// The routes agentd serves: `/healthz` on the public listener. The
-    /// internal listeners answer everything with 404 until the credential
-    /// proxy and the agentctl API are added.
+    /// The routes agentd serves: `/healthz` on the public listener and the
+    /// agentctl API on the ctl listener. The proxy listener answers
+    /// everything with 404 until the credential proxy is added.
     pub fn new(app: &App) -> Self {
         Self {
             public: public_router(app.clone()),
             proxy: Router::new(),
-            ctl: Router::new(),
+            ctl: app.ctl().router(),
         }
     }
 }

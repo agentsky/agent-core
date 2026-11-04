@@ -109,9 +109,10 @@ uuid_id!(
     "binding id"
 );
 uuid_id!(
-    /// One grant of a scope's `shared/` lock, minted on each acquire. Renew
-    /// and release name it, so two `agentctl lock` runs in one session never
-    /// share a lease.
+    /// One grant of a scope's `shared/` lock, picked by agentctl for each
+    /// `agentctl lock` and sent with each of its acquires. Renew and release
+    /// name it, so two `agentctl lock` runs in one session never share a
+    /// lease.
     LeaseId,
     "lease id"
 );
