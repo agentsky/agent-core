@@ -71,22 +71,26 @@ pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(30);
 /// The directory under the data directory where attachments are staged.
 pub const STAGING_DIR: &str = "ctl-outbox";
 
-/// Finds the surface an agent's bot uses in a conversation, for
-/// `agentctl history`.
+/// Finds the surface an agent's bot uses in a conversation: for
+/// `agentctl history`, and for the turn pipeline, which posts through it.
 ///
-/// agentd implements it once surfaces are wired in (T23). Until then
-/// [`NoSurfaces`] answers `None`, and `history` is not available.
-pub trait SurfaceLookup: Send + Sync {
-    /// The surface that acts as `agent`'s bot in `conv`, if there is one.
-    fn surface(&self, agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>>;
+/// agentd's is [`StoreSurfaces`](crate::pipeline::StoreSurfaces), over the
+/// agents' bindings. [`NoSurfaces`] answers `None`, and `history` is then
+/// not available.
+#[async_trait::async_trait]
+pub trait SurfaceLookup: Send + Sync + std::fmt::Debug {
+    /// The surface that acts as `agent`'s bot on `conv`'s surface and
+    /// team, if the agent has an active binding there.
+    async fn surface(&self, agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>>;
 }
 
 /// A [`SurfaceLookup`] with no surfaces.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoSurfaces;
 
+#[async_trait::async_trait]
 impl SurfaceLookup for NoSurfaces {
-    fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
+    async fn surface(&self, _agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
         None
     }
 }

@@ -289,6 +289,32 @@ impl Store {
         row.map(Row::into_ref).transpose()
     }
 
+    /// Deletes the inbound rows of `session` with these short ids, and
+    /// returns how many went: messages recorded for a turn that never
+    /// reached the model, which the session's next turn must show again.
+    /// A row with `agent_id` set is kept.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if a query fails; nothing is deleted then.
+    pub async fn forget_message_refs(&self, session: SessionId, short_ids: &[u32]) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        let mut deleted = 0;
+        for short_id in short_ids {
+            deleted += sqlx::query(
+                "DELETE FROM message_refs WHERE session_id = ? AND short_id = ? \
+                 AND agent_id IS NULL",
+            )
+            .bind(session.to_string())
+            .bind(i64::from(*short_id))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     /// The messages agentd posted as `agent` in `thread` from sessions
     /// other than `session`, which `session` hasn't recorded yet, oldest
     /// first. Other threads of the conversation are left out.
@@ -521,6 +547,59 @@ mod tests {
             store.posted_message_ref(&msg("C1", "9.9")).await.unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn forgotten_rows_are_shown_again_and_posts_are_kept() {
+        let store = memory_store().await;
+        let (session, other) = (SessionId::new_v4(), SessionId::new_v4());
+        let person = requester("U1", None);
+        let (a, b, c) = (msg("C1", "1.1"), msg("C1", "1.2"), msg("C1", "1.3"));
+        let kept = store
+            .record_message_ref(&inbound(session, &a, None, &person), at(1))
+            .await
+            .unwrap();
+        let posted = store
+            .record_message_ref(
+                &NewMessageRef {
+                    agent: Some(AgentId::new_v4()),
+                    ..inbound(session, &b, None, &person)
+                },
+                at(2),
+            )
+            .await
+            .unwrap();
+        let shown = store
+            .record_message_ref(&inbound(session, &c, None, &person), at(3))
+            .await
+            .unwrap();
+        let elsewhere = store
+            .record_message_ref(&inbound(other, &c, None, &person), at(3))
+            .await
+            .unwrap();
+        let forgotten = store
+            .forget_message_refs(session, &[posted.short_id, shown.short_id])
+            .await
+            .unwrap();
+        assert_eq!(forgotten, 1);
+        assert_eq!(store.session_message_ref(session, &c).await.unwrap(), None);
+        assert_eq!(
+            store.session_message_ref(session, &a).await.unwrap(),
+            Some(kept)
+        );
+        assert_eq!(
+            store.posted_message_ref(&b).await.unwrap(),
+            Some(posted.clone())
+        );
+        assert_eq!(
+            store.session_message_ref(other, &c).await.unwrap(),
+            Some(elsewhere)
+        );
+        let again = store
+            .record_message_ref(&inbound(session, &c, None, &person), at(4))
+            .await
+            .unwrap();
+        assert_eq!(again.short_id, shown.short_id);
     }
 
     #[tokio::test]

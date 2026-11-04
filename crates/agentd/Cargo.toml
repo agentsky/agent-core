@@ -21,10 +21,13 @@ clap.workspace = true
 commands.workspace = true
 core-types.workspace = true
 cred-proxy.workspace = true
+futures.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rand.workspace = true
+render.workspace = true
+router.workspace = true
 runner.workspace = true
 sandbox.workspace = true
 secrecy.workspace = true
@@ -46,7 +49,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 bollard.workspace = true
-futures.workspace = true
 log.workspace = true
 serde_norway.workspace = true
 sqlx.workspace = true
