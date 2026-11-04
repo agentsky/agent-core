@@ -150,14 +150,19 @@ description, and must pass T02's policy.
   | --- | --- |
   | `authorize_url` | `https://claude.com/cai/oauth/authorize` |
   | `token_url` | `https://platform.claude.com/v1/oauth/token` |
+  | `revoke_url` | `https://platform.claude.com/v1/oauth/token/revoke` |
   | `redirect_uri` | `https://platform.claude.com/oauth/code/callback` |
   | `client_id` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
   | `scopes` | `user:profile user:inference` |
   | `profile_url` | `https://api.anthropic.com/api/oauth/profile` |
 
   qm-core still uses `https://claude.ai/oauth/authorize` and
-  `https://console.anthropic.com/v1/oauth/token`. T09 confirms the defaults with
-  a live login and records the result in its PR.
+  `https://console.anthropic.com/v1/oauth/token`. T09 checked every default,
+  and the request shapes, against the 2.1.285 binary
+  ([impl-notes](impl-notes.md#t09-auth)). Claude Code's own claude.ai login
+  asks for more scopes; `user:profile user:inference` is the least agentd
+  needs. The live login T09 couldn't run is on
+  [T13's live-check list](#t13).
 
 ### Network and deployment shape
 
@@ -929,19 +934,36 @@ Deliverables:
      `code_verifier`, `redirect_uri` and `client_id`.
   4. Store the tokens.
   5. Fetch the profile.
-- `fetch_plan(access_token) -> Plan`: `GET profile_url` with a Bearer token.
+- `fetch_plan(access_token) -> PlanInfo { plan, rate_limit_tier }`:
+  `GET profile_url` with a Bearer token.
   Map `organization.organization_type` (`claude_pro`, `claude_max`,
   `claude_team`, `claude_enterprise`) to `Plan`, and keep
   `organization.rate_limit_tier`. Unknown values map to `Plan::Unknown(String)`
   rather than failing.
 - A `TokenSource` trait for use by the proxy:
   `async fn access_token(&self, member) -> Result<SecretString>`. It refreshes
-  when the token expires within 5 minutes, single-flight per member with a keyed
-  async mutex, re-reads the plan after every refresh, and stores both.
-- A refresh failure returns `AuthError::RelinkRequired` and marks the link
-  broken. The DM to the member is sent by agentd (T13), not here.
-- `logout(member)`: deletes the link. Revoking at Anthropic is not part of
-  Claude Code's flow, so there's nothing to call.
+  when the token expires within 5 minutes. The refresh runs in a spawned task
+  that holds the member's keyed async mutex and finishes even if every caller
+  is dropped; concurrent callers share its result, success or failure
+  ([impl-notes](impl-notes.md#a-cancelled-caller-lost-the-refresh)). After a
+  failure that doesn't break the link, a still-valid token is served without
+  retrying for 30 s. The tokens are stored first; the plan is re-read after
+  the lock is released and stored on its own.
+- A refresh whose response says the refresh token is dead (HTTP 400 or 401
+  with `invalid_grant`, `invalid_client`, `invalid_scope` or
+  `unauthorized_client`, or an account-on-hold body on 400, 401 or 403, as
+  Claude Code 2.1.285 reads them) returns `AuthError::RelinkRequired` and
+  marks the link broken. The member is sent once per failure, by the refresh
+  task, on the channel `Auth::take_relink_notices()` returns. Other failures
+  (network, timeout, 5xx, 429, any other 4xx such as a proxy's HTML 403, an
+  unreadable body) leave the link alone and serve the current token while it
+  is valid
+  ([impl-notes](impl-notes.md#a-4xx-from-the-token-endpoint-is-not-always-a-dead-token)).
+  The DM to the member is sent by agentd (T13), not here.
+- `status(member) -> LinkStatus { linked, plan, broken }`, read without the
+  tokens, for T13's `me`.
+- `logout(member)`: deletes the link, then revokes the refresh token at
+  `revoke_url`, best effort, as Claude Code 2.1.285's logout does.
 
 Acceptance:
 
@@ -954,7 +976,9 @@ Acceptance:
 
 Live check (manual, recorded in the PR): one real login against the default
 endpoints. Say which endpoints worked. If any default is wrong, fix it here and
-in [Configuration](#configuration).
+in [Configuration](#configuration). T09's environment had no browser or
+Claude account, so this login moved to [T13's live check](#t13), where
+`login` first exists end to end.
 
 ### T10
 
@@ -1128,16 +1152,31 @@ Deliverables:
     told to revoke that key at Anthropic.
   - `logout`: delete the link (and, later, the Slack configuration token; T30
     adds that).
-  - `me`: link status and plan. The usage line is added in T27, the manager app
-    name in T30.
-- Relink notice: when `TokenSource` reports `RelinkRequired`, DM the member.
-  Send it only when `claude_links.broken_at` goes from empty to set, so there is
-  one notice per failure.
+  - `me`: link status and plan, from `Auth::status`. The usage line is added in
+    T27, the manager app name in T30.
+- Relink notice: at startup, take the receiver from
+  `Auth::take_relink_notices()` and DM each member it yields. `auth`'s refresh
+  task sends a member exactly when it sets `claude_links.broken_at`, whoever
+  asked for the token (a command, or T18's proxy on a session's behalf), so
+  there is one notice per failure and none is lost when the caller goes away.
+  Callers that get `RelinkRequired` send nothing themselves.
 - Secret-bearing commands are never logged with their arguments.
 
 Acceptance: `MockSurface` and wiremock tests for the full login flow from DM,
 the channel refusal and invalidation path, logout, and `me` for linked and
 unlinked members.
+
+Live check (manual, recorded in the PR), the real login T09 couldn't run:
+with the default `[claude_oauth]` endpoints and a real Claude account, run
+`login`, open the link, and paste the `code#state` back. Confirm the
+authorization server accepts the narrowed scopes `user:profile
+user:inference`, that the token works for a model request and `me` shows the
+plan from the profile, and that a refresh succeeds. Then `logout` and confirm
+the revocation at `revoke_url`
+(`https://platform.claude.com/v1/oauth/token/revoke`, read from the binary,
+never called live) succeeds and a refresh with the revoked token is refused.
+Say which endpoints worked; fix any wrong default here, in
+[Configuration](#configuration) and in impl-notes.
 
 ### T14
 
@@ -1459,6 +1498,10 @@ Deliverables:
   - Replaces only that header's value: a subscription credential from
     `TokenSource`, or the community API key from a `CommunityKey` trait.
     T26 implements it over the store; until then tests use a fixed key.
+  - When `TokenSource` returns `RelinkRequired` or `NotLinked`, answers the
+    client with an error and does nothing else: the relink DM comes from
+    `auth`'s relink notices, which agentd forwards (T13). Dropping a request
+    mid-refresh is safe; the refresh finishes in its own task.
   - Leaves the body and every other header untouched, and streams request and
     response bodies (SSE) without buffering.
   - Answers `HEAD /api/hello` locally with 200.

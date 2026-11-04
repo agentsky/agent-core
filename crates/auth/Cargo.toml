@@ -11,3 +11,21 @@ publish = false
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+base64.workspace = true
+core-types.workspace = true
+rand.workspace = true
+reqwest = { workspace = true, features = ["rustls"] }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+store.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+testkit.workspace = true
+wiremock.workspace = true
