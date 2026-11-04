@@ -173,6 +173,32 @@ takes effect once this workflow is on `main`. GitHub also disables
 activity, so on a quiet repository the weekly advisory run can stop and has
 to be re-enabled from the Actions tab.
 
+### Four advisories broke the `deny` job up the stack
+
+**Issue.** In October 2026 the advisory database gained four advisories
+against the versions in our lockfiles: RUSTSEC-2026-0414 and
+RUSTSEC-2026-0433 (pulldown-cmark before 0.13.5 and before 0.13.6: wikilinks
+make parsing take exponential memory or quadratic time), RUSTSEC-2026-0386
+(tokio's safe `AsyncFd` constructors break I/O safety; patched in 1.53.3)
+and RUSTSEC-2026-0385 (ctutils before 0.4.4 can branch on secret values).
+From T06's branch up, `cargo deny check` failed on every pull request that
+changed code, whatever the change was. Our own exposure was small for the
+first three: the renderer enables only tables and strikethrough, and nothing
+calls `AsyncFd`. ctutils sits under `digest` and `universal-hash`, which the
+HMAC signatures and the store's `chacha20poly1305` use, so its fix matters
+beyond the check. The workspace floors, tokio 1.53.1 and pulldown-cmark
+0.13.4, were themselves vulnerable versions.
+
+**Solution.** Each crate is updated with `cargo update --precise` on the
+lowest branch whose lockfile has it: pulldown-cmark to 0.13.6 on T06's
+branch, tokio to 1.54.1 on T04's and ctutils to 0.4.7 on T05's. Every branch
+above takes its parent with a merge that keeps its own `Cargo.lock` and
+reapplies the updates, because a textual merge of two lockfiles mixed
+versions from both sides. The workspace floors move to the locked versions,
+tokio 1.54.1 and pulldown-cmark 0.13.6. tokio's floor is 1.54.1 rather than
+1.53.3 because RUSTSEC-2026-0384 affects 1.54.0. ctutils is transitive and
+has no floor, so the lockfile alone keeps it patched.
+
 ## T03: core-types
 
 ### The `Surface` trait's `Sender` has no runtime to come from
