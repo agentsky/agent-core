@@ -21,6 +21,7 @@ use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, anyhow};
@@ -41,9 +42,10 @@ use tokio::sync::watch;
 use tokio::task::{JoinError, JoinSet};
 use tower::Service as _;
 
+use crate::agents::{Acknowledge, Supervisor};
 use crate::app::App;
 use crate::commands::relink::{RELINK_SWEEP_INTERVAL, RelinkNotifier};
-use crate::commands::rocketchat::{self, CommandIntake};
+use crate::commands::rocketchat::{self, CommandIntake, StoreDedup};
 use crate::net::RefuseSubnet;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
@@ -210,9 +212,10 @@ impl Server {
     ///
     /// The sweeper runs alongside, every [`SWEEP_INTERVAL`], and so do the
     /// routers' [`Worker`]s, the relink notifier and, with `[rocketchat]`,
-    /// the manager bot's connection, which feeds the commands it hears to
-    /// the [`CommandIntake`]. The intake finishes the commands it received
-    /// once the connection stops.
+    /// the manager bot's connection and the [`Supervisor`] of the agents'
+    /// connections. Every connection feeds the commands it hears to the one
+    /// [`CommandIntake`] and passes other messages to [`Acknowledge`]. The
+    /// intake finishes the commands it received once the connections stop.
     ///
     /// # Errors
     ///
@@ -279,10 +282,27 @@ impl Server {
                 intake.run().await;
                 "Rocket.Chat command intake"
             });
+            let onward = Sender::new(Acknowledge::new(
+                manager.agents.clone(),
+                manager.binding.bot.clone(),
+            ));
+            let supervisor = Supervisor::new(
+                manager.agents.clone(),
+                manager.surface_config.clone(),
+                Arc::new(StoreDedup(app.store().clone())),
+                manager.bots.clone(),
+                feed.clone(),
+                Some(onward.clone()),
+            );
+            let supervising = stopping.clone();
+            tasks.spawn(async move {
+                supervisor.run(supervising).await;
+                "Rocket.Chat agent supervisor"
+            });
             let connection = rocketchat::listen(
                 manager.surface.clone(),
                 manager.binding.clone(),
-                feed.into_sender(None),
+                feed.into_sender(Some(onward)),
                 stopping,
             );
             tasks.spawn(async move {

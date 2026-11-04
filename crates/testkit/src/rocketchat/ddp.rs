@@ -56,6 +56,7 @@ struct State {
     next_conn: u64,
     next_ping: u64,
     tokens: HashMap<String, String>,
+    rest: Option<Arc<Mutex<super::State>>>,
     forbidden_rooms: HashSet<String>,
     conns: Vec<Conn>,
     logins: Vec<LoginAttempt>,
@@ -81,8 +82,9 @@ impl State {
 ///
 /// - `connect` is answered with `connected`, `ping` with `pong`.
 /// - `login` with a `resume` token registered with
-///   [`add_token`](Self::add_token) succeeds; any other token gets the
-///   server's 403 error.
+///   [`add_token`](Self::add_token), or issued by the [`FakeRest`](super::FakeRest)
+///   given to [`accept_tokens_of`](Self::accept_tokens_of), succeeds; any
+///   other token gets the server's 403 error.
 /// - `sub` to `stream-room-messages` for any room, except one marked with
 ///   [`forbid_room`](Self::forbid_room), and to `stream-notify-user` for the
 ///   logged-in user's own events, is answered with `ready`; anything else
@@ -144,6 +146,12 @@ impl FakeDdp {
     /// Accepts `token` as a `resume` token for `user_id`.
     pub fn add_token(&self, token: &str, user_id: &str) {
         self.state().tokens.insert(token.into(), user_id.into());
+    }
+
+    /// Also accepts every token `rest` has issued to an active user, such
+    /// as the personal access tokens of bots created through it.
+    pub fn accept_tokens_of(&self, rest: &super::FakeRest) {
+        self.state().rest = Some(Arc::clone(&rest.state));
     }
 
     /// Refuses subscriptions to the messages of `room` from now on.
@@ -445,7 +453,16 @@ fn handle(state: &Mutex<State>, id: u64, text: &str) {
         None => return,
         _ => {}
     }
-    let tokens = state.tokens.clone();
+    let mut tokens = state.tokens.clone();
+    if let Some(rest) = &state.rest {
+        let rest = rest.lock().unwrap_or_else(PoisonError::into_inner);
+        tokens.extend(rest.tokens.iter().filter_map(|(token, user)| {
+            rest.users
+                .get(user)
+                .filter(|u| u.active)
+                .map(|_| (token.clone(), user.clone()))
+        }));
+    }
     let forbidden = state.forbidden_rooms.clone();
     let Some(conn) = state.conn(id) else {
         return;

@@ -39,6 +39,8 @@ pub struct FakeUser {
     pub avatar_url: Option<String>,
     /// Whether `users.create` was asked for a verified email.
     pub verified: bool,
+    /// The email `users.create` was given.
+    pub email: Option<String>,
     password: Option<String>,
 }
 
@@ -80,6 +82,7 @@ struct State {
     rooms: BTreeMap<String, FakeRoom>,
     messages: Vec<FakeMessage>,
     uploads: HashMap<String, (String, String, String)>,
+    files: HashMap<String, (String, Vec<u8>)>,
 }
 
 impl State {
@@ -98,14 +101,18 @@ impl State {
 
     fn user_json(&self, id: &str) -> Value {
         self.users.get(id).map_or(Value::Null, |u| {
-            json!({
+            let mut user = json!({
                 "_id": u.id,
                 "username": u.username,
                 "name": u.name,
                 "roles": u.roles,
                 "active": u.active,
                 "type": "user",
-            })
+            });
+            if let Some(email) = &u.email {
+                user["emails"] = json!([{ "address": email, "verified": u.verified }]);
+            }
+            user
         })
     }
 
@@ -160,8 +167,9 @@ impl State {
 ///
 /// It starts with one user, the manager ([`FakeRest::MANAGER_ID`],
 /// authenticated by [`FakeRest::MANAGER_TOKEN`]), and no rooms.
-/// `users.info` includes `roles` only for the caller itself and for the
-/// manager, which the fake treats as holding `view-full-other-user-info`.
+/// `users.info` includes `roles` and `emails` only for the caller itself
+/// and for the manager, which the fake treats as holding
+/// `view-full-other-user-info`.
 pub struct FakeRest {
     server: MockServer,
     state: Arc<Mutex<State>>,
@@ -188,6 +196,7 @@ impl FakeRest {
                 active: true,
                 avatar_url: None,
                 verified: false,
+                email: None,
                 password: None,
             },
         );
@@ -198,6 +207,10 @@ impl FakeRest {
         let server = MockServer::start().await;
         Mock::given(path_regex("^/api/v1/"))
             .respond_with(Router(Arc::clone(&state)))
+            .mount(&server)
+            .await;
+        Mock::given(path_regex("^/file-upload/"))
+            .respond_with(Files(Arc::clone(&state)))
             .mount(&server)
             .await;
         Self { server, state }
@@ -231,6 +244,7 @@ impl FakeRest {
                 active: true,
                 avatar_url: None,
                 verified: false,
+                email: None,
                 password: None,
             },
         );
@@ -272,6 +286,19 @@ impl FakeRest {
     ) -> String {
         let mut state = self.state();
         store_message(&mut state, room, user_id, text, tmid, None)
+    }
+
+    /// Stores a file named `name` holding `content`, as if it had been
+    /// uploaded, and returns its id. It is served at
+    /// `/file-upload/<id>/<name>` to any active user's credentials, sent as
+    /// `X-User-Id` and `X-Auth-Token` headers.
+    pub fn add_file(&self, name: &str, content: &[u8]) -> String {
+        let mut state = self.state();
+        let id = format!("file-{}", state.next());
+        state
+            .files
+            .insert(id.clone(), (name.to_owned(), content.to_vec()));
+        id
     }
 
     /// A user by username.
@@ -502,7 +529,13 @@ impl Respond for Router {
         match (post, segments.as_slice()) {
             (false, ["me"]) => ok(state.user_json(&caller)),
             (false, ["users.info"]) => {
-                let id = param("userId");
+                let id = match query.get("username") {
+                    Some(username) => state
+                        .user_by_name(username)
+                        .map(|u| u.id.clone())
+                        .unwrap_or_default(),
+                    None => param("userId"),
+                };
                 if !state.users.contains_key(&id) {
                     return failure("User not found.");
                 }
@@ -512,6 +545,7 @@ impl Respond for Router {
                     && let Some(user) = user.as_object_mut()
                 {
                     user.remove("roles");
+                    user.remove("emails");
                 }
                 ok(json!({ "user": user }))
             }
@@ -727,6 +761,30 @@ impl Respond for Router {
     }
 }
 
+/// Serves the files stored with [`FakeRest::add_file`].
+struct Files(Arc<Mutex<State>>);
+
+impl Respond for Files {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if authenticate(&state, request).is_none() {
+            return ResponseTemplate::new(403).set_body_string("Forbidden");
+        }
+        let path = request.url.path().trim_start_matches("/file-upload/");
+        let file = path.split_once('/').and_then(|(id, name)| {
+            state
+                .files
+                .get(id)
+                .filter(|(stored, _)| stored == name)
+                .map(|(_, content)| content.clone())
+        });
+        match file {
+            Some(content) => ResponseTemplate::new(200).set_body_bytes(content),
+            None => ResponseTemplate::new(404).set_body_string("Not found"),
+        }
+    }
+}
+
 fn header(request: &Request, name: &str) -> String {
     request
         .headers
@@ -767,7 +825,7 @@ fn login(state: &mut State, body: &Value) -> ResponseTemplate {
 
 fn create_user(state: &mut State, body: &Value) -> ResponseTemplate {
     let field = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
-    let (Some(username), Some(name), Some(_email), Some(password)) = (
+    let (Some(username), Some(name), Some(email), Some(password)) = (
         field("username"),
         field("name"),
         field("email"),
@@ -807,6 +865,7 @@ fn create_user(state: &mut State, body: &Value) -> ResponseTemplate {
                 .get("verified")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            email: Some(email),
             password: Some(password),
         },
     );

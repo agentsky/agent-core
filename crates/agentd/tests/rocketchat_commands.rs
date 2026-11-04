@@ -239,7 +239,7 @@ async fn every_bot_connection_feeds_commands_to_the_one_intake() {
         manager_surface.clone(),
         Arc::new(RocketChatDms(manager_rest)),
     ));
-    let commands = Commands::new(store, auth, Replies::new(Some(bot)));
+    let commands = Commands::new(store, auth, Replies::new(Some(bot)), None);
     let (intake, feed) = CommandIntake::new(commands, manager.clone());
     let (onward_tx, mut onward) = mpsc::unbounded_channel();
     let (stop, stopping) = watch::channel(false);
