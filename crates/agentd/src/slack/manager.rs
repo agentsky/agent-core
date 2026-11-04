@@ -18,6 +18,7 @@ use anyhow::Context as _;
 use async_trait::async_trait;
 use core_types::{ConversationId, MemberKey, SurfaceError, SurfaceKind, TeamId, UserId};
 use secrecy::SecretString;
+use surface_slack::normalize::is_workspace_id;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory, WebApi};
 
 use crate::commands::{ManagerBot, OpenDm};
@@ -36,6 +37,10 @@ pub struct ManagerIdentity {
     pub app_id: String,
     /// The app's name, as `bots.info` gives it.
     pub app_name: Option<String>,
+    /// The workspace's Enterprise Grid organization, the `enterprise_id`
+    /// `auth.test` gave, if it is in one. A message's sender team fields
+    /// may name it for a home member.
+    pub enterprise: Option<TeamId>,
 }
 
 impl ManagerIdentity {
@@ -44,10 +49,21 @@ impl ManagerIdentity {
     /// # Errors
     ///
     /// The [`SurfaceError`] of `auth.test` or `bots.info`, or
-    /// [`SurfaceError::Api`] if the token isn't a bot token or its bot
-    /// belongs to no app.
+    /// [`SurfaceError::Api`] if `auth.test` names no workspace (`T…`), as
+    /// for an organization-wide install, if the token isn't a bot token,
+    /// or if its bot belongs to no app.
     pub async fn look_up(api: &WebApi) -> Result<Self, SurfaceError> {
         let auth = api.auth_test().await?;
+        if !is_workspace_id(auth.team_id.as_str()) {
+            let named = if auth.is_enterprise_install {
+                "an organization-wide install (is_enterprise_install)"
+            } else {
+                "no workspace"
+            };
+            return Err(SurfaceError::Api(format!(
+                "auth.test named {named}: install the manager app in each workspace, not organization-wide"
+            )));
+        }
         let bot_id = auth.bot_id.filter(|id| !id.is_empty()).ok_or_else(|| {
             SurfaceError::Api("the token is not a bot token (auth.test named no bot)".into())
         })?;
@@ -62,6 +78,7 @@ impl ManagerIdentity {
             bot_id,
             app_id,
             app_name: bot.name.filter(|name| !name.trim().is_empty()),
+            enterprise: auth.enterprise_id,
         })
     }
 }
@@ -106,6 +123,7 @@ impl SlackManager {
         let identity = manager.identity();
         tracing::info!(
             team = %identity.team,
+            enterprise = identity.enterprise.as_ref().map_or("none", TeamId::as_str),
             bot_user = %identity.bot_user,
             app_id = identity.app_id,
             "Slack manager app connected"
@@ -128,7 +146,9 @@ impl SlackManager {
     /// The manager app acting through `api`, a client of `client` with its
     /// bot token, known to be `identity`.
     pub fn with_identity(client: SlackClient, api: WebApi, identity: ManagerIdentity) -> Self {
-        let directory = Arc::new(TeamDirectory::new(identity.team.clone()));
+        let directory = Arc::new(
+            TeamDirectory::new(identity.team.clone()).with_home_org(identity.enterprise.clone()),
+        );
         Self {
             client,
             surface: Arc::new(
@@ -165,29 +185,60 @@ impl SlackManager {
     }
 
     /// The [`ManagerBot`] that sends private replies and notices as the
-    /// manager app, opening DMs with `conversations.open`.
+    /// manager app, opening DMs with `conversations.open` only with home
+    /// members ([`SlackDms`]).
     pub fn manager_bot(&self) -> ManagerBot {
         ManagerBot::new(
             self.bot(),
             self.surface.clone(),
-            Arc::new(SlackDms(self.surface.api().clone())),
+            Arc::new(SlackDms::new(
+                self.surface.api().clone(),
+                Arc::clone(self.surface.directory()),
+            )),
         )
     }
 }
 
 /// Opens the manager bot's DMs on Slack with `conversations.open`, which
-/// returns the existing DM when there is one.
+/// returns the existing DM when there is one, and only with a member of the
+/// workspace.
+///
+/// Every Slack DM the manager bot sends is opened here, through
+/// [`ManagerBot`]: [`Replies`](crate::commands::Replies)'s `dm`, `dm_room`
+/// and `dm_rich`, and direct `manager_bot().dm()` calls. So this is the
+/// guard that keeps agentd from DMing a member of another organization in
+/// a Slack Connect conversation: before `conversations.open`, the user is
+/// looked up with [`TeamDirectory::home_user`], and one it doesn't say is
+/// home fails with [`SurfaceError::Forbidden`]. A lookup that fails is an
+/// error, not a verdict: it is passed on as it came and isn't kept, and
+/// each caller handles either as it handles a failed `conversations.open`.
 #[derive(Debug, Clone)]
-pub struct SlackDms(pub WebApi);
+pub struct SlackDms {
+    api: WebApi,
+    directory: Arc<TeamDirectory>,
+}
+
+impl SlackDms {
+    /// Opens DMs with `api`, the manager app's bot token, after asking
+    /// `directory`, the workspace's, whether the user is home.
+    pub fn new(api: WebApi, directory: Arc<TeamDirectory>) -> Self {
+        Self { api, directory }
+    }
+}
 
 #[async_trait]
 impl OpenDm for SlackDms {
     async fn open_dm(&self, member: &MemberKey) -> Result<ConversationId, SurfaceError> {
-        self.0.open_dm(&member.user).await
+        if !self.directory.home_user(&self.api, &member.user).await? {
+            return Err(SurfaceError::Forbidden(
+                "the user isn't a member of the workspace; no DM is opened with them".into(),
+            ));
+        }
+        self.api.open_dm(&member.user).await
     }
 
     async fn name_of(&self, member: &MemberKey) -> Result<String, SurfaceError> {
-        let user = self.0.user_info(&member.user).await?;
+        let user = self.api.user_info(&member.user).await?;
         user.name
             .or(user.real_name)
             .ok_or(SurfaceError::NotFound("the user's name".to_owned()))

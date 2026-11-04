@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use core_types::{BindingId, ConvKind, ConvRef, MemberId, MessageId, MsgRef, SurfaceKind};
+use core_types::{
+    BindingId, ConvKind, ConvRef, MemberId, MessageId, MsgRef, Outside, SurfaceKind, TeamId,
+};
 use time::macros::datetime;
 
 use super::*;
@@ -196,6 +198,7 @@ impl World {
             reply_to: None,
             files: vec![],
             received_at: datetime!(2026-09-30 12:00 UTC),
+            outside: None,
         }
     }
 
@@ -242,6 +245,7 @@ impl World {
         Requester {
             member: self.view.member_for(key).flatten(),
             key: key.clone(),
+            outside: None,
         }
     }
 
@@ -273,13 +277,21 @@ impl World {
         );
         match self.view.refs.get(&event.message) {
             Some(attribution) if from_agent => {
-                let Requester { member, key } = attribution.requester.clone();
+                let Requester {
+                    member,
+                    key,
+                    outside,
+                } = attribution.requester.clone();
                 Requester {
                     member: member.or_else(|| self.view.member_for(&key).flatten()),
                     key,
+                    outside,
                 }
             }
-            _ => self.requester(&event.sender),
+            _ => Requester {
+                outside: event.outside.clone(),
+                ..self.requester(&event.sender)
+            },
         }
     }
 
@@ -321,6 +333,7 @@ fn refused(reason: RefuseReason) -> Decision {
         requester: Requester {
             member: None,
             key: key("UANY"),
+            outside: None,
         },
     }
 }
@@ -452,6 +465,7 @@ fn hop_requester_member_is_resolved_from_key_when_not_recorded() {
     let recorded = Requester {
         member: None,
         key: w.linked_key.clone(),
+        outside: None,
     };
     let event = w.b_mentions_a(recorded, Hop::ZERO);
     assert_eq!(
@@ -698,6 +712,7 @@ fn unlinked_without_community_key_gets_link_prompt() {
             requester: Requester {
                 member: Some(w.known),
                 key: w.known_key.clone(),
+                outside: None,
             }
         }
     );
@@ -1549,6 +1564,7 @@ fn hop_with_an_unrecorded_member_refuses_when_the_member_is_unanswered() {
     let unrecorded = Requester {
         member: None,
         key: w.owner_key.clone(),
+        outside: None,
     };
     let event = w.b_mentions_a(unrecorded, Hop::ZERO);
     w.view.members_unavailable = true;
@@ -1557,6 +1573,7 @@ fn hop_with_an_unrecorded_member_refuses_when_the_member_is_unanswered() {
     let recorded = Requester {
         member: Some(w.linked),
         key: w.linked_key.clone(),
+        outside: None,
     };
     let event = w.b_mentions_a(recorded.clone(), Hop::ZERO);
     assert_eq!(
@@ -1882,6 +1899,7 @@ fn check_invariants(case: Case) -> usize {
                     .copied()
                     .filter(|_| case.recorded_member),
                 key: requester_key,
+                outside: None,
             };
             let mut event = w.b_mentions_a(requester, Hop::ZERO);
             event.mentions.clear();
@@ -2026,4 +2044,89 @@ fn model_policy_configuration_needs_a_default_and_rejects_unknown_keys() {
     assert_eq!(only_default, ModelPolicy::new("claude-sonnet"));
     assert!(toml::from_str::<ModelPolicy>(r#"plans = { claude_max = "claude-opus" }"#).is_err());
     assert!(toml::from_str::<ModelPolicy>("default = \"a\"\nmodel = \"b\"").is_err());
+}
+
+fn from_outside(team: &str) -> Option<Outside> {
+    Some(Outside {
+        team: TeamId::from(team),
+    })
+}
+
+#[test]
+fn the_router_ignores_outside_requesters_until_admitted() {
+    let mut w = World::new();
+    for outside in [from_outside("T0THEIRS1"), from_outside("E0THEIRS1")] {
+        for sender in [
+            w.stranger_key.clone(),
+            w.linked_key.clone(),
+            w.owner_key.clone(),
+        ] {
+            let mut event = w.mention(&sender);
+            event.outside.clone_from(&outside);
+            assert_eq!(w.route(&event), ignored(IgnoreReason::Outside), "{sender}");
+            let mut dm = w.dm(&sender);
+            dm.outside.clone_from(&outside);
+            assert_eq!(w.route(&dm), ignored(IgnoreReason::Outside));
+        }
+        let mut unaddressed = w.message(&w.linked_key);
+        unaddressed.outside.clone_from(&outside);
+        assert_eq!(
+            w.route(&unaddressed),
+            ignored(IgnoreReason::NotAddressed),
+            "the gate comes first"
+        );
+    }
+
+    let mut outside = w.mention(&w.linked_key);
+    outside.outside = from_outside("T0THEIRS1");
+    w.view.states.insert(w.a, AgentState::Paused);
+    assert_eq!(w.route(&outside), ignored(IgnoreReason::Outside));
+    w.view.states.insert(w.a, AgentState::Active);
+    w.view.banned_members.insert(w.linked);
+    assert_eq!(w.route(&outside), ignored(IgnoreReason::Outside));
+    w.view.banned_members.clear();
+    let deny = w.member_target(&w.linked_key);
+    w.set_policy(AgentPolicy {
+        deny: vec![deny],
+        ..AgentPolicy::default()
+    });
+    assert_eq!(
+        w.route(&outside),
+        ignored(IgnoreReason::Outside),
+        "before every refusal"
+    );
+
+    let mut w = World::new();
+    let theirs = Requester {
+        outside: from_outside("T0THEIRS1"),
+        ..w.requester(&w.linked_key.clone())
+    };
+    let hop = w.b_mentions_a(theirs, Hop(1));
+    assert_eq!(
+        w.route(&hop),
+        ignored(IgnoreReason::Outside),
+        "a hop inherits its attribution's outside"
+    );
+    assert_eq!(
+        IgnoreReason::Outside.to_string(),
+        "requester from outside the workspace"
+    );
+}
+
+#[test]
+fn a_bots_outside_never_makes_a_hop_ignored() {
+    let mut w = World::new();
+    let requester = w.requester(&w.linked_key.clone());
+    let mut event = w.b_mentions_a(requester.clone(), Hop(1));
+    event.outside = from_outside("T0THEIRS1");
+    assert_eq!(
+        w.route(&event),
+        run(
+            requester,
+            Hop(2),
+            CredentialRef::Member(w.linked),
+            ScopeKind::Channel
+        ),
+        "the posting bot's own team says nothing about who asked"
+    );
 }

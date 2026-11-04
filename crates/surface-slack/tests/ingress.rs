@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use axum::Router;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::{Request, StatusCode};
-use core_types::{BindingId, ConvKind, MemberId, SendError, Sender, Sink, UserId};
+use core_types::{BindingId, ConvKind, MemberId, Outside, SendError, Sender, Sink, TeamId, UserId};
 use futures::StreamExt as _;
 use secrecy::{ExposeSecret as _, SecretString};
 use surface_slack::ingress::{
@@ -193,7 +193,21 @@ impl Harness {
     }
 
     fn with_capacity(secrets: Secrets, dedup: MemoryDedup, capacity: usize) -> Self {
+        Self::serving(secrets, dedup, capacity, None)
+    }
+
+    /// A harness whose queue serves `workspace`, when given.
+    fn serving(
+        secrets: Secrets,
+        dedup: MemoryDedup,
+        capacity: usize,
+        workspace: Option<&str>,
+    ) -> Self {
         let (router, queue) = ingress(Arc::new(secrets), capacity);
+        let queue = match workspace {
+            Some(workspace) => queue.with_workspace(workspace.into(), None),
+            None => queue,
+        };
         let (tx, out) = mpsc::unbounded_channel();
         let dedup = Arc::new(dedup);
         let worker = tokio::spawn(queue.run(dedup.clone(), Sender::new(Collect(tx))));
@@ -847,7 +861,7 @@ async fn other_events_are_handed_on_and_rate_limit_notices_are_acked() {
             assert_eq!(event.binding, BindingRef::MANAGER_ID);
             assert_eq!(event.event_type, "user_change");
             assert_eq!(event.event_id, "Ev0USERCHG1");
-            assert_eq!(event.team.as_ref().map(|t| t.as_str()), Some(TEAM));
+            assert_eq!(event.team.as_str(), TEAM);
             assert_eq!(event.event["user"]["deleted"], true);
         }
         other => panic!("expected an event, got {other:?}"),
@@ -1912,5 +1926,272 @@ async fn messages_one_owner_keeps_past_their_rate_are_acked_and_dropped_without_
     );
     logs.snapshot()
         .matching("keeping messages faster than their rate")
+        .assert_has("WARN");
+}
+
+#[tokio::test]
+async fn the_workspace_is_the_installation_not_the_envelope_team() {
+    let mut harness = Harness::start();
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_CONNECT_THEIR_TEAM,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let event = harness.message().await;
+    assert_eq!(event.sender.team.as_str(), TEAM);
+    assert_eq!(event.sender.user.as_str(), fixtures::OUTSIDE_USER);
+    assert_eq!(event.conv.team.as_str(), TEAM);
+    assert_eq!(event.message.conv.team.as_str(), TEAM);
+    assert_eq!(
+        event.outside,
+        Some(Outside {
+            team: fixtures::OUTSIDE_TEAM.into()
+        })
+    );
+
+    let elsewhere = edited(fixtures::USER_CHANGE, |body| {
+        body["team_id"] = fixtures::OUTSIDE_TEAM.into();
+        body["authorizations"][0]["team_id"] = "T0ELSE001".into();
+    });
+    let (status, _) = harness
+        .send(signed(
+            &path(BindingRef::Manager, "events"),
+            MANAGER_SECRET,
+            &elsewhere,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    match harness.next().await {
+        SlackInbound::Event(event) => assert_eq!(event.team.as_str(), "T0ELSE001"),
+        other => panic!("expected an event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_event_without_an_installation_team_is_dropped() {
+    let logs = Logs::global();
+    let mut harness = Harness::start();
+    let uninstalled = |n: usize, authorizations: Option<serde_json::Value>| {
+        edited(
+            &fixtures::with_event_id(fixtures::MESSAGE_MENTION, &format!("Ev0NOINST{n}")),
+            |body| match authorizations {
+                Some(authorizations) => body["authorizations"] = authorizations,
+                None => {
+                    body.as_object_mut().unwrap().remove("authorizations");
+                }
+            },
+        )
+    };
+    let cases = [
+        None,
+        Some(serde_json::Value::Null),
+        Some(serde_json::json!([])),
+        Some(serde_json::json!([{}])),
+        Some(serde_json::json!([{"team_id": null}])),
+        Some(serde_json::json!([{"team_id": "not-a-team"}])),
+        Some(serde_json::json!([{"team_id": 7}])),
+        Some(serde_json::json!([null, {"team_id": TEAM}])),
+        Some(serde_json::json!({"team_id": TEAM})),
+        Some(serde_json::json!("T0TEAM001")),
+    ];
+    let count = cases.len();
+    for (n, authorizations) in cases.into_iter().enumerate() {
+        let body = uninstalled(n, authorizations);
+        let (status, body) = harness
+            .send(signed_events(agent(), AGENT_SECRET, &body))
+            .await;
+        assert_eq!((status, body.as_str()), (StatusCode::OK, ""), "case {n}");
+    }
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_WITHOUT_AUTHORIZATIONS,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let manager = edited(fixtures::USER_CHANGE, |body| {
+        body.as_object_mut().unwrap().remove("authorizations");
+    });
+    let (status, _) = harness
+        .send(signed(
+            &path(BindingRef::Manager, "events"),
+            MANAGER_SECRET,
+            &manager,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+    assert!(harness.recorded("slack:manager").is_empty());
+
+    let dropped = logs
+        .snapshot()
+        .matching("name no installation team")
+        .matching(&format!("binding={}", agent()));
+    let lines = dropped.to_string();
+    let level = |level: &str| lines.lines().filter(|line| line.contains(level)).count();
+    assert_eq!(
+        (level("WARN"), level("DEBUG")),
+        (1, count),
+        "one warning per binding, the rest throttled:\n{lines}"
+    );
+    logs.snapshot()
+        .matching("name no installation team")
+        .matching("binding=manager")
+        .assert_has("WARN");
+
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            &edited(fixtures::MESSAGE_MENTION, |body| {
+                body["authorizations"][0]["team_id"] = TEAM.into();
+                body["authorizations"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!({"team_id": "nonsense", "extra": [1, 2]}));
+            }),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        harness.message().await.event_id,
+        "Ev0MENTION1",
+        "only the first authorization is read"
+    );
+}
+
+#[tokio::test]
+async fn deduplication_keys_are_unchanged_in_shared_channels() {
+    let mut harness = Harness::start();
+    let theirs = edited(
+        &fixtures::with_event_id(fixtures::MESSAGE_CONNECT_NO_ACTOR_TEAM, "Ev0CONNECTX"),
+        |body| {
+            body["team_id"] = fixtures::OUTSIDE_TEAM.into();
+            body["context_team_id"] = fixtures::OUTSIDE_TEAM.into();
+            body["event"]["team"] = fixtures::OUTSIDE_TEAM.into();
+        },
+    );
+    for body in [fixtures::MESSAGE_CONNECT_NO_ACTOR_TEAM, theirs.as_str()] {
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, body))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert_eq!(harness.message().await.event_id, "Ev0CONNECT1");
+    harness.assert_nothing_delivered().await;
+    let messages = harness.recorded(&format!("slack:{}:message", agent()));
+    assert!(
+        messages.contains(&fresh(&format!(
+            "{}:1727697800.000100",
+            fixtures::SHARED_CHANNEL
+        ))),
+        "keyed by channel and ts only: {messages:?}"
+    );
+    assert!(harness.recorded(&format!("slack:{}", agent())).is_empty());
+
+    let manager_events = path(BindingRef::Manager, "events");
+    for (event_id, team) in [
+        ("Ev0SHAREDEV", TEAM),
+        ("Ev0SHAREDEV", fixtures::OUTSIDE_TEAM),
+    ] {
+        let body = edited(
+            &fixtures::with_event_id(fixtures::USER_CHANGE, event_id),
+            |body| {
+                body["team_id"] = team.into();
+            },
+        );
+        let (status, _) = harness
+            .send(signed(&manager_events, MANAGER_SECRET, &body))
+            .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+    assert!(matches!(harness.next().await, SlackInbound::Event(_)));
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded("slack:manager"), ["Ev0SHAREDEV"]);
+}
+
+#[tokio::test]
+async fn an_interactions_sender_team_is_its_users_team_id() {
+    let mut harness = Harness::start();
+    let uri = path(BindingRef::Manager, "interactivity");
+    for (fixture, sender_team) in [
+        (fixtures::BLOCK_ACTIONS, Some(TEAM)),
+        (fixtures::BLOCK_ACTIONS_WITHOUT_USER_TEAM, None),
+        (
+            fixtures::BLOCK_ACTIONS_OUTSIDE,
+            Some(fixtures::OUTSIDE_TEAM),
+        ),
+    ] {
+        let body = fixtures::interactivity_body(fixture);
+        let (status, _) = harness.send(signed(&uri, MANAGER_SECRET, &body)).await;
+        assert_eq!(status, StatusCode::OK);
+        let SlackInbound::Interaction(interaction) = harness.next().await else {
+            panic!("expected an interaction");
+        };
+        assert_eq!(
+            interaction.sender_team.as_ref().map(TeamId::as_str),
+            sender_team
+        );
+        assert_eq!(
+            interaction
+                .sender
+                .as_ref()
+                .map(|sender| sender.team.as_str()),
+            Some(TEAM),
+            "the payload's team.id keys the clicker"
+        );
+    }
+    let malformed = edited(fixtures::BLOCK_ACTIONS, |payload| {
+        payload["user"]["team_id"] = "not a team".into();
+    });
+    let (status, _) = harness
+        .send(signed(
+            &uri,
+            MANAGER_SECRET,
+            &fixtures::interactivity_body(&malformed),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let SlackInbound::Interaction(interaction) = harness.next().await else {
+        panic!("expected an interaction");
+    };
+    assert_eq!(interaction.sender_team, None);
+}
+
+#[tokio::test]
+async fn an_event_installed_elsewhere_takes_no_deduplication_key() {
+    let logs = Logs::global();
+    let mut harness = Harness::serving(secrets(), MemoryDedup::default(), 64, Some(TEAM));
+    let elsewhere = edited(
+        &fixtures::with_event_id(fixtures::MESSAGE_MENTION, "Ev0ELSEWHR"),
+        |body| body["authorizations"][0]["team_id"] = "T0ELSE001".into(),
+    );
+    let (status, _) = harness
+        .send(signed_events(agent(), AGENT_SECRET, &elsewhere))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::MESSAGE_MENTION,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let event = harness.message().await;
+    assert_eq!(
+        event.event_id, "Ev0MENTION1",
+        "the home installation's delivery of the same message is kept"
+    );
+    assert_eq!(event.sender.team.as_str(), TEAM);
+    harness.assert_nothing_delivered().await;
+    logs.snapshot()
+        .matching("installed in another workspace")
+        .matching(&format!("binding={}", agent()))
         .assert_has("WARN");
 }

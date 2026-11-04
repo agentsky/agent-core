@@ -96,6 +96,7 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
             bot_id: "B1".into(),
             app_id: "A1".into(),
             app_name: None,
+            enterprise: None,
         },
     );
     let app = App::new(config, store.clone(), Some(slack)).unwrap();
