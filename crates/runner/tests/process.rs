@@ -120,10 +120,10 @@ async fn two_turns_on_one_warm_process() {
     assert_eq!(one.terminal_reason.as_deref(), Some("completed"));
     assert_eq!(one.usage.unwrap().input_tokens, 10);
     assert_eq!(two.usage.unwrap().input_tokens, 10, "usage is per turn");
-    assert_eq!(one.cost_usd, Some(REPLY_COST_USD));
+    assert_eq!(one.cost_usd, Ok(REPLY_COST_USD));
     assert_eq!(
         two.cost_usd,
-        Some(REPLY_COST_USD),
+        Ok(REPLY_COST_USD),
         "the second turn is not billed for the first"
     );
     assert_eq!(two.process_total_cost_usd, Some(2.0 * REPLY_COST_USD));
@@ -160,7 +160,7 @@ async fn a_crash_then_a_resume() {
     assert_eq!(result.result.as_deref(), Some("after"));
     assert_eq!(
         result.cost_usd,
-        Some(REPLY_COST_USD),
+        Ok(REPLY_COST_USD),
         "a new process counts its cost from 0"
     );
     assert_eq!(h.transcript_user_messages(), ["one", "two", "three"]);

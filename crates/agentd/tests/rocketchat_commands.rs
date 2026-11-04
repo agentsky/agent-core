@@ -149,7 +149,13 @@ async fn the_manager_bot_runs_dm_and_channel_commands() {
     dm.sort();
     let dm = dm.concat();
     let replies = wait_for_posts(&fake, &dm, 1).await;
-    assert_eq!(replies, ["Claude account: linked. Plan: Claude Team."]);
+    assert_eq!(
+        replies,
+        [concat!(
+            "Claude account: linked. Plan: Claude Team.",
+            "\nUsage billed to you today: 0 turns, 0 tokens. This month: 0 turns, 0 tokens (days start at midnight UTC)."
+        )]
+    );
     assert!(posted(&fake, "GENERAL").await.is_empty());
 
     stop.send(()).unwrap();
@@ -271,7 +277,10 @@ async fn every_bot_connection_feeds_commands_to_the_one_intake() {
     let dm = dm.concat();
     let from_alice =
         |id: &str, room: &str, text: &str| realtime_message(id, room, (&alice, "alice"), text);
-    let not_linked = "Claude account: not linked. Send `login` to link one.";
+    let not_linked = concat!(
+        "Claude account: not linked. Send `login` to link one.",
+        "\nUsage billed to you today: 0 turns, 0 tokens. This month: 0 turns, 0 tokens (days start at midnight UTC)."
+    );
 
     let first = from_alice("m-1", "SHARED", "!agent me");
     assert_eq!(ddp.send_message_to(&helper, &first), 1);

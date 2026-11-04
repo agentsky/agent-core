@@ -479,24 +479,7 @@ mod tests {
     use core_types::{ScopeKey, SurfaceKind, TeamId, ThreadKey};
 
     use super::*;
-    use crate::test_util::{at, member_key, memory_store};
-    use crate::{AgentCreation, NewAgent, Visibility};
-
-    async fn agent(store: &Store, owner: MemberId, name: &str) -> AgentId {
-        let team = TeamId::new("T1");
-        let new = NewAgent {
-            owner,
-            name,
-            persona: "p",
-            visibility: Visibility::Public,
-            surface: SurfaceKind::RocketChat,
-            team: &team,
-        };
-        match store.create_agent(&new, 10, at(1)).await.unwrap() {
-            AgentCreation::Created(agent, _) => agent.id,
-            other => panic!("{other:?}"),
-        }
-    }
+    use crate::test_util::{agent, at, member_key, memory_store};
 
     /// Takes the lease on `agent`'s skill `name` from whoever holds it,
     /// for every write a test makes at the times it uses.

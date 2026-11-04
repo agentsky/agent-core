@@ -60,7 +60,7 @@ pub(super) fn no_such_agent(name: &str) -> String {
 impl Commands {
     /// The agents on `member`'s surface and team, if agentd manages agents
     /// there.
-    fn agents_for(&self, member: &MemberKey) -> Option<&RocketChatAgents> {
+    pub(super) fn agents_for(&self, member: &MemberKey) -> Option<&RocketChatAgents> {
         self.inner.rocketchat.as_ref().filter(|agents| {
             member.surface == SurfaceKind::RocketChat && *agents.team() == member.team
         })
@@ -377,7 +377,7 @@ impl Commands {
 
     /// The user id `user` names on `key`'s surface, or `None` if nobody by
     /// that name exists.
-    async fn resolve_user(
+    pub(super) async fn resolve_user(
         &self,
         key: &MemberKey,
         user: &UserRef,

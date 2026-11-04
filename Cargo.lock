@@ -1936,6 +1936,7 @@ dependencies = [
  "async-trait",
  "core-types",
  "futures",
+ "rustix",
  "sandbox",
  "secrecy",
  "serde",

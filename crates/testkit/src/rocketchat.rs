@@ -649,6 +649,23 @@ impl Respond for Router {
                 };
                 invite(&mut state, &text("roomId"), &text("userId"), t, key)
             }
+            (false, ["rooms.info"]) if param("roomId").is_empty() => {
+                let name = param("roomName");
+                let found = state
+                    .rooms
+                    .iter()
+                    .find(|(_, room)| room.name.as_deref() == Some(name.as_str()));
+                match found {
+                    Some((id, room)) if room.members.contains(&caller) || room.t == "c" => {
+                        ok(json!({ "room": state.room_json(id) }))
+                    }
+                    Some(_) => failure("not-allowed"),
+                    None => meteor_error(
+                        "error-room-not-found",
+                        "The required \"roomId\" or \"roomName\" param provided does not match any channel",
+                    ),
+                }
+            }
             (false, ["rooms.info"]) => match state.rooms.get(&param("roomId")) {
                 Some(room) if room.members.contains(&caller) || room.t == "c" => {
                     ok(json!({ "room": state.room_json(&param("roomId")) }))

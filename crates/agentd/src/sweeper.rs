@@ -46,6 +46,8 @@ pub async fn sweep_once(store: &Store, skills: &Skills) {
         Ok(swept) => tracing::debug!(
             pending_logins = swept.pending_logins,
             processed_events = swept.processed_events,
+            thread_usage = swept.thread_usage,
+            limit_notices = swept.limit_notices,
             "swept expired rows"
         ),
         Err(err) => tracing::warn!(error = %err, "sweeping expired rows failed"),
