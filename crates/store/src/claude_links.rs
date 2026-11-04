@@ -2,6 +2,7 @@
 
 use core_types::MemberId;
 use secrecy::SecretString;
+use sqlx::SqliteConnection;
 use time::OffsetDateTime;
 
 use crate::seal::Aad;
@@ -328,6 +329,17 @@ impl Store {
         .await?;
         Ok(result.rows_affected() > 0)
     }
+}
+
+/// Whether `member` has a Claude link, read on `conn`, so that a write
+/// transaction refusing an unlinked member sees a `logout` that unlinked
+/// before it.
+pub(crate) async fn linked(conn: &mut SqliteConnection, member: MemberId) -> Result<bool> {
+    let row: Option<i64> = sqlx::query_scalar("SELECT 1 FROM claude_links WHERE member_id = ?")
+        .bind(member.to_string())
+        .fetch_optional(conn)
+        .await?;
+    Ok(row.is_some())
 }
 
 fn broken_at(value: Option<i64>) -> Result<Option<OffsetDateTime>> {

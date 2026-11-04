@@ -41,8 +41,9 @@ const ADMIN: &str = "root";
 const NO_USAGE: &str = "Usage billed to you today: 0 turns, 0 tokens. This month: 0 turns, \
                         0 tokens (days start at midnight UTC).";
 /// The reply to a banned member's commands in a Rocket.Chat DM.
-const BANNED: &str = "A community admin banned you, so agents won't take your requests. You \
-                      can still run `me`, `logout`, and `pause` or `delete` your agents.";
+pub(super) const BANNED: &str = "A community admin banned you, so agents won't take your \
+                                 requests. You can still run `me`, `logout`, `cloud rm`, and \
+                                 `pause` or `delete` your agents.";
 
 /// What `me` answers `status`, the line on the Claude account, followed by
 /// the usage line for someone nothing was billed to.
@@ -50,7 +51,7 @@ fn me(status: &str) -> String {
     format!("{status}\n{NO_USAGE}")
 }
 
-fn key(user: &str) -> MemberKey {
+pub(super) fn key(user: &str) -> MemberKey {
     MemberKey {
         surface: SurfaceKind::RocketChat,
         team: TeamId::new(TEAM),
@@ -58,7 +59,7 @@ fn key(user: &str) -> MemberKey {
     }
 }
 
-fn conv(room: &str) -> ConvRef {
+pub(super) fn conv(room: &str) -> ConvRef {
     ConvRef {
         surface: SurfaceKind::RocketChat,
         team: TeamId::new(TEAM),
@@ -66,7 +67,7 @@ fn conv(room: &str) -> ConvRef {
     }
 }
 
-fn dm_room(user: &str) -> String {
+pub(super) fn dm_room(user: &str) -> String {
     format!("dm-{user}")
 }
 
@@ -82,18 +83,18 @@ impl OpenDm for Dms {
     }
 }
 
-struct Harness {
-    store: Store,
+pub(super) struct Harness {
+    pub(super) store: Store,
     auth: Arc<Auth>,
-    commands: Commands,
-    mock: Arc<MockSurface>,
+    pub(super) commands: Commands,
+    pub(super) mock: Arc<MockSurface>,
     oauth: MockServer,
-    manager: Binding,
+    pub(super) manager: Binding,
     root: TempDir,
     dms: Arc<Dms>,
 }
 
-async fn harness() -> Harness {
+pub(super) async fn harness() -> Harness {
     let oauth = MockServer::start().await;
     let store =
         Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
@@ -144,7 +145,13 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
-    fn event(&self, sender: &str, kind: ConvKind, room: &str, text: &str) -> InboundEvent {
+    pub(super) fn event(
+        &self,
+        sender: &str,
+        kind: ConvKind,
+        room: &str,
+        text: &str,
+    ) -> InboundEvent {
         InboundEvent {
             event_id: format!("ev-{}", uuid::Uuid::new_v4()),
             binding: self.manager.id,
@@ -168,7 +175,7 @@ impl Harness {
     }
 
     /// Sends `text` as `user` in their DM with the manager bot.
-    async fn dm(&self, user: &str, text: &str) {
+    pub(super) async fn dm(&self, user: &str, text: &str) {
         let origin = Origin::RocketChatDm {
             room: dm_room(user).into(),
         };
@@ -178,7 +185,7 @@ impl Harness {
     }
 
     /// The reply to `/agent <text>` sent as `user` in a Slack channel.
-    async fn slash(&self, user: &str, text: &str) -> String {
+    pub(super) async fn slash(&self, user: &str, text: &str) -> String {
         let origin = Origin::SlackSlash {
             response_url: SecretString::from("https://hooks.slack.test/r"),
             conv: ConvRef {
@@ -188,11 +195,14 @@ impl Harness {
             },
         };
         let command = commands::parse(text).unwrap();
-        self.commands.run(&key(user), command, &origin, &[]).await.0
+        self.commands
+            .run(&key(user), command, &origin, &[], text)
+            .await
+            .0
     }
 
     /// Sends `!agent <text>` as `user` in a channel.
-    async fn channel(&self, user: &str, text: &str) {
+    pub(super) async fn channel(&self, user: &str, text: &str) {
         let origin = Origin::RocketChatChannel {
             room: "GENERAL".into(),
         };
@@ -202,7 +212,7 @@ impl Harness {
     }
 
     /// Every text posted in `user`'s DM with the manager bot.
-    fn replies_to(&self, user: &str) -> Vec<String> {
+    pub(super) fn replies_to(&self, user: &str) -> Vec<String> {
         let to = ReplyTarget {
             conv: conv(&dm_room(user)),
             thread_root: None,
@@ -215,11 +225,11 @@ impl Harness {
             .collect()
     }
 
-    fn last_reply(&self, user: &str) -> String {
+    pub(super) fn last_reply(&self, user: &str) -> String {
         self.replies_to(user).pop().expect("no reply")
     }
 
-    async fn wait_for_replies(&self, user: &str, count: usize) -> Vec<String> {
+    pub(super) async fn wait_for_replies(&self, user: &str, count: usize) -> Vec<String> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let replies = self.replies_to(user);
@@ -239,7 +249,11 @@ impl Harness {
         self.store.member_for_identity(&key(user)).await.unwrap()
     }
 
-    async fn linked_member(&self, user: &str, plan: &str) -> (core_types::MemberId, i64) {
+    pub(super) async fn linked_member(
+        &self,
+        user: &str,
+        plan: &str,
+    ) -> (core_types::MemberId, i64) {
         let member = self
             .store
             .ensure_member(&key(user), user, OffsetDateTime::now_utc())
@@ -274,7 +288,7 @@ impl Harness {
 
 /// Runs the manager bot's connection to the mock surface, feeding a new
 /// intake, as the server does. Completes once both have finished.
-fn serve(
+pub(super) fn serve(
     h: &Harness,
     stopping: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<Result<(), SurfaceError>> {
@@ -804,8 +818,6 @@ async fn commands_that_come_later_say_so() {
     let h = harness().await;
     h.dm(ADMIN, "admin slack").await;
     assert_eq!(h.last_reply(ADMIN), "`admin slack` isn't available yet.");
-    h.dm("alice", "cloud list").await;
-    assert_eq!(h.last_reply("alice"), "`cloud list` isn't available yet.");
 }
 
 #[tokio::test]
@@ -897,6 +909,7 @@ async fn only_admins_change_the_community_key() {
                 room: "dm-root".into(),
             },
             &[],
+            "",
         )
         .await;
     assert_eq!(
@@ -967,6 +980,7 @@ async fn an_admin_sets_the_key_with_the_slack_slash_command() {
             commands::parse(&format!("admin api-key set {API_KEY}")).unwrap(),
             &origin,
             &[],
+            "",
         )
         .await;
     assert!(
@@ -981,6 +995,7 @@ async fn an_admin_sets_the_key_with_the_slack_slash_command() {
             commands::parse("admin api-key clear").unwrap(),
             &origin,
             &[],
+            "",
         )
         .await;
     assert_eq!(reply, admin::NOT_AN_ADMIN, "admins are the ones configured");
@@ -2753,7 +2768,7 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
     assert_eq!(
         h.last_reply(ADMIN),
         "Banned `@BOB`. Agents refuse their requests, and they can only run `me`, `logout`, \
-         and `pause` or `delete` their agents. Undo it with `admin unban <user>`."
+         `cloud rm`, and `pause` or `delete` their agents. Undo it with `admin unban <user>`."
     );
     let ban = h.store.ban(bob).await.unwrap().unwrap();
     assert_eq!(ban.banned_by, key(ADMIN));
@@ -2763,8 +2778,8 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
     assert_eq!(
         h.slash(ADMIN, "admin ban <@CAROL>").await,
         "Banned `@CAROL`. Agents refuse their requests, and they can only run `/agent me`, \
-         `/agent logout`, and `/agent pause` or `/agent delete` their agents. Undo it with \
-         `/agent admin unban <user>`."
+         `/agent logout`, `/agent cloud rm`, and `/agent pause` or `/agent delete` their agents. \
+         Undo it with `/agent admin unban <user>`."
     );
 
     h.dm("BOB", "list").await;
@@ -2772,7 +2787,8 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
     assert_eq!(
         h.slash("BOB", "list").await,
         "A community admin banned you, so agents won't take your requests. You can still run \
-         `/agent me`, `/agent logout`, and `/agent pause` or `/agent delete` your agents."
+         `/agent me`, `/agent logout`, `/agent cloud rm`, and `/agent pause` or `/agent delete` \
+         your agents."
     );
     h.dm("BOB", "login").await;
     assert_eq!(h.last_reply("BOB"), BANNED);
@@ -2781,7 +2797,8 @@ async fn an_admin_bans_and_unbans_and_a_ban_leaves_only_what_takes_away() {
         h.last_reply("BOB"),
         format!(
             "{}\nA community admin banned you: agents won't take your requests, and you can \
-             only run `me`, `logout`, and `pause` or `delete` your agents. Reason: posts spam \
+             only run `me`, `logout`, `cloud rm`, and `pause` or `delete` your agents. Reason: \
+             posts spam \
              all day",
             me("Claude account: not linked. Send `login` to link one.")
         )

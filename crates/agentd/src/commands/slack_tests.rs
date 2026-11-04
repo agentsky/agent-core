@@ -23,6 +23,7 @@ use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 use super::intake::CommandIntake;
+use super::relink::RelinkNotifier;
 use super::slack::{consent_action, dm_command, member_who_left, slash_command};
 use super::slack_tokens::{
     ConfigTokenRotator, NOTICE_LEASE, NOTICE_MAX_ATTEMPTS, ROTATION_LEASE, RotationPass,
@@ -40,7 +41,7 @@ const GIVEN_TOKEN: &str = "xoxe.xoxp-1-GIVEN-SECRET-token";
 const GIVEN_REFRESH: &str = "xoxe-1-GIVEN-SECRET-refresh";
 const HOOK: &str = "hook-SECRET-path";
 
-fn slack_key(user: &str) -> MemberKey {
+pub(super) fn slack_key(user: &str) -> MemberKey {
     MemberKey {
         surface: SurfaceKind::Slack,
         team: TeamId::new(TEAM),
@@ -48,7 +49,7 @@ fn slack_key(user: &str) -> MemberKey {
     }
 }
 
-fn slack_channel(id: &str) -> ConvRef {
+pub(super) fn slack_channel(id: &str) -> ConvRef {
     ConvRef {
         surface: SurfaceKind::Slack,
         team: TeamId::new(TEAM),
@@ -56,7 +57,7 @@ fn slack_channel(id: &str) -> ConvRef {
     }
 }
 
-fn identity() -> ManagerIdentity {
+pub(super) fn identity() -> ManagerIdentity {
     ManagerIdentity {
         team: TeamId::new(TEAM),
         bot_user: UserId::new("U0MANAGER"),
@@ -73,17 +74,17 @@ fn ok(body: Value) -> ResponseTemplate {
     ResponseTemplate::new(200).set_body_json(body)
 }
 
-struct SlackHarness {
-    store: Store,
+pub(super) struct SlackHarness {
+    pub(super) store: Store,
     data: TempDir,
-    commands: Commands,
+    pub(super) commands: Commands,
     consents: Consents,
-    slack: MockServer,
+    pub(super) slack: MockServer,
     manager: SlackManager,
     hooks: std::sync::atomic::AtomicUsize,
 }
 
-async fn slack_harness() -> SlackHarness {
+pub(super) async fn slack_harness() -> SlackHarness {
     let store =
         Store::open_in_memory(Sealer::from_base64(&Sealer::generate_key().unwrap()).unwrap())
             .await
@@ -91,7 +92,7 @@ async fn slack_harness() -> SlackHarness {
     slack_harness_on(store).await
 }
 
-async fn slack_harness_on(store: Store) -> SlackHarness {
+pub(super) async fn slack_harness_on(store: Store) -> SlackHarness {
     let oauth = OAuthConfig {
         token_url: "http://127.0.0.1:9/token".to_owned(),
         revoke_url: "http://127.0.0.1:9/revoke".to_owned(),
@@ -161,7 +162,7 @@ async fn slack_harness_on(store: Store) -> SlackHarness {
 
 impl SlackHarness {
     /// A new `response_url`, and its path.
-    fn response_url(&self) -> (SecretString, String) {
+    pub(super) fn response_url(&self) -> (SecretString, String) {
         let n = self.hooks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = format!("/hooks/{n}/{HOOK}");
         let url = SecretString::from(format!("{}{path}", self.slack.uri()));
@@ -170,7 +171,7 @@ impl SlackHarness {
 
     /// Runs `/agent <text>` as `user` in `C0CHAN001` and returns the
     /// replies sent to its `response_url`.
-    async fn slash(&self, user: &str, text: &str) -> Vec<String> {
+    pub(super) async fn slash(&self, user: &str, text: &str) -> Vec<String> {
         self.slash_in(user, &slack_channel("C0CHAN001"), text).await
     }
 
@@ -193,7 +194,7 @@ impl SlackHarness {
             .collect()
     }
 
-    async fn requests(&self) -> Vec<Request> {
+    pub(super) async fn requests(&self) -> Vec<Request> {
         self.slack.received_requests().await.unwrap_or_default()
     }
 
@@ -207,7 +208,7 @@ impl SlackHarness {
     }
 
     /// Every text the manager posted, with the channel.
-    async fn posts(&self) -> Vec<(String, String)> {
+    pub(super) async fn posts(&self) -> Vec<(String, String)> {
         self.calls("chat.postMessage")
             .await
             .iter()
@@ -221,7 +222,7 @@ impl SlackHarness {
             .collect()
     }
 
-    async fn linked(&self, user: &str) -> MemberId {
+    pub(super) async fn linked(&self, user: &str) -> MemberId {
         self.linked_as(&slack_key(user)).await
     }
 
@@ -231,20 +232,7 @@ impl SlackHarness {
             .ensure_member(key, key.user.as_str(), OffsetDateTime::now_utc())
             .await
             .unwrap();
-        self.store
-            .put_claude_link(
-                member,
-                &NewClaudeLink {
-                    access_token: SecretString::from("access"),
-                    refresh_token: SecretString::from("refresh"),
-                    expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
-                    plan: Some("claude_max".to_owned()),
-                    rate_limit_tier: None,
-                },
-                OffsetDateTime::now_utc(),
-            )
-            .await
-            .unwrap();
+        link(&self.store, member).await;
         member
     }
 
@@ -270,7 +258,7 @@ impl SlackHarness {
     }
 }
 
-fn json_body(request: &Request) -> Value {
+pub(super) fn json_body(request: &Request) -> Value {
     serde_json::from_slice(&request.body).unwrap()
 }
 
@@ -493,6 +481,7 @@ async fn slack_token_needs_a_linked_member_on_slack() {
                 room: "dm-alice".into(),
             },
             &[],
+            "",
         )
         .await;
     assert!(reply.contains("send it on Slack"), "{reply}");
@@ -517,6 +506,7 @@ async fn without_the_slack_manager_app_slack_token_is_unavailable() {
                 channel: "D0DM00001".into(),
             },
             &[],
+            "",
         )
         .await;
     assert_eq!(reply, "Slack isn't set up on this agentd.");
@@ -548,6 +538,7 @@ async fn me_on_slack_names_the_manager_app_and_the_token_state() {
             OffsetDateTime::now_utc(),
         )
         .await
+        .unwrap()
         .unwrap();
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(reply.contains("Plan: Claude Max."), "{reply}");
@@ -580,6 +571,7 @@ async fn logout_deletes_the_configuration_tokens() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
@@ -608,6 +600,7 @@ async fn the_rotator_renews_each_token_before_it_expires() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     let first_exp = (start + time::Duration::hours(12)).unix_timestamp();
     let second_exp = (start + time::Duration::hours(22)).unix_timestamp();
@@ -681,6 +674,7 @@ async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -738,6 +732,7 @@ async fn a_failed_renewal_is_tried_again_after_the_lease() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -792,6 +787,7 @@ async fn a_notice_nobody_can_send_is_tried_a_bounded_number_of_times() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     h.store
         .mark_slack_config_token_broken(&row, start)
@@ -822,13 +818,13 @@ async fn a_notice_nobody_can_send_is_tried_a_bounded_number_of_times() {
 
 /// Collects what the Slack queue would hand on, through [`Inbound`], into a
 /// running intake.
-struct Running {
+pub(super) struct Running {
     inbound: Sender<SlackInbound>,
     intake: tokio::task::JoinHandle<()>,
 }
 
 impl Running {
-    fn start(h: &SlackHarness) -> Self {
+    pub(super) fn start(h: &SlackHarness) -> Self {
         let (intake, submitter) = CommandIntake::new(h.commands.clone());
         let inbound = Inbound::new(h.store.clone(), Some(identity()), submitter);
         Self {
@@ -837,11 +833,11 @@ impl Running {
         }
     }
 
-    async fn send(&self, item: SlackInbound) {
+    pub(super) async fn send(&self, item: SlackInbound) {
         self.inbound.send(item).await.unwrap();
     }
 
-    async fn stop(self) {
+    pub(super) async fn stop(self) {
         drop(self.inbound);
         tokio::time::timeout(Duration::from_secs(20), self.intake)
             .await
@@ -850,7 +846,7 @@ impl Running {
     }
 }
 
-fn dm_event(sender: &str, text: &str) -> InboundEvent {
+pub(super) fn dm_event(sender: &str, text: &str) -> InboundEvent {
     let conv = ConvRef {
         surface: SurfaceKind::Slack,
         team: TeamId::new(TEAM),
@@ -878,7 +874,7 @@ fn dm_event(sender: &str, text: &str) -> InboundEvent {
     }
 }
 
-fn slash(text: &str, response_url: SecretString) -> SlashCommand {
+pub(super) fn slash(text: &str, response_url: SecretString) -> SlashCommand {
     SlashCommand {
         binding: BindingRef::MANAGER_ID,
         sender: slack_key("U0HUMAN01"),
@@ -1005,6 +1001,7 @@ impl SlackHarness {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
 }
@@ -1058,7 +1055,8 @@ fn only_agent_slash_commands_are_taken_and_their_text_is_decoded() {
     let (member, text, origin) =
         slash_command(slash("persona helper a &lt;b&gt; &amp;amp; c", url.clone())).unwrap();
     assert_eq!(member, slack_key("U0HUMAN01"));
-    assert_eq!(text, "persona helper a <b> &amp; c");
+    assert_eq!(text, "persona helper a &lt;b&gt; &amp;amp; c");
+    assert_eq!(origin.decoded(&text), "persona helper a <b> &amp; c");
     let Origin::SlackSlash { conv, .. } = &origin else {
         panic!("{origin:?}");
     };
@@ -1086,7 +1084,8 @@ fn a_manager_dm_is_parsed_whole_or_after_a_prefix() {
     let (member, text, origin, files) = dm_command(&event, &identity()).unwrap();
     assert_eq!(files, [file]);
     assert_eq!(member, slack_key("U0HUMAN01"));
-    assert_eq!(text, "persona helper <b>");
+    assert_eq!(text, "persona helper &lt;b&gt;");
+    assert_eq!(origin.decoded(&text), "persona helper <b>");
     assert_eq!(
         format!("{origin:?}"),
         r#"SlackDm { channel: ConversationId("D0DM00001") }"#
@@ -1275,9 +1274,11 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         .ensure_member(&slack_key("U0HUMAN02"), "bob", start)
         .await
         .unwrap();
+    link(&old_key, bob).await;
     old_key
         .put_slack_config_token(bob, &TeamId::new(TEAM), &token("xoxe-1-BOB", 10), start)
         .await
+        .unwrap()
         .unwrap();
     old_key.close().await;
 
@@ -1287,9 +1288,11 @@ async fn a_token_that_fails_to_decrypt_does_not_hold_up_the_others() {
         .ensure_member(&slack_key("U0HUMAN01"), "alice", start)
         .await
         .unwrap();
+    link(&store, alice).await;
     store
         .put_slack_config_token(alice, &TeamId::new(TEAM), &token("xoxe-1-R0", 20), start)
         .await
+        .unwrap()
         .unwrap();
     mount_rotation(
         &h.slack,
@@ -1335,6 +1338,7 @@ async fn me_says_when_a_token_expired_because_renewing_it_keeps_failing() {
             OffsetDateTime::now_utc(),
         )
         .await
+        .unwrap()
         .unwrap();
     let reply = h.slash("U0HUMAN01", "me").await.remove(0);
     assert!(
@@ -1374,6 +1378,7 @@ async fn requests_from_another_workspace_are_dropped() {
                 OffsetDateTime::now_utc(),
             )
             .await
+            .unwrap()
             .unwrap();
     }
     let running = Running::start(&h);
@@ -1420,7 +1425,7 @@ async fn requests_from_another_workspace_are_dropped() {
 }
 
 /// A store in a new SQLite file, its URL, and the file's directory.
-async fn file_store() -> (Store, String, TempDir) {
+pub(super) async fn file_store() -> (Store, String, TempDir) {
     let dir = TempDir::new("agentd-slack");
     let url = dir.db_url();
     let store = Store::open(
@@ -1430,6 +1435,17 @@ async fn file_store() -> (Store, String, TempDir) {
     .await
     .unwrap();
     (store, url, dir)
+}
+
+/// Runs `statements` on the SQLite database at `url`.
+pub(super) async fn sql(url: &str, statements: &str) {
+    use sqlx::Connection as _;
+    let mut db = sqlx::SqliteConnection::connect(url).await.unwrap();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(statements.to_owned()))
+        .execute(&mut db)
+        .await
+        .unwrap();
+    db.close().await.unwrap();
 }
 
 const TOKEN_WRITE_FAILURES: &str = "\
@@ -1451,6 +1467,30 @@ const FAIL_TOKEN_DELETES: &str = "\
     WHEN (SELECT remaining FROM token_write_failures) > 0 BEGIN \
     UPDATE token_write_failures SET remaining = remaining - 1; \
     SELECT RAISE(FAIL, 'injected write failure'); END;";
+
+/// Makes every delete of a cloud routine fail, until [`NO_FORGETTING_OFF`].
+pub(super) const NO_FORGETTING: &str = "CREATE TRIGGER no_forgetting BEFORE DELETE ON \
+     cloud_routines BEGIN SELECT RAISE(FAIL, 'injected'); END;";
+/// Undoes [`NO_FORGETTING`].
+pub(super) const NO_FORGETTING_OFF: &str = "DROP TRIGGER no_forgetting;";
+
+/// Links `member`'s Claude account in `store`, as `login` does.
+pub(super) async fn link(store: &Store, member: MemberId) {
+    store
+        .put_claude_link(
+            member,
+            &NewClaudeLink {
+                access_token: SecretString::from("access"),
+                refresh_token: SecretString::from("refresh"),
+                expires_at: OffsetDateTime::now_utc() + time::Duration::hours(8),
+                plan: Some("claude_max".to_owned()),
+                rate_limit_tier: None,
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+}
 
 /// Makes the next `failures` writes of configuration tokens to the store
 /// at `url` fail: inserts, and updates that set the tokens.
@@ -1511,6 +1551,7 @@ async fn a_renewed_pair_is_stored_although_the_first_writes_fail() {
             start,
         )
         .await
+        .unwrap()
         .unwrap();
     mount_rotation(
         &h.slack,
@@ -1565,6 +1606,73 @@ async fn a_checked_pair_is_stored_although_the_first_write_fails() {
             "xoxe-1-NEW-SECRET-refresh".to_owned()
         ))
     );
+}
+
+/// Answers `tooling.tokens.rotate` with `answer` after deleting every
+/// Claude link in the store at `url`, as a `logout` elsewhere would while
+/// the rotation is out.
+struct UnlinkingFirst {
+    url: String,
+    answer: ResponseTemplate,
+}
+
+impl wiremock::Respond for UnlinkingFirst {
+    fn respond(&self, _: &Request) -> ResponseTemplate {
+        let url = self.url.clone();
+        std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(sql(&url, "DELETE FROM claude_links;"));
+        })
+        .join()
+        .unwrap();
+        self.answer.clone()
+    }
+}
+
+#[tokio::test]
+async fn a_checked_pair_whose_member_was_unlinked_meanwhile_is_not_kept() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    let exp = in_hours(12);
+    Mock::given(method("POST"))
+        .and(path("/api/tooling.tokens.rotate"))
+        .respond_with(UnlinkingFirst {
+            url: url.clone(),
+            answer: ok(json!({
+                "token": "xoxe.xoxp-1-NEW-SECRET-token",
+                "refresh_token": "xoxe-1-NEW-SECRET-refresh",
+                "team_id": TEAM,
+                "user_id": "U0HUMAN01",
+                "iat": exp - 43_200,
+                "exp": exp,
+            })),
+        })
+        .expect(1)
+        .mount(&h.slack)
+        .await;
+
+    let replies = h
+        .slash(
+            "U0HUMAN01",
+            &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        )
+        .await;
+    assert!(
+        replies[0].starts_with(
+            "Your Claude account was unlinked while I checked that token, so I didn't keep it, \
+             and checking it used up its refresh token."
+        ),
+        "{replies:?}"
+    );
+    assert!(
+        replies[0].contains("generate a new configuration token"),
+        "{replies:?}"
+    );
+    assert_eq!(h.stored(alice).await, None);
 }
 
 #[tokio::test]
@@ -1681,6 +1789,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
             commands::parse("skill add helper").unwrap(),
             &dm,
             &[file("F1", "SKILL.md", skill.len())],
+            "",
         )
         .await;
     assert_eq!(
@@ -1698,6 +1807,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
             commands::parse("skill add helper").unwrap(),
             &dm,
             &[too_big],
+            "",
         )
         .await;
     assert_eq!(reply, "That file is over the 256 KB limit.");
@@ -1708,6 +1818,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
             commands::parse("persona helper").unwrap(),
             &dm,
             &[file("F2", "persona.md", 15)],
+            "",
         )
         .await;
     assert!(reply.starts_with("Replaced `helper`'s persona."), "{reply}");
@@ -1724,6 +1835,7 @@ async fn files_in_the_manager_dm_feed_skill_add_and_persona() {
                 conv: slack_channel("C0CHAN001"),
             },
             &[file("F1", "SKILL.md", skill.len())],
+            "",
         )
         .await;
     assert!(
@@ -1842,6 +1954,7 @@ async fn slack_session_commands_link_threads_and_reset_the_slash_commands_channe
                 channel: "D0DM00001".into(),
             },
             &[],
+            "",
         )
         .await;
     assert_eq!(
@@ -2667,6 +2780,98 @@ async fn outside_commands_dms_and_clicks_never_run() {
 }
 
 #[tokio::test]
+async fn slack_command_text_is_decoded_once_before_it_is_parsed() {
+    let h = slack_harness().await;
+    let alice = h.linked("U0HUMAN01").await;
+    let team = TeamId::new(TEAM);
+    let store::AgentCreation::Created(agent, _) = h
+        .store
+        .create_agent(
+            &store::NewAgent {
+                owner: alice,
+                name: "helper",
+                persona: "p",
+                visibility: store::Visibility::Public,
+                surface: SurfaceKind::Slack,
+                team: &team,
+            },
+            10,
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("created");
+    };
+    let reply = h
+        .slash("U0HUMAN01", "persona helper a &lt;b&gt; &amp;amp; c")
+        .await;
+    assert!(
+        reply[0].starts_with("Replaced `helper`'s persona."),
+        "{reply:?}"
+    );
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "a <b> &amp; c");
+
+    let (intake, submitter) = CommandIntake::new(h.commands.clone());
+    let inbound = Sender::new(Inbound::new(h.store.clone(), Some(identity()), submitter));
+    let running = tokio::spawn(intake.run());
+    inbound
+        .send(SlackInbound::Message(
+            Box::new(dm_event(
+                "U0HUMAN01",
+                "persona helper x &lt;y&gt; &amp;amp; z",
+            )),
+            InFlight::untracked(),
+        ))
+        .await
+        .unwrap();
+    drop(inbound);
+    tokio::time::timeout(Duration::from_secs(10), running)
+        .await
+        .unwrap()
+        .unwrap();
+    let row = h.store.agent(agent.id).await.unwrap().unwrap();
+    assert_eq!(row.persona, "x <y> &amp; z");
+}
+
+#[tokio::test]
+async fn a_relink_notice_the_store_fails_on_leaves_the_others() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    let grace = h.linked("U0HUMAN02").await;
+    let now = OffsetDateTime::now_utc();
+    for (member, broken_at) in [(alice, now - time::Duration::minutes(1)), (grace, now)] {
+        let generation = h
+            .store
+            .get_claude_link(member)
+            .await
+            .unwrap()
+            .unwrap()
+            .generation;
+        h.store
+            .mark_claude_link_broken(member, generation, broken_at)
+            .await
+            .unwrap();
+    }
+    sql(
+        &url,
+        &format!(
+            "CREATE TRIGGER no_claim BEFORE UPDATE OF relink_attempts ON claude_links \
+             WHEN OLD.member_id = '{alice}' BEGIN SELECT RAISE(FAIL, 'injected'); END;"
+        ),
+    )
+    .await;
+    let notifier = RelinkNotifier::new(h.store.clone(), h.commands.replies().clone());
+    assert!(notifier.send_pending().await.is_err());
+    assert_eq!(h.posts().await.len(), 1, "grace was told");
+    sql(&url, "DROP TRIGGER no_claim;").await;
+    assert_eq!(notifier.send_pending().await.unwrap(), 1);
+    assert_eq!(h.posts().await.len(), 2, "alice was told after");
+}
+
+#[tokio::test]
 async fn a_departed_members_token_is_deleted_although_the_first_deletes_fail() {
     let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
@@ -2716,6 +2921,172 @@ async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() 
         "{logs}"
     );
     global_logs().snapshot().assert_lacks("SECRET");
+}
+
+/// Stores a routine for `member`, who must be linked.
+async fn with_routine(store: &Store, member: MemberId) {
+    let routine_id: core_types::RoutineId = "trig_01ABCdef".parse().unwrap();
+    let token =
+        core_types::RoutineToken::parse(SecretString::from("sk-ant-oat01-ROUTINE-SECRET")).unwrap();
+    let put = store
+        .put_cloud_routine(
+            &store::NewCloudRoutine {
+                member,
+                label: "agent-core",
+                routine_id: &routine_id,
+                url_origin: "https://api.anthropic.com",
+                token: &token,
+                added_by: &slack_key("U0HUMAN01"),
+            },
+            OffsetDateTime::now_utc(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(put, store::CloudRoutinePut::Added(_)), "{put:?}");
+}
+
+#[tokio::test]
+async fn a_logout_deletes_the_token_although_the_first_deletes_fail() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    fail_token_deletes(&url, 2).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(
+        reply.starts_with("Your Claude account is unlinked."),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert_eq!(failures_left(&url).await, 0);
+    assert_eq!(h.stored(alice).await, None);
+}
+
+#[tokio::test]
+async fn a_logout_whose_token_delete_keeps_failing_still_forgets_the_routines() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let logs = global_logs().tag();
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    with_routine(&h.store, alice).await;
+    fail_token_deletes(&url, 10).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(
+        reply.starts_with("Your Claude account is unlinked. I also forgot"),
+        "{reply}"
+    );
+    assert!(
+        !reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(
+        reply.contains("I can't revoke a routine's token: revoke each"),
+        "{reply}"
+    );
+    assert!(
+        reply.ends_with(
+            "Something went wrong on my side and I couldn't delete everything, so send `/agent \
+             logout` again in a minute, before you send `/agent login`."
+        ),
+        "{reply}"
+    );
+    assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
+    let logged = logs.snapshot();
+    assert!(
+        logged.contains("couldn't delete Slack configuration tokens at logout"),
+        "{logged}"
+    );
+    logged.assert_lacks("SECRET");
+    assert!(h.stored(alice).await.is_some());
+    assert!(
+        h.store.cloud_routines(alice).await.unwrap().is_empty(),
+        "the routines go although the token stays"
+    );
+
+    sql(&url, "UPDATE token_write_failures SET remaining = 0;").await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(reply.starts_with("No Claude account is linked."), "{reply}");
+    assert!(
+        reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert_eq!(h.stored(alice).await, None);
+}
+
+#[tokio::test]
+async fn a_logout_whose_token_and_routine_deletes_both_keep_failing_says_to_send_it_again() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    with_routine(&h.store, alice).await;
+    fail_token_deletes(&url, 10).await;
+    sql(&url, NO_FORGETTING).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert_eq!(
+        reply,
+        "Your Claude account is unlinked. Something went wrong on my side and I couldn't \
+         delete everything, so send `/agent logout` again in a minute, before you send \
+         `/agent login`."
+    );
+    assert!(h.store.get_claude_link(alice).await.unwrap().is_none());
+    assert!(h.stored(alice).await.is_some());
+    assert_eq!(h.store.cloud_routines(alice).await.unwrap().len(), 1);
+
+    sql(
+        &url,
+        &format!("UPDATE token_write_failures SET remaining = 0; {NO_FORGETTING_OFF}"),
+    )
+    .await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert!(reply.starts_with("No Claude account is linked."), "{reply}");
+    assert!(
+        reply.contains("I also deleted your Slack configuration token"),
+        "{reply}"
+    );
+    assert!(reply.contains("I also forgot your 1 routine."), "{reply}");
+    assert!(!reply.contains("Something went wrong"), "{reply}");
+    assert_eq!(h.stored(alice).await, None);
+    assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_logout_by_a_member_with_no_link_whose_delete_fails_says_to_send_it_again() {
+    let (store, url, _dir) = file_store().await;
+    let h = slack_harness_on(store).await;
+    let alice = h.linked("U0HUMAN01").await;
+    h.with_token(alice).await;
+    with_routine(&h.store, alice).await;
+    sql(&url, "DELETE FROM claude_links;").await;
+    fail_token_deletes(&url, 10).await;
+
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert_eq!(
+        reply,
+        "No Claude account is linked. I also forgot your 1 routine. I can't revoke a \
+         routine's token: revoke each with *Revoke* on the routine's API trigger at \
+         claude.ai/code/routines. Something went wrong on my side and I couldn't delete \
+         everything, so send `/agent logout` again in a minute, before you send `/agent login`."
+    );
+    assert!(h.stored(alice).await.is_some());
+    assert!(h.store.cloud_routines(alice).await.unwrap().is_empty());
+
+    sql(&url, "UPDATE token_write_failures SET remaining = 0;").await;
+    let reply = h.slash("U0HUMAN01", "logout").await.remove(0);
+    assert_eq!(
+        reply,
+        "No Claude account is linked. I also deleted your Slack configuration token, so I can \
+         no longer create or change apps as you."
+    );
+    assert_eq!(h.stored(alice).await, None);
 }
 
 /// Creates `count` public agents of `owner`'s, with names long enough that
