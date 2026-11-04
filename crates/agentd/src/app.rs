@@ -3,13 +3,20 @@
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use auth::Auth;
+use core_types::{Binding, BindingId, MemberKey, SurfaceKind, TeamId, UserId};
 use store::Store;
+use surface_rocketchat::rest::{Credentials, RestClient};
+use surface_rocketchat::{BotRoles, RocketChatSurface};
 
-use crate::config::Config;
+use crate::commands::rocketchat::{RocketChatDms, StoreDedup};
+use crate::commands::{Commands, ManagerBot, Replies};
+use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
 use crate::ctl::{Ctl, CtlSettings, NoSurfaces, SurfaceLookup};
 
-/// The shared state: the configuration, the store and the agentctl API, and
-/// later the surfaces, the runner and the credential proxy.
+/// The shared state: the configuration, the store, the agentctl API,
+/// account linking, command dispatch and the Rocket.Chat manager bot, and
+/// later the agents' surfaces, the runner and the credential proxy.
 ///
 /// Cloning is cheap: every clone shares the same state. Axum handlers take it
 /// as their state.
@@ -18,24 +25,63 @@ pub struct App {
     config: Arc<Config>,
     store: Store,
     ctl: Ctl,
+    auth: Arc<Auth>,
+    commands: Commands,
+    rocketchat: Option<RocketChatManager>,
+}
+
+/// The Rocket.Chat manager bot: its surface and the binding it listens as.
+#[derive(Debug, Clone)]
+pub struct RocketChatManager {
+    /// The surface, acting as the manager bot.
+    pub surface: Arc<RocketChatSurface>,
+    /// The binding its connection listens as. The manager bot has no
+    /// stored binding, so its id is new at every start.
+    pub binding: Binding,
+    /// Tells bots from people over the manager's client. Every Rocket.Chat
+    /// surface shares this one, so a sender is classified the same whichever
+    /// connection records a message.
+    pub bots: BotRoles,
 }
 
 impl App {
     /// An `App` over an already open `store`, with no surfaces for
     /// `agentctl history` yet.
-    pub fn new(config: Config, store: Store) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// If the HTTP clients for Claude or Rocket.Chat can't be built.
+    pub fn new(config: Config, store: Store) -> anyhow::Result<Self> {
         Self::with_surfaces(config, store, Arc::new(NoSurfaces))
     }
 
     /// An `App` over an already open `store`, whose agentctl API finds
     /// surfaces through `surfaces`.
-    pub fn with_surfaces(config: Config, store: Store, surfaces: Arc<dyn SurfaceLookup>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// If the HTTP clients for Claude or Rocket.Chat can't be built.
+    pub fn with_surfaces(
+        config: Config,
+        store: Store,
+        surfaces: Arc<dyn SurfaceLookup>,
+    ) -> anyhow::Result<Self> {
         let ctl = Ctl::new(store.clone(), CtlSettings::from_config(&config), surfaces);
-        Self {
+        let auth = Arc::new(
+            Auth::new(config.claude_oauth.clone(), store.clone())
+                .context("setting up Claude account linking")?,
+        );
+        let rocketchat = rocketchat_manager(&config, &store)?;
+        let replies = Replies::new(rocketchat.as_ref().map(|(_, bot)| Arc::clone(bot)));
+        let commands = Commands::new(store.clone(), Arc::clone(&auth), replies);
+        Ok(Self {
             config: Arc::new(config),
             store,
             ctl,
-        }
+            auth,
+            commands,
+            rocketchat: rocketchat.map(|(manager, _)| manager),
+        })
     }
 
     /// Opens the store at `store.url` with the master key, running pending
@@ -48,7 +94,7 @@ impl App {
     /// If the store can't be opened or migrated, or the purge fails.
     pub async fn open(config: Config) -> anyhow::Result<Self> {
         let store = open_store(&config).await?;
-        let app = Self::new(config, store);
+        let app = Self::new(config, store)?;
         let purged = app
             .ctl
             .purge()
@@ -76,6 +122,83 @@ impl App {
     pub fn ctl(&self) -> &Ctl {
         &self.ctl
     }
+
+    /// Claude account linking.
+    pub fn auth(&self) -> &Arc<Auth> {
+        &self.auth
+    }
+
+    /// Command dispatch.
+    pub fn commands(&self) -> &Commands {
+        &self.commands
+    }
+
+    /// The Rocket.Chat manager bot, if agentd serves Rocket.Chat.
+    pub fn rocketchat(&self) -> Option<&RocketChatManager> {
+        self.rocketchat.as_ref()
+    }
+}
+
+/// The Rocket.Chat manager bot from `[rocketchat]`, if the section is set:
+/// its surface, and the [`ManagerBot`] that sends private replies through it.
+fn rocketchat_manager(
+    config: &Config,
+    store: &Store,
+) -> anyhow::Result<Option<(RocketChatManager, Arc<ManagerBot>)>> {
+    let Some(settings) = &config.rocketchat else {
+        return Ok(None);
+    };
+    let token = config
+        .secrets
+        .rc_manager_token
+        .clone()
+        .with_context(|| format!("{RC_MANAGER_TOKEN_VAR} is required with [rocketchat]"))?;
+    let identity = MemberKey {
+        surface: SurfaceKind::RocketChat,
+        team: TeamId::new(settings.team.as_str()),
+        user: UserId::new(settings.manager_user_id.as_str()),
+    };
+    let credentials = Credentials {
+        user_id: identity.user.clone(),
+        token,
+    };
+    let rest =
+        RestClient::new(&settings.base_url, credentials.clone()).context("rocketchat.base_url")?;
+    let mut surface_config = surface_rocketchat::RocketChatConfig::new(
+        settings.base_url.as_str(),
+        identity.team.clone(),
+        credentials,
+    );
+    surface_config
+        .websocket_url
+        .clone_from(&settings.websocket_url);
+    let bots = BotRoles::new(rest.clone());
+    let surface = Arc::new(
+        RocketChatSurface::new(
+            surface_config,
+            Arc::new(StoreDedup(store.clone())),
+            bots.clone(),
+        )
+        .context("setting up the Rocket.Chat manager bot")?,
+    );
+    let binding = Binding {
+        id: BindingId::new_v4(),
+        agent: None,
+        bot: identity.clone(),
+    };
+    let bot = Arc::new(ManagerBot::new(
+        identity,
+        surface.clone(),
+        Arc::new(RocketChatDms(rest)),
+    ));
+    Ok(Some((
+        RocketChatManager {
+            surface,
+            binding,
+            bots,
+        },
+        bot,
+    )))
 }
 
 /// Opens the store `config` names, with its master key.

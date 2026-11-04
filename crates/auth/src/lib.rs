@@ -447,6 +447,28 @@ impl Auth {
         Ok(Linked { plan })
     }
 
+    /// Drops the pending login that the pasted text (as for
+    /// [`complete_login`](Self::complete_login)) names by its `state`,
+    /// whichever member it belongs to, without using the code. For a code
+    /// posted where others can read it: whoever read it can't finish that
+    /// login either. Returns whether there was such a login; text that
+    /// doesn't parse names none.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the store fails.
+    pub async fn cancel_pasted_login(&self, pasted: &SecretString) -> Result<bool, AuthError> {
+        let Ok(pasted) = pkce::parse_pasted(pasted) else {
+            return Ok(false);
+        };
+        Ok(self
+            .inner
+            .store
+            .take_pending_login(&pasted.state)
+            .await?
+            .is_some())
+    }
+
     /// Reads the plan from the profile, with `access_token` as the Bearer
     /// token.
     ///

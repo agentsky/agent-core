@@ -255,6 +255,13 @@ impl FakeRest {
         }
     }
 
+    /// Removes a member from a room, the manager included.
+    pub fn remove_member(&self, room: &str, user_id: &str) {
+        if let Some(room) = self.state().rooms.get_mut(room) {
+            room.members.remove(user_id);
+        }
+    }
+
     /// Stores a message as if `user_id` had posted it, and returns its id.
     pub fn seed_message(
         &self,
