@@ -5,6 +5,14 @@
 //! value of any field whose whole name is in [`REDACTED_FIELDS`] is written
 //! as [`REDACTED`], in events and in spans, in both formats. Only whole names
 //! match, so fields such as `scope_key` or `token_count` are still logged.
+//!
+//! Some libraries log what they send at debug level, and records from the
+//! `log` crate reach the subscriber too. bollard's hold every Docker request
+//! body, including the environment of an `exec`, which carries a session's
+//! placeholder and agentctl token. So every subscriber built here also caps
+//! the targets in [`CAPPED_TARGETS`], whatever `server.log_filter` says:
+//! the cap is a separate filter, not a directive the operator's own could
+//! outrank.
 
 use std::fmt::{self, Write as _};
 use std::io::IsTerminal;
@@ -17,6 +25,7 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Subscriber};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::RecordFields;
+use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, FormattedFields, MakeWriter};
 use tracing_subscriber::layer::SubscriberExt as _;
@@ -37,6 +46,11 @@ pub const REDACTED_FIELDS: [&str; 11] = [
     "verifier",
     "password",
 ];
+
+/// Targets logged at most at the given level, whatever the filter says,
+/// because their debug output holds secrets. `bollard` logs every Docker
+/// request body at debug level, `exec` environments included.
+pub const CAPPED_TARGETS: [(&str, LevelFilter); 1] = [("bollard", LevelFilter::INFO)];
 
 /// What a redacted field's value is replaced with.
 pub const REDACTED: &str = "[redacted]";
@@ -79,7 +93,8 @@ impl LogFormat {
 
 /// Installs the global subscriber, writing to standard error in the
 /// [detected](LogFormat::detect) format, filtered by `filter`
-/// (`server.log_filter`). Records from the `log` crate are forwarded to it.
+/// (`server.log_filter`), with [`CAPPED_TARGETS`] capped. Records from the
+/// `log` crate are forwarded to it.
 ///
 /// # Errors
 ///
@@ -91,7 +106,8 @@ pub fn init(filter: &str) -> anyhow::Result<()> {
         .context("installing the log subscriber")
 }
 
-/// A subscriber writing `format` lines to `writer`, with redaction.
+/// A subscriber writing `format` lines to `writer`, with redaction, filtered
+/// by `filter` and then by the cap on [`CAPPED_TARGETS`].
 pub fn subscriber<W>(
     format: LogFormat,
     filter: EnvFilter,
@@ -100,7 +116,10 @@ pub fn subscriber<W>(
 where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    let registry = tracing_subscriber::registry().with(filter);
+    let cap = Targets::new()
+        .with_default(LevelFilter::TRACE)
+        .with_targets(CAPPED_TARGETS);
+    let registry = tracing_subscriber::registry().with(filter).with(cap);
     match format {
         LogFormat::Human { ansi } => Box::new(
             registry.with(
@@ -489,6 +508,44 @@ pub(crate) mod tests {
         });
         let out = captured.text();
         assert!(!out.contains("hidden") && out.contains("shown"), "{out}");
+    }
+
+    #[test]
+    fn bollard_debug_records_are_dropped_whatever_the_filter() {
+        let _ = tracing_log::LogTracer::init();
+        let filters = [
+            "trace",
+            "debug",
+            "bollard=trace",
+            "bollard::docker=trace",
+            "[turn]=trace",
+            "info,bollard[turn]=trace",
+        ];
+        let formats = [LogFormat::Human { ansi: false }, LogFormat::Json];
+        for filter in filters {
+            for format in formats {
+                let captured = Captured::default();
+                let subscriber = subscriber(format, EnvFilter::new(filter), captured.clone());
+                tracing::subscriber::with_default(subscriber, || {
+                    let span = tracing::info_span!("turn");
+                    let _entered = span.enter();
+                    log::debug!(
+                        target: "bollard::docker",
+                        "{{\"Env\":[\"AGENTCTL_TOKEN=agentctl-secret\"]}}"
+                    );
+                    log::trace!(target: "bollard::docker", "request: agentctl-secret");
+                    tracing::debug!(target: "bollard::docker", "agentctl-secret");
+                    log::info!(target: "bollard::docker", "bollard-info");
+                    log::debug!(target: "sandbox::probe", "other-debug");
+                });
+                let out = captured.text();
+                assert!(!out.contains("agentctl-secret"), "{filter}: {out}");
+                assert!(out.contains("bollard-info"), "{filter}: {out}");
+                if matches!(filter, "trace" | "debug" | "[turn]=trace") {
+                    assert!(out.contains("other-debug"), "{filter}: {out}");
+                }
+            }
+        }
     }
 
     #[test]
