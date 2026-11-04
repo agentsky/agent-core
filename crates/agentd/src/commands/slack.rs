@@ -36,6 +36,7 @@ pub fn slash_command(command: SlashCommand) -> Option<(MemberKey, String, Origin
     let text = unescape(&command.text);
     let origin = Origin::SlackSlash {
         response_url: command.response_url,
+        conv: command.conv,
     };
     Some((command.sender, text, origin))
 }
