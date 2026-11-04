@@ -56,7 +56,8 @@ pub const MESSAGE_GROUP: &str = include_str!("../fixtures/slack/message_group.js
 /// no subtype, with `bot_id`, `bot_profile` and its bot user in `user`, and
 /// the mention in a `mrkdwn` section block too.
 pub const MESSAGE_BOT: &str = include_str!("../fixtures/slack/message_bot.json");
-/// A bot's thread reply with `bot_id` and `bot_profile` but no `user`.
+/// A bot's thread reply with `bot_id` and `bot_profile` but no `user`,
+/// mentioning [`BOT_USER`] in its text.
 pub const MESSAGE_BOT_WITHOUT_USER: &str =
     include_str!("../fixtures/slack/message_bot_without_user.json");
 /// A DM with a file: subtype `file_share` and one entry in `files`.

@@ -7,7 +7,8 @@
 //!   message (see [`Skip::Update`]).
 //! - `event_id` is the message `_id`, and so is the message id.
 //! - `mentions` are `mentions[]._id`, without the `all` and `here`
-//!   broadcasts, which name no user.
+//!   broadcasts, which name no user, and only the first
+//!   [`MAX_MENTIONS`] of them.
 //! - `tmid` becomes both `thread_root` and `reply_to`: the router decides
 //!   whether the thread root is the agent's own message.
 //! - A room of type `d` is a `Dm`, or a `GroupDm` with more than two
@@ -18,8 +19,8 @@
 //!   every message and only the first to record it delivers it.
 
 use core_types::{
-    BindingId, ConvKind, ConvRef, InFile, InboundEvent, MemberKey, MsgRef, SurfaceKind, TeamId,
-    UserId,
+    BindingId, ConvKind, ConvRef, InFile, InboundEvent, MAX_MENTIONS, MemberKey, MsgRef,
+    SurfaceKind, TeamId, UserId,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -132,6 +133,9 @@ pub(crate) fn to_event(message: &Message, ctx: &Context<'_>) -> InboundEvent {
     };
     let mut mentions: Vec<UserId> = Vec::with_capacity(message.mentions.len());
     for mention in &message.mentions {
+        if mentions.len() == MAX_MENTIONS {
+            break;
+        }
         if !BROADCASTS.contains(&mention.as_str()) && !mentions.contains(mention) {
             mentions.push(mention.clone());
         }

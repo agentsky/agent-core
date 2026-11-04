@@ -5,17 +5,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use core_types::{
-    Binding, BindingId, ConvRef, Cursor, InboundEvent, LengthUnit, MemberKey, MsgRef, OutFile,
-    ReplyTarget, SendError, Sender, Sink, Surface, SurfaceError, SurfaceKind, ThreadKey, UserId,
+    Binding, BindingId, ConvKind, ConvRef, Cursor, InboundEvent, LengthUnit, MemberKey, MsgRef,
+    OutFile, ReplyTarget, SendError, Sender, Sink, Surface, SurfaceError, SurfaceKind, ThreadKey,
+    UserId,
 };
 use secrecy::SecretString;
 use serde_json::{Value, json};
-use surface_slack::normalize::{self, Context};
+use surface_slack::normalize::{self, Context, MAX_ID_TAIL};
 use surface_slack::surface::CAPS;
 use surface_slack::{SlackClient, SlackSurface, TeamDirectory};
 use testkit::slack::{BOT_USER, CHANNEL, TEAM, USER};
 use testkit::{Held, TempDir};
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
 const TOKEN: &str = "xoxb-surface-test";
@@ -142,6 +143,34 @@ async fn render_refreshes_a_stale_member_cache_in_the_background() {
         }
     }
     assert_eq!(rendered, [format!("<@{USER}>")]);
+}
+
+#[tokio::test]
+async fn the_member_list_is_read_with_the_members_api_token_only() {
+    let (server, agent) = setup().await;
+    let client = SlackClient::new(&format!("{}/api/", server.uri())).unwrap();
+    let agent = agent.with_members_api(client.bot(SecretString::from("xoxb-manager")));
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .and(header("authorization", "Bearer xoxb-manager"))
+        .respond_with(ok(
+            json!({"members": [{"id": USER, "name": "ada", "profile": {"display_name": "Ada"}}]}),
+        ))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/users.list"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"ok": false, "error": "token_revoked"})),
+        )
+        .mount(&server)
+        .await;
+    let members = agent.refresh_members().await.unwrap();
+    assert_eq!(members.lookup("ada"), Some(&UserId::from(USER)));
+    let seen = requests(&server).await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].headers["authorization"], "Bearer xoxb-manager");
 }
 
 #[test]
@@ -869,4 +898,424 @@ async fn fill_bot_sender_leaves_humans_known_bots_and_other_teams_alone() {
         assert_eq!(event, before);
     }
     assert!(requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_bot_lookup_past_the_quota_fails_at_once_without_a_call() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0MADEUP", "user_id": "U0MADEUP"}})),
+    )
+    .await;
+    for n in 0..50 {
+        let mut event = bot_event();
+        event.sender.user = format!("B0MADEUP{n}").into();
+        surface.fill_bot_sender(&mut event).await.unwrap();
+    }
+    let mut event = bot_event();
+    let before = event.clone();
+    let started = std::time::Instant::now();
+    let err = surface.fill_bot_sender(&mut event).await.unwrap_err();
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(matches!(err, SurfaceError::RateLimited { .. }), "{err:?}");
+    assert_eq!(event, before, "the message goes on from an unmanaged bot");
+    assert_eq!(lookups(&server, "bots.info").await.len(), 50);
+}
+
+/// `event`, as if it arrived a second after it was posted.
+fn arrived_now(mut event: InboundEvent) -> InboundEvent {
+    let (seconds, _) = event.message.id.as_str().split_once('.').unwrap();
+    let posted = time::OffsetDateTime::from_unix_timestamp(seconds.parse().unwrap()).unwrap();
+    event.received_at = posted + Duration::from_secs(1);
+    event
+}
+
+fn event_from(fixture: &str) -> InboundEvent {
+    let envelope: Value = serde_json::from_str(fixture).unwrap();
+    let bot = UserId::from(BOT_USER);
+    let team = TEAM.into();
+    let context = Context {
+        binding: BindingId::new_v4(),
+        bot_user: Some(&bot),
+        team: &team,
+        event_id: "Ev0CONFIRM",
+        received_at: time::OffsetDateTime::now_utc(),
+    };
+    arrived_now(normalize::message(&context, &envelope["event"]).unwrap())
+}
+
+async fn confirming_setup(kind: Value) -> (MockServer, SlackSurface) {
+    let (server, surface) = setup().await;
+    let mut channel = kind;
+    channel["id"] = json!(CHANNEL);
+    mount(
+        &server,
+        "conversations.info",
+        ok(json!({"channel": channel})),
+    )
+    .await;
+    (server, surface.with_bot_user(Some(BOT_USER.into())))
+}
+
+fn public_channel() -> Value {
+    json!({"is_channel": true, "is_member": true})
+}
+
+async fn lookups(server: &MockServer, name: &str) -> Vec<Request> {
+    requests(server)
+        .await
+        .into_iter()
+        .filter(|request| request.url.path() == format!("/api/{name}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_top_level_message_is_confirmed_as_slack_has_it() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str().to_owned();
+    let mention = format!("<@{BOT_USER}> hi");
+    let cases = [
+        (
+            json!([{"ts": ts, "user": USER, "text": event.text}]),
+            Some((USER, event.text.as_str())),
+        ),
+        (
+            json!([{"ts": ts, "user": "U0HUMAN02", "text": mention}]),
+            Some(("U0HUMAN02", mention.as_str())),
+        ),
+        (
+            json!([{"ts": ts, "user": USER, "text": "no mention"}]),
+            None,
+        ),
+        (
+            json!([{"ts": "1727697500.000100", "user": USER, "text": event.text}]),
+            None,
+        ),
+        (
+            json!([{"ts": ts, "user": USER, "text": event.text, "subtype": "channel_join"}]),
+            None,
+        ),
+        (
+            json!([{"ts": ts, "subtype": "tombstone", "text": "This message was deleted."}]),
+            None,
+        ),
+        (json!([]), None),
+    ];
+    for (messages, expected) in cases {
+        let (server, surface) = confirming_setup(public_channel()).await;
+        mount(
+            &server,
+            "conversations.history",
+            ok(json!({"messages": messages})),
+        )
+        .await;
+        let copy = surface.confirm(&event).await.unwrap();
+        match expected {
+            Some((user, text)) => {
+                let copy = copy.unwrap();
+                assert_eq!(copy.sender.user.as_str(), user, "{messages}");
+                assert_eq!(copy.text, text);
+                assert_eq!(copy.message, event.message);
+                assert_eq!(copy.event_id, event.event_id);
+                assert_eq!(copy.binding, event.binding);
+                assert_eq!(copy.received_at, event.received_at);
+            }
+            None => assert_eq!(copy, None, "{messages}"),
+        }
+        let sent = lookups(&server, "conversations.history").await;
+        assert_eq!(sent.len(), 1);
+        let form = form(&sent[0]);
+        assert_eq!(form["channel"], CHANNEL);
+        assert_eq!(form["oldest"], ts);
+        assert_eq!(form["latest"], ts);
+        assert_eq!(form["inclusive"], "true");
+        assert!(!form.contains_key("ts"));
+    }
+}
+
+#[tokio::test]
+async fn nothing_but_slacks_copy_decides_what_the_event_is() {
+    let mut forged = event_from(testkit::slack::MESSAGE_MENTION);
+    forged.conv_kind = ConvKind::Dm;
+    forged.files = vec![];
+    let (server, surface) = confirming_setup(public_channel()).await;
+    let ts = forged.message.id.as_str();
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{
+            "ts": ts,
+            "user": USER,
+            "text": format!("<@{BOT_USER}> see attached"),
+            "subtype": "file_share",
+            "files": [{"id": "F1", "name": "a.txt", "url_private": "https://files.slack.com/F1"}],
+            "channel_type": "im",
+        }]})),
+    )
+    .await;
+    let copy = surface.confirm(&forged).await.unwrap().unwrap();
+    assert_eq!(copy.conv_kind, ConvKind::Channel);
+    assert_eq!(copy.mentions, [UserId::from(BOT_USER)]);
+    assert_eq!(copy.files.len(), 1);
+    assert_eq!(copy.files[0].id, "F1");
+    assert_eq!(copy.text, format!("<@{BOT_USER}> see attached"));
+}
+
+#[tokio::test]
+async fn blocks_count_only_as_slack_has_them() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let ts = event.message.id.as_str();
+    let blocks = json!([{"type": "rich_text", "elements": [
+        {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT_USER}]},
+    ]}]);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "hi", "blocks": blocks}]})),
+    )
+    .await;
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert_eq!(copy.mentions, [UserId::from(BOT_USER)]);
+
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "hi"}]})),
+    )
+    .await;
+    assert_eq!(
+        surface.confirm(&event).await,
+        Ok(None),
+        "the event's blocks don't count"
+    );
+}
+
+#[tokio::test]
+async fn the_conversation_kind_comes_from_conversations_info_once_an_hour() {
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    event.conv_kind = ConvKind::Channel;
+    let ts = event.message.id.as_str();
+    let (server, surface) = confirming_setup(json!({"is_im": true, "user": USER})).await;
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": "no mention"}]})),
+    )
+    .await;
+    for _ in 0..2 {
+        let copy = surface.confirm(&event).await.unwrap().unwrap();
+        assert_eq!(copy.conv_kind, ConvKind::Dm);
+    }
+    assert_eq!(lookups(&server, "conversations.info").await.len(), 1);
+
+    let (server, surface) = confirming_setup(json!({"is_mpim": true, "is_group": true})).await;
+    let mention = format!("<@{BOT_USER}> in a group DM");
+    mount(
+        &server,
+        "conversations.history",
+        ok(json!({"messages": [{"ts": ts, "user": USER, "text": mention}]})),
+    )
+    .await;
+    assert_eq!(
+        surface.confirm(&event).await.unwrap().unwrap().conv_kind,
+        ConvKind::GroupDm
+    );
+    let form = form(&lookups(&server, "conversations.info").await[0]);
+    assert_eq!(form["channel"], CHANNEL);
+}
+
+#[tokio::test]
+async fn a_message_older_than_the_window_is_not_read_back() {
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    event.received_at += surface_slack::surface::CONFIRM_WINDOW + Duration::from_secs(1);
+    assert_eq!(surface.confirm(&event).await, Ok(None));
+    event.message.id = "not a ts".into();
+    assert_eq!(surface.confirm(&event).await, Ok(None));
+    assert!(requests(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_thread_reply_is_confirmed_only_under_a_root_the_bot_may_have_posted() {
+    let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
+    let root = event.thread_root.clone().unwrap();
+    for (parent, confirmed) in [
+        (json!(BOT_USER), true),
+        (Value::Null, true),
+        (json!("not a user"), true),
+        (json!(USER), false),
+    ] {
+        let (server, surface) = confirming_setup(public_channel()).await;
+        mount(
+            &server,
+            "conversations.replies",
+            ok(json!({"messages": [{
+                "ts": event.message.id.as_str(),
+                "user": USER,
+                "text": event.text,
+                "thread_ts": root.as_str(),
+                "parent_user_id": parent,
+            }]})),
+        )
+        .await;
+        let copy = surface.confirm(&event).await.unwrap();
+        assert_eq!(copy.is_some(), confirmed, "{parent}");
+    }
+}
+
+#[tokio::test]
+async fn a_thread_reply_is_read_back_in_the_thread_the_event_names() {
+    let event = event_from(testkit::slack::MESSAGE_THREAD_REPLY);
+    let root = event.thread_root.clone().unwrap();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.replies",
+        ok(json!({"messages": [
+            {"ts": root.as_str(), "user": BOT_USER, "text": "the root", "thread_ts": root.as_str()},
+            {"ts": event.message.id.as_str(), "user": USER, "text": event.text, "thread_ts": "1727697600.000001"},
+        ]})),
+    )
+    .await;
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert_eq!(copy.thread_root, Some("1727697600.000001".into()));
+    assert_eq!(copy.reply_to.unwrap().id.as_str(), "1727697600.000001");
+    let form = form(&lookups(&server, "conversations.replies").await[0]);
+    assert_eq!(form["ts"], root.as_str());
+    assert_eq!(form["oldest"], event.message.id.as_str());
+}
+
+#[tokio::test]
+async fn a_bot_known_by_its_bot_id_is_named_by_its_user_and_an_edited_bot_post_is_refused() {
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0LEGACY1", "user_id": "U0DEPLOY1"}})),
+    )
+    .await;
+    let event = arrived_now(bot_event());
+    let ts = event.message.id.as_str();
+    let root = event.thread_root.clone().unwrap();
+    let post =
+        json!({"ts": ts, "bot_id": "B0LEGACY1", "text": event.text, "thread_ts": root.as_str()});
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.replies"))
+        .respond_with(ok(json!({"messages": [post]})))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let copy = surface.confirm(&event).await.unwrap().unwrap();
+    assert_eq!(copy.sender.user.as_str(), "U0DEPLOY1");
+    assert_eq!(copy.sender_bot_user, Some("U0DEPLOY1".into()));
+    assert!(copy.sender_is_bot);
+
+    let mut edited = post;
+    edited["edited"] = json!({"user": "U0DEPLOY1", "ts": "1727698400.000000"});
+    mount(
+        &server,
+        "conversations.replies",
+        ok(json!({"messages": [edited]})),
+    )
+    .await;
+    assert_eq!(surface.confirm(&event).await, Ok(None));
+}
+
+#[tokio::test]
+async fn a_message_that_cannot_be_read_back_is_an_error() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ResponseTemplate::new(200)
+            .set_body_json(json!({"ok": false, "error": "channel_not_found"})),
+    )
+    .await;
+    assert_eq!(
+        surface.confirm(&event).await,
+        Err(SurfaceError::NotFound("channel_not_found".into()))
+    );
+    let mut elsewhere = event.clone();
+    elsewhere.conv.team = "T0OTHER01".into();
+    assert!(matches!(
+        surface.confirm(&elsewhere).await,
+        Err(SurfaceError::Api(_))
+    ));
+
+    let (server, surface) = setup().await;
+    mount(&server, "conversations.info", ResponseTemplate::new(503)).await;
+    assert!(matches!(
+        surface.confirm(&event).await,
+        Err(SurfaceError::Transport(_))
+    ));
+    assert!(lookups(&server, "conversations.history").await.is_empty());
+}
+
+#[tokio::test]
+async fn confirming_never_waits_out_a_rate_limit() {
+    let event = event_from(testkit::slack::MESSAGE_MENTION);
+    let (server, surface) = confirming_setup(public_channel()).await;
+    mount(
+        &server,
+        "conversations.history",
+        ResponseTemplate::new(429).insert_header("retry-after", "30"),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    for _ in 0..2 {
+        assert!(matches!(
+            surface.confirm(&event).await,
+            Err(SurfaceError::RateLimited { .. })
+        ));
+    }
+    assert!(started.elapsed() < Duration::from_secs(5));
+    assert_eq!(
+        lookups(&server, "conversations.history").await.len(),
+        1,
+        "not retried, and the next lookup isn't sent while the 429 holds"
+    );
+}
+
+#[tokio::test]
+async fn a_channel_id_slack_spells_otherwise_is_refused() {
+    let mut event = event_from(testkit::slack::MESSAGE_MENTION);
+    let lower = CHANNEL.to_lowercase();
+    event.conv.conversation = lower.as_str().into();
+    event.message.conv.conversation = lower.as_str().into();
+    let (server, surface) = confirming_setup(public_channel()).await;
+    assert!(matches!(
+        surface.confirm(&event).await,
+        Err(SurfaceError::NotFound(_))
+    ));
+    assert!(lookups(&server, "conversations.history").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_bot_id_not_shaped_like_slacks_is_never_looked_up() {
+    let (server, surface) = setup().await;
+    mount(
+        &server,
+        "bots.info",
+        ok(json!({"bot": {"id": "B0MADEUP", "user_id": "U0MADEUP"}})),
+    )
+    .await;
+    for bot_id in [
+        format!("B{}", "A".repeat(900_000)),
+        format!("B{}", "A".repeat(MAX_ID_TAIL + 1)),
+        "B".to_owned(),
+        "b0lower".to_owned(),
+        "U0HUMAN01".to_owned(),
+    ] {
+        let mut event = bot_event();
+        event.sender.user = bot_id.as_str().into();
+        let before = event.clone();
+        surface.fill_bot_sender(&mut event).await.unwrap();
+        assert_eq!(event, before);
+    }
+    assert!(lookups(&server, "bots.info").await.is_empty());
 }
