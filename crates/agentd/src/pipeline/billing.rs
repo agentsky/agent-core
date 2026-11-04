@@ -9,6 +9,11 @@
 //! about it, is told in a direct message from the manager bot, at most
 //! once per [`FAILURE_DM_INTERVAL`] for each kind of failure. The agent's
 //! owner is never told, unless they are the requester.
+//!
+//! The exception is a private task, which always runs on the owner's own
+//! account: its thread is told it was the owner's
+//! ([`PRIVATE_USAGE_LIMIT_TEXT`], [`PRIVATE_LOGIN_TEXT`]), and nobody is
+//! told privately.
 
 use std::time::Duration;
 
@@ -41,6 +46,15 @@ pub const COMMUNITY_KEY_REFUSED_TEXT: &str = "Sorry, I can't answer that: the co
      admin can set a working one; meanwhile, link your own account with `/agent login` \
      (`!agent login` on Rocket.Chat).";
 
+/// What the thread is told when a private task couldn't run because the
+/// agent owner's Claude account, which it runs on, reached its usage limit.
+pub const PRIVATE_USAGE_LIMIT_TEXT: &str = "Sorry, the private task couldn't run: the Claude \
+     account of the agent's owner, which private tasks run on, has reached its usage limit.";
+/// What the thread is told when a private task couldn't run because the
+/// agent owner's Claude login expired, was refused, or isn't linked.
+pub const PRIVATE_LOGIN_TEXT: &str = "Sorry, the private task couldn't run: the Claude login \
+     of the agent's owner, which private tasks run on, has expired or isn't linked.";
+
 /// A turn failure the credential it ran on caused, as the runner
 /// classified it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +85,15 @@ impl CredentialFailure {
             (Self::Refused, CredentialRef::Member(_)) => LOGIN_EXPIRED_TEXT,
             (Self::UsageLimit, CredentialRef::Community) => COMMUNITY_USAGE_LIMIT_TEXT,
             (Self::Refused, CredentialRef::Community) => COMMUNITY_KEY_REFUSED_TEXT,
+        }
+    }
+
+    /// What the thread is told about a private task that failed on the
+    /// agent owner's account, which private tasks always run on.
+    pub(super) fn private_task_text(self) -> &'static str {
+        match self {
+            Self::UsageLimit => PRIVATE_USAGE_LIMIT_TEXT,
+            Self::Refused => PRIVATE_LOGIN_TEXT,
         }
     }
 
@@ -173,6 +196,21 @@ mod tests {
                 assert!(!text.contains("owner"), "{text}");
                 assert!(!text.contains("no Claude account linked"), "{text}");
             }
+        }
+    }
+
+    #[test]
+    fn a_private_tasks_texts_name_the_owners_account() {
+        assert_eq!(
+            CredentialFailure::UsageLimit.private_task_text(),
+            PRIVATE_USAGE_LIMIT_TEXT
+        );
+        assert_eq!(
+            CredentialFailure::Refused.private_task_text(),
+            PRIVATE_LOGIN_TEXT
+        );
+        for text in [PRIVATE_USAGE_LIMIT_TEXT, PRIVATE_LOGIN_TEXT] {
+            assert!(text.contains("of the agent's owner"), "{text}");
         }
     }
 

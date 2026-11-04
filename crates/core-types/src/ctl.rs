@@ -220,8 +220,10 @@ impl CtlRequest for AskAgentRequest {
 pub struct PrivateRequest {
     /// The task text, shown to the owner exactly as given.
     pub task: String,
-    /// Files in the calling session's directory, as the CLI sees their
-    /// paths, to copy into the private task.
+    /// Files to copy into the private task's working directory, as paths
+    /// relative to the calling session's directory (`sessions/<id>/`), such
+    /// as `work/report.csv`. agentctl turns the paths it is given into
+    /// these.
     pub files: Vec<String>,
 }
 

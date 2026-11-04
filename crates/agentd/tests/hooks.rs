@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentd::community::StoreCommunityKey;
+use agentd::consents::ConsentSettings;
 use agentd::ctl::{Ctl, CtlSettings, NoSurfaces};
 use agentd::pipeline::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks};
 use auth::{Auth, OAuthConfig, TokenSource};
@@ -75,6 +76,7 @@ async fn rig() -> Rig {
             staging_dir: dir.join("ctl-outbox"),
             attach_max_bytes: 1024,
             lease_ttl: Duration::from_secs(30),
+            consents: ConsentSettings::in_data_dir(dir.path()),
         },
         Arc::new(NoSurfaces),
     );

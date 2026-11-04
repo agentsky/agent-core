@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use core_types::{
     Ack, AskAgentRequest, AttachRequest, AttachResponse, CtlError, CtlErrorCode, CtlRequest,
     Cursor, HistoryRequest, HistoryResponse, LockRequest, LockResponse, MsgRef, OutFile,
-    PostRequest, PrivateRequest, ReactRequest, SurfaceError, TurnKind,
+    PostRequest, PrivateRequest, PrivateResponse, ReactRequest, SurfaceError, TurnKind,
 };
 use http_body_util::BodyExt as _;
 use serde::de::DeserializeOwned;
@@ -28,6 +28,7 @@ use super::outbox::{QueuedPost, QueuedReaction};
 use super::target;
 use super::token::{MAX_PRESENTED_LEN, hash_token};
 use super::{Ctl, MAX_POST_BYTES};
+use crate::consents::{RequestError, StageError};
 
 /// The largest JSON request body.
 pub const JSON_BODY_LIMIT: usize = 64 * 1024;
@@ -336,43 +337,55 @@ async fn stage(
     Ok(AttachResponse { name, size })
 }
 
-/// Checks an attachment's display name: a plain file name, never a path.
-fn attachment_name(name: &str) -> Result<String, ApiError> {
-    let ok = !name.is_empty()
+/// Whether `name` is a plain file name, never a path: at most 255 bytes,
+/// not only whitespace, not `.` or `..`, with no slash, backslash, control
+/// or invisible formatting character.
+pub(crate) fn is_plain_file_name(name: &str) -> bool {
+    !name.trim().is_empty()
         && name.len() <= MAX_NAME_LEN
         && name != "."
         && name != ".."
         && !name
             .chars()
-            .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c));
-    if ok {
+            .any(|c| c == '/' || c == '\\' || c.is_control() || is_invisible(c))
+}
+
+/// Checks an attachment's display name: a plain file name, never a path.
+fn attachment_name(name: &str) -> Result<String, ApiError> {
+    if is_plain_file_name(name) {
         Ok(name.to_owned())
     } else {
         Err(error(
             CtlErrorCode::BadRequest,
-            "the attachment name must be a plain file name of at most 255 bytes, with no \
-             control or invisible formatting characters",
+            "the attachment name must be a plain file name of at most 255 bytes, not only \
+             whitespace, with no control or invisible formatting characters",
         ))
     }
 }
 
-/// Whether `c` changes how a name displays without showing itself:
-/// bidirectional controls, which can make `exe.txt` read as `txt.exe`,
-/// zero-width and other invisible format characters, tag characters, and the
-/// line and paragraph separators.
+/// Whether `c` changes how text displays without showing itself:
+/// Unicode's default-ignorable code points
+/// ([`render::is_default_ignorable`]), among them bidirectional controls,
+/// which can make `exe.txt` read as `txt.exe`, zero-width characters,
+/// variation selectors and tag characters, and also the line and paragraph
+/// separators and the interlinear annotation characters.
 pub(crate) fn is_invisible(c: char) -> bool {
-    matches!(
-        c,
-        '\u{00AD}'
-            | '\u{061C}'
-            | '\u{180E}'
-            | '\u{200B}'..='\u{200F}'
-            | '\u{2028}'..='\u{202E}'
-            | '\u{2060}'..='\u{206F}'
-            | '\u{FEFF}'
-            | '\u{FFF9}'..='\u{FFFB}'
-            | '\u{E0000}'..='\u{E007F}'
-    )
+    render::is_default_ignorable(c)
+        || matches!(c, '\u{2028}' | '\u{2029}' | '\u{FFF9}'..='\u{FFFB}')
+}
+
+/// `text` without the characters that only choose how what is around them
+/// is drawn: the text and emoji presentation selectors (U+FE0E, U+FE0F),
+/// which emoji such as ⚠️ carry, and the zero-width non-joiner and joiner
+/// (U+200C, U+200D), which Persian and other joining scripts, and emoji
+/// sequences such as 👨‍💻, use. Without them the text reads the same, its
+/// emoji in their default form or as their parts, so a card can show
+/// exactly what the model reads while [`is_invisible`] refuses every other
+/// invisible character.
+pub(crate) fn without_joiners(text: &str) -> String {
+    text.chars()
+        .filter(|c| !matches!(c, '\u{FE0E}' | '\u{FE0F}' | '\u{200C}' | '\u{200D}'))
+        .collect()
 }
 
 /// `POST /v1/post`: queues a message after checking its target.
@@ -487,6 +500,7 @@ async fn history(
         .surfaces()
         .surface(caller.token.agent, &thread.conv)
         .await
+        .map_err(|err| internal("looking up the agent's surface", &err))?
         .ok_or_else(|| {
             error(
                 CtlErrorCode::NotAvailable,
@@ -611,12 +625,44 @@ async fn ask_agent(Caller(_): Caller) -> ApiError {
     )
 }
 
-/// `POST /v1/private`: not available until private tasks (T33).
-async fn private(Caller(_): Caller) -> ApiError {
-    error(
-        CtlErrorCode::NotAvailable,
-        "agentctl private is not available yet",
-    )
+/// `POST /v1/private`: records a consent for the task, with the files it
+/// names copied out of the caller's session directory, and returns its id
+/// at once. The task runs once the owner approves it, at once when the
+/// owner asked for it in their own DM with the agent. A turn may ask for
+/// [`MAX_PRIVATE_TASKS`].
+///
+/// [`MAX_PRIVATE_TASKS`]: super::MAX_PRIVATE_TASKS
+async fn private(
+    State(ctl): State<Ctl>,
+    Caller(caller): Caller,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<PrivateResponse>, ApiError> {
+    let request: PrivateRequest = json_body(body, "private")?;
+    ctl.reserve_private_task(&caller)?;
+    let requested = ctl
+        .consents()
+        .request(&caller.token, &caller.turn, request)
+        .await;
+    if requested.is_err() {
+        ctl.release_private_task(&caller);
+    }
+    let consent = requested.map_err(|err| match err {
+        RequestError::BadRequest(message) => error(CtlErrorCode::BadRequest, message),
+        RequestError::Stage(StageError::TooLarge(..)) => {
+            error(CtlErrorCode::TooLarge, err.to_string())
+        }
+        RequestError::Stage(StageError::NotFound(_)) => {
+            error(CtlErrorCode::NotFound, err.to_string())
+        }
+        RequestError::Stage(StageError::Io(ref io)) => internal("staging a file", io),
+        RequestError::Stage(_) => error(CtlErrorCode::BadRequest, err.to_string()),
+        RequestError::Inactive | RequestError::TooMany => {
+            error(CtlErrorCode::Refused, err.to_string())
+        }
+        RequestError::Store(ref store) => internal("recording a consent", store),
+        RequestError::Io(ref io) => internal("staging a consent's files", io),
+    })?;
+    Ok(Json(PrivateResponse { consent }))
 }
 
 #[cfg(test)]
@@ -651,6 +697,9 @@ mod tests {
         assert_eq!(attachment_name("résumé 1.txt").unwrap(), "résumé 1.txt");
         for bad in [
             "",
+            " ",
+            "   ",
+            "\u{3000}",
             ".",
             "..",
             "a/b",

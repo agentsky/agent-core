@@ -103,20 +103,26 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
 
     let rc = agent_on(&store, SurfaceKind::RocketChat, "chat.example", "rcbot").await;
     let here = conv(SurfaceKind::RocketChat, "chat.example");
-    let first = surfaces.surface(rc, &here).await.expect("a surface");
-    let again = surfaces.surface(rc, &here).await.unwrap();
+    let first = surfaces
+        .surface(rc, &here)
+        .await
+        .unwrap()
+        .expect("a surface");
+    let again = surfaces.surface(rc, &here).await.unwrap().unwrap();
     assert!(Arc::ptr_eq(&first, &again), "one surface per binding");
     assert!(first.caps().supports_threads);
     assert!(
         surfaces
             .surface(rc, &conv(SurfaceKind::RocketChat, "other.example"))
             .await
+            .unwrap()
             .is_none()
     );
     assert!(
         surfaces
             .surface(rc, &conv(SurfaceKind::Slack, "T1"))
             .await
+            .unwrap()
             .is_none(),
         "no binding on Slack"
     );
@@ -125,6 +131,7 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
     let slack_surface = surfaces
         .surface(slack_agent, &conv(SurfaceKind::Slack, "T1"))
         .await
+        .unwrap()
         .expect("a Slack surface");
     assert!(slack_surface.caps().per_binding_delivery);
     let other_team = agent_on(&store, SurfaceKind::Slack, "T2", "UOTHER").await;
@@ -132,6 +139,7 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
         surfaces
             .surface(other_team, &conv(SurfaceKind::Slack, "T2"))
             .await
+            .unwrap()
             .is_none(),
         "agentd serves the manager app's workspace only"
     );
@@ -142,7 +150,13 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
             .await
             .unwrap()
     );
-    assert!(surfaces.surface(rc, &here).await.is_none());
-    assert!(surfaces.surface(AgentId::new_v4(), &here).await.is_none());
+    assert!(surfaces.surface(rc, &here).await.unwrap().is_none());
+    assert!(
+        surfaces
+            .surface(AgentId::new_v4(), &here)
+            .await
+            .unwrap()
+            .is_none()
+    );
     assert!(format!("{surfaces:?}").contains("StoreSurfaces"));
 }

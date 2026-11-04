@@ -153,6 +153,24 @@ thread outside one-to-one DMs, whatever agents are in it:
 says so once per thread and window; when an agent refuses someone because
 they are banned or denied, the manager bot tells them privately, at most
 once a day.
+An agent that needs its owner's private resources asks with
+`agentctl private [--file <path>]... <task>`, which returns at once. The
+owner's request in their own one-to-one DM with the agent runs right away;
+anyone else's, and the owner's anywhere else (a channel or group DM, whose
+history others write into, or through another agent's message), waits for
+the owner to approve a consent card the manager bot sends them,
+with Approve and Decline buttons on Slack and `approve <id>` or
+`decline <id>` on Rocket.Chat, until `[limits] consent_ttl_secs` (default
+a day) passes. The task runs on the owner's account in a new session on the
+agent's private volume, with only the task text and the files named with
+`--file`, and with the owner's shared files read-only and no memory when
+someone else asked. Its reply and attached files, or the refusal or
+expiry, are posted in the thread that asked, and a mention in them starts
+no other agent's turn. Files wait in `consents/` under `store.data_dir`
+until then, at most one attachment's worth per task, and each agent may
+have only a few tasks waiting or running at once. A
+private task's sandbox shares the sandbox network with channel sandboxes,
+so it relies on the isolation described above.
 Community admins are the member identities `[community] admins` lists, as
 `<surface>:<team>:<user>`. An admin sets the community API key with
 `admin api-key set <key>` in the manager bot's direct message (or with
@@ -167,7 +185,9 @@ agents still answer others. Admins can't be banned.
 On SIGTERM or SIGINT agentd stops accepting connections and messages and
 gives running turns and in-flight requests `server.drain_timeout_secs` to
 finish; a turn still running then is dropped, and its thread told to ask
-again. A second signal drops them at once. Logs go to standard error,
+again. A private task's turn dropped that way is killed and billed first,
+which can take up to about half a minute. A second signal drops them at
+once. Logs go to standard error,
 human-readable on a terminal and one JSON object per line otherwise.
 
 ### Slack

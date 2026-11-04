@@ -27,7 +27,7 @@ use core_types::{
 use runner::{PoolConfig, ProcessConfig};
 use sandbox::ProcessSandbox;
 use secrecy::SecretString;
-use store::{AgentCreation, NewAgent, NewClaudeLink, Store, Visibility};
+use store::{AgentCreation, NewAgent, NewClaudeLink, Store, StoreError, Visibility};
 use testkit::{
     Call, FakeAnthropic, MockSurface, Op, TempDir, Turn, agentctl_path, fake_anthropic,
     fake_claude_path,
@@ -56,12 +56,16 @@ struct Mocks {
 
 #[async_trait::async_trait]
 impl SurfaceLookup for Mocks {
-    async fn surface(&self, agent: AgentId, _conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        Some(Arc::new(Held {
+    async fn surface(
+        &self,
+        agent: AgentId,
+        _conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        Ok(Some(Arc::new(Held {
             mock: self.mock.clone(),
             holds: self.holds.clone(),
             agent,
-        }))
+        })))
     }
 }
 
@@ -1097,6 +1101,7 @@ async fn failed_turns_say_why_and_a_hop_bills_the_requester_of_the_turn_that_men
                         key: key("bob"),
                     },
                     hop: core_types::Hop(1),
+                    consent: None,
                 },
                 OffsetDateTime::now_utc(),
             )
@@ -1460,6 +1465,7 @@ async fn a_hop_refused_for_its_requester_tells_no_one() {
                         key: key("bob"),
                     },
                     hop: core_types::Hop(1),
+                    consent: None,
                 },
                 OffsetDateTime::now_utc(),
             )
@@ -2445,6 +2451,7 @@ async fn only_an_attributed_post_of_the_bot_is_shown_as_from_outside_the_session
                     key: key("alice"),
                 },
                 hop: core_types::Hop::ZERO,
+                consent: None,
             },
             OffsetDateTime::now_utc(),
         )
