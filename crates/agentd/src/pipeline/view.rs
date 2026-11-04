@@ -16,29 +16,23 @@ use tokio::time::Instant;
 
 use crate::policy::{Limits, agent_policy};
 
-/// How long the attribution of a message an agent's bot sent is waited
-/// for: agentd records it just after posting, and the platform may deliver
-/// the message sooner.
-pub(crate) const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
-
 /// The first pause between two reads of an attribution; each next one is
 /// twice as long.
 const ATTRIBUTION_FIRST_PAUSE: Duration = Duration::from_millis(25);
 
-/// The row attributing `msg` to the agent agentd posted it as. When
-/// `wait`, the row is read again, with growing pauses, for up to
-/// [`ATTRIBUTION_WAIT`].
+/// The row attributing `msg` to the agent agentd posted it as, read again
+/// with growing pauses for up to `wait`.
 async fn attribution(
     store: &Store,
     msg: &MsgRef,
-    wait: bool,
+    wait: Duration,
 ) -> Result<Option<MessageRef>, StoreError> {
-    let deadline = Instant::now() + ATTRIBUTION_WAIT;
+    let deadline = Instant::now() + wait;
     let mut pause = ATTRIBUTION_FIRST_PAUSE;
     loop {
         let posted = store.posted_message_ref(msg).await?;
         let now = Instant::now();
-        if posted.is_some() || !wait || now >= deadline {
+        if posted.is_some() || now >= deadline {
             return Ok(posted);
         }
         tokio::time::sleep(pause.min(deadline - now)).await;
@@ -72,10 +66,13 @@ async fn attribution(
 /// The attribution is waited for only when the router reads it: another
 /// agent's bot sent the message, mentioning this agent. A post of an
 /// agent's bot that has none, such as a file a turn uploaded, holds no lane
-/// up otherwise. A private task's result or outcome, whose row names its
-/// consent, is given no attribution, so the router never takes a mention
-/// in it as a hop: private context doesn't flow to another agent's turn,
-/// and no hop chains on the owner's credential from it.
+/// up otherwise. Only a post whose row hands off (`hands_off`: a turn's
+/// post in the turn's own thread) is given its attribution, so the router
+/// takes a mention as a hop only there. A private task's result or
+/// outcome never hands off, so private context doesn't flow to another
+/// agent's turn and no hop chains on the owner's credential from it; nor
+/// does a post a turn made in another thread or conversation, so a hop
+/// never starts a thread of its own with a fresh budget.
 #[derive(Debug, Default)]
 pub(crate) struct StoreView {
     agent: Option<(AgentId, MemberId, AgentState)>,
@@ -105,6 +102,9 @@ pub(crate) struct ViewContext<'a> {
     pub(crate) limits: &'a Limits,
     /// Now, for today's and this hour's counts.
     pub(crate) now: OffsetDateTime,
+    /// How long the attribution of another agent's post is waited for
+    /// ([`PipelineSettings::attribution_wait`](super::PipelineSettings::attribution_wait)).
+    pub(crate) attribution_wait: Duration,
 }
 
 impl StoreView {
@@ -152,9 +152,13 @@ impl StoreView {
         let mentions_agent = mentions
             .iter()
             .any(|key| view.bots.get(key) == Some(&ManagedBot::Agent(agent)));
-        let wait = from_other_agent && mentions_agent;
+        let wait = if from_other_agent && mentions_agent {
+            context.attribution_wait
+        } else {
+            Duration::ZERO
+        };
         if let Some(posted) = attribution(store, &event.message, wait).await?
-            && posted.consent.is_none()
+            && posted.hands_off
             && let Some(poster) = posted.agent
         {
             view.member(store, &posted.requester.key).await?;

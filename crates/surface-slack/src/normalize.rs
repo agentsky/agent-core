@@ -36,7 +36,15 @@
 //! - Mentions are the `<@U…>` tokens in `text`, then the `user` elements of
 //!   `rich_text` blocks and the tokens in `mrkdwn` text objects, each user
 //!   once, in order of first appearance. Text typed inside a `rich_text`
-//!   block is not scanned: a literal `<@U…>` there is not a mention.
+//!   block is not scanned: a literal `<@U…>` there is not a mention. A
+//!   token with a backtick somewhere before it and another after it in the
+//!   same text is not one either, since Slack might show it as code
+//!   ([`mentions`]); a person's mention there is still read from the
+//!   `user` element their client sends. A bot's mentions are read from
+//!   `text` alone, as agentd reads what it posted, so the copy of an
+//!   agent's post Slack delivers, with whatever blocks Slack makes of its
+//!   text, hands off to the agents agentd's own delivery did: agentd's
+//!   agents post text, and the router ignores every other bot.
 //! - The team is the envelope's `team_id`, for the sender and the
 //!   conversation alike.
 //! - A bot's message that was `edited` is dropped: agentd never edits its
@@ -67,8 +75,9 @@
 //!   escaping of `&`, `<` and `>` lengthens the text a member typed, `&`
 //!   to five characters, so a cut in characters of the escaped text could
 //!   cut a real message short; a cut in bytes keeps the same bound and
-//!   more of the message. A mention past the cut is still read from
-//!   `blocks`, where Slack's clients put each one too.
+//!   more of the message. A person's mention past the cut is still read
+//!   from `blocks`, where Slack's clients put each one too; a bot's
+//!   mentions are read from `text` alone.
 //! - Mentions to the first [`MAX_MENTIONS`] different users, each an id
 //!   [`is_user_id`] accepts; the router looks each one up.
 //! - Files to the first [`MAX_FILES`] the bot can download, each with an id
@@ -321,7 +330,7 @@ fn normalized(
     };
     let mut text = event.text.unwrap_or_default();
     text.truncate(truncated(&text, MAX_TEXT_BYTES).len());
-    let mentions = mentions(&text, event.blocks.as_ref());
+    let mentions = mentions(&text, event.blocks.as_ref().filter(|_| !is_bot));
     let thread_root = event.thread_ts.filter(|root| *root != ts);
     let mentioned = context.bot_user.is_some_and(|bot| mentions.contains(bot));
     let own = context.bot_user.is_some_and(|bot| *bot == sender);
@@ -453,7 +462,11 @@ pub fn unescape(text: &str) -> String {
 
 /// The first [`MAX_MENTIONS`] users mentioned in `text` and `blocks`, once
 /// each, in order of first appearance: `<@U…>` tokens in `text`, then
-/// `rich_text` `user` elements and tokens in `mrkdwn` text objects.
+/// `rich_text` `user` elements and tokens in `mrkdwn` text objects. A
+/// token Slack might show as code is no mention
+/// ([`without_code`](render::slack::without_code)): agentd's own post and
+/// the platform's copy of it are read alike, so neither hands off what the
+/// thread sees as code.
 pub fn mentions(text: &str, blocks: Option<&Value>) -> Vec<UserId> {
     let mut found = Vec::new();
     scan_tokens(text, &mut found);
@@ -492,12 +505,14 @@ fn walk_blocks(value: &Value, found: &mut Vec<UserId>) {
     }
 }
 
-/// Collects the ids of `<@U…>` and `<@U…|label>` tokens, reading each byte
-/// about once, so a body costs time linear in its size. A label ends at the
-/// first `>`; Slack writes a typed `<` or `>` as `&lt;` or `&gt;`, so a `<`
-/// before that `>` leaves the token unclosed.
+/// Collects the ids of `<@U…>` and `<@U…|label>` tokens outside what
+/// Slack might show as code, reading each byte about once, so a body costs
+/// time linear in its size. A label ends at the first `>`; Slack writes a
+/// typed `<` or `>` as `&lt;` or `&gt;`, so a `<` before that `>` leaves
+/// the token unclosed.
 fn scan_tokens(text: &str, found: &mut Vec<UserId>) {
-    let mut rest = text;
+    let text = render::slack::without_code(text);
+    let mut rest = text.as_str();
     while let Some(at) = rest.find("<@") {
         rest = &rest[at + 2..];
         let end = rest
@@ -686,6 +701,44 @@ mod tests {
         let found = mentions("<@U1> and <@U1>", Some(&blocks));
         let ids: Vec<&str> = found.iter().map(UserId::as_str).collect();
         assert_eq!(ids, ["U1", "U2", "U3", "U4", "U5"]);
+    }
+
+    #[test]
+    fn a_token_slack_might_show_as_code_mentions_no_one() {
+        let blocks = json!([
+            {"type": "section", "text": {"type": "mrkdwn", "text": "`<@U4>` and `a` <@U5> `b`"}},
+            {"type": "section", "text": {"type": "mrkdwn", "text": "```\nx\n``` <@U6>"}},
+        ]);
+        let found = mentions("`<@U1>` over to <@U2>, see `x`y` <@U3> `z`", Some(&blocks));
+        let ids: Vec<&str> = found.iter().map(UserId::as_str).collect();
+        assert_eq!(ids, ["U6"]);
+        let found = mentions("<@U1>, see `code`", None);
+        assert_eq!(found, [UserId::from("U1")]);
+    }
+
+    #[test]
+    fn a_persons_mention_between_backticks_is_read_from_the_block_their_client_sends() {
+        let text = "`foo` <@U0BOT> `bar`";
+        let typed = channel_message(json!({
+            "text": text,
+            "blocks": [{"type": "rich_text", "elements": [
+                {"type": "rich_text_section", "elements": [
+                    {"type": "text", "text": "foo", "style": {"code": true}},
+                    {"type": "text", "text": " "},
+                    {"type": "user", "user_id": "U0BOT"},
+                    {"type": "text", "text": " "},
+                    {"type": "text", "text": "bar", "style": {"code": true}},
+                ]},
+            ]}],
+        }));
+        let event = normalize(typed).unwrap();
+        assert_eq!(event.mentions, [UserId::from("U0BOT")]);
+        let bare = channel_message(json!({"text": text}));
+        assert_eq!(
+            normalize(bare),
+            Err(Skip::NotAddressed),
+            "without the block, a token between backticks addresses no one"
+        );
     }
 
     #[test]
@@ -927,6 +980,29 @@ mod tests {
                 with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER", "text": "hi"})),
                 with(json!({"user": "U0OTHERBOT", "bot_profile": {"id": "B0OTHER"}, "text": "hi"})),
                 with(json!({"bot_id": "B0OTHER", "text": "hi <@U0HUMAN>"})),
+                with(
+                    json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER", "text": format!("`<@{BOT}>` over to you")}),
+                ),
+                with(json!({
+                    "user": "U0OTHERBOT",
+                    "bot_id": "B0OTHER",
+                    "text": format!("`a` <@{BOT}> `b`"),
+                    "blocks": [{"type": "rich_text", "elements": [
+                        {"type": "rich_text_section", "elements": [
+                            {"type": "text", "text": "a", "style": {"code": true}},
+                            {"type": "user", "user_id": BOT},
+                            {"type": "text", "text": "b", "style": {"code": true}},
+                        ]},
+                    ]}],
+                })),
+                with(json!({
+                    "user": "U0OTHERBOT",
+                    "bot_id": "B0OTHER",
+                    "text": "have a look",
+                    "blocks": [{"type": "rich_text", "elements": [
+                        {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]},
+                    ]}],
+                })),
             ];
             quiet_bots[2].as_object_mut().unwrap().remove("user");
             for quiet in quiet_bots {
@@ -936,17 +1012,6 @@ mod tests {
             let calling = with(json!({"user": "U0OTHERBOT", "bot_id": "B0OTHER"}));
             assert!(normalize(calling.clone()).is_ok(), "{channel_type}");
             assert!(read(kind, calling).is_ok(), "{channel_type}");
-            let calling_in_blocks = with(json!({
-                "user": "U0OTHERBOT",
-                "bot_id": "B0OTHER",
-                "text": "have a look",
-                "blocks": [{"type": "rich_text", "elements": [
-                    {"type": "rich_text_section", "elements": [{"type": "user", "user_id": BOT}]},
-                ]}],
-            }));
-            let kept = normalize(calling_in_blocks.clone()).unwrap();
-            assert_eq!(kept.mentions, [UserId::from(BOT)], "{channel_type}");
-            assert!(read(kind, calling_in_blocks).is_ok(), "{channel_type}");
             let person = with(json!({"text": "hi"}));
             assert!(normalize(person).is_ok(), "{channel_type}");
         }
