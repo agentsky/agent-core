@@ -1,0 +1,24 @@
+{
+  "token": "fakeVerificationToken0",
+  "team_id": "T0TEAM001",
+  "api_app_id": "A0AGENT01",
+  "event": {
+    "user": "U0HUMAN02",
+    "type": "message",
+    "ts": "1727698000.000600",
+    "client_msg_id": "2c3b1e8e-5d0a-4f0e-9d4c-0c3f1f2a7b06",
+    "text": "can someone check the build?",
+    "team": "T0TEAM001",
+    "channel": "C0MPIM001",
+    "event_ts": "1727698000.000600",
+    "channel_type": "mpim"
+  },
+  "type": "event_callback",
+  "event_id": "Ev0MPIM0001",
+  "event_time": 1727698000,
+  "authorizations": [
+    {"enterprise_id": null, "team_id": "T0TEAM001", "user_id": "U0BOT0001", "is_bot": true, "is_enterprise_install": false}
+  ],
+  "is_ext_shared_channel": false,
+  "event_context": "4-eyJldCI6Im1lc3NhZ2UifQ"
+}

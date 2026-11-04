@@ -9,6 +9,8 @@
 //! - [`app`]: [`App`], the shared state.
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
+//! - [`slack`]: the Slack request URLs' signing secrets, deduplication and
+//!   queue.
 //! - [`sweeper`]: deleting expired rows every minute.
 //! - [`telemetry`]: log output and field redaction.
 //! - [`net`]: subnets and the public listener's guard.
@@ -21,6 +23,7 @@ pub mod config;
 pub mod ctl;
 pub mod net;
 pub mod server;
+pub mod slack;
 pub mod sweeper;
 pub mod telemetry;
 
