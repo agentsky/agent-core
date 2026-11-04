@@ -518,22 +518,37 @@ Deliverables:
 - `deny.toml` with these sections:
   - `[bans]` denies `openssl`, `openssl-sys` and `native-tls`, and warns on
     duplicate versions.
-  - `[licenses]` allows the permissive licenses the lockfile actually needs
-    (MIT, Apache-2.0, BSD-2/3-Clause, ISC, Unicode-3.0, Zlib, and
-    CDLA-Permissive-2.0 if `webpki-roots` is pulled in), and `OpenSSL` as a
-    per-crate exception for `aws-lc-sys`. GPL, LGPL and AGPL
-    are denied. A weak-copyleft license such as MPL-2.0 is allowed only as a
-    per-crate exception with a reason. `[licenses.private] ignore = true`,
-    because the workspace crates carry only `license-file`.
-  - `[advisories]` denies vulnerabilities and warns on unmaintained crates.
+  - `[licenses]` allows the permissive licenses that
+    `[workspace.dependencies]` actually needs: MIT, Apache-2.0,
+    BSD-3-Clause, ISC, Unicode-3.0, Zlib, and CDLA-Permissive-2.0 (for
+    `webpki-root-certs`). `aws-lc-sys` no longer needs an `OpenSSL`
+    exception; see
+    [impl-notes](impl-notes.md#aws-lc-sys-no-longer-needs-an-openssl-exception).
+    GPL, LGPL and AGPL are denied. A weak-copyleft license such as MPL-2.0 is
+    allowed only as a per-crate exception with a reason.
+    `[licenses.private] ignore = true`, because the workspace crates carry
+    only `license-file`. That exempts every `publish = false` crate, so
+    `scripts/ci/check-path-deps.sh` fails when any path package other than
+    the root package or a crate directly under `crates/` is in the graph
+    (see
+    [impl-notes](impl-notes.md#licensesprivate-exempts-any-unpublished-crate)).
+  - `[advisories]` denies vulnerabilities and warns on unmaintained crates
+    (the latter through `-W unmaintained` on the command line; see
+    [impl-notes](impl-notes.md#cargo-deny-020-has-no-warning-level-for-unmaintained-crates)).
   - `[sources]` allows crates.io only.
 - A `deny` job in `.github/workflows/ci.yml`, using
-  `EmbarkStudios/cargo-deny-action` pinned to a major version. It runs when
-  code changed and is added to `ci-passed`'s `needs`.
+  `EmbarkStudios/cargo-deny-action` pinned to a major version, run with
+  `--workspace` (see
+  [impl-notes](impl-notes.md#cargo-deny-checks-only-the-root-package-by-default)).
+  It runs `check-path-deps.sh` before cargo-deny, runs when code changed and
+  on a weekly `schedule` (which runs every job but `publish-badges`; see
+  [impl-notes](impl-notes.md#the-deny-job-ran-only-when-code-changed)),
+  and is added to `ci-passed`'s `needs`.
 - A README line naming the policy.
 
 Acceptance: the job passes on `main`'s lockfile. A throwaway local commit that
-adds `native-tls` fails it; say so in the PR.
+adds `native-tls` fails it, and so does one that adds a GPL crate with
+`publish = false` as a path dependency; say so in the PR.
 
 ### T03
 
