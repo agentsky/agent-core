@@ -750,13 +750,22 @@ Deliverables:
   - `**bold**` to `*bold*`, `*em*` and `_em_` to `_em_`, and `~~strike~~` to
     `~strike~`.
   - Inline and fenced code are preserved, and their contents are never
-    rewritten.
-  - Links to `<url|label>`, and bare URLs are left alone.
+    rewritten, except that a run of three backticks inside a fenced block
+    gets a zero-width space so it can't close the block (see
+    [impl-notes](impl-notes.md#backtick-runs-close-a-slack-code-block)).
+  - Links to `<url|label>`, except that a label naming another host goes
+    next to the link (see
+    [impl-notes](impl-notes.md#a-link-label-can-disguise-its-destination)).
+    Bare `http(s)` URLs get explicit `<url>` bounds, as in qm-core, so Slack
+    doesn't pull neighboring marks into them (see
+    [impl-notes](impl-notes.md#bare-urls-get-explicit-bounds)).
   - Lists to `•` and `1.` lines, with two spaces of indent per nesting level.
   - Blockquotes to `>`.
   - Tables to aligned plain text inside a fenced code block.
   - Images to links.
-- Escapes `&`, `<` and `>` outside code, as Slack requires.
+- Escapes `&`, `<` and `>` everywhere, including inside code, as Slack
+  requires (see
+  [impl-notes](impl-notes.md#escaping-applies-inside-code-too)).
 - `@Name` (outside code) becomes `<@U…>` when `directory` resolves it and is
   left as text when it doesn't.
 - Neutralizes mass mentions. `@here`, `@channel` and `@everyone`, and literal
@@ -1958,6 +1967,10 @@ Deliverables:
 
 - A Web API client with a bot token per binding:
   - `chat.postMessage` with `thread_ts`, `unfurl_links: false` and mrkdwn text.
+    Posts and updates never set `link_names` or `parse: full`: `render`
+    leaves unresolved `@names` and code as written, and either flag would let
+    them ping (see
+    [impl-notes](impl-notes.md#typed-broadcasts-get-a-zero-width-space)).
   - `chat.update`, `chat.postEphemeral`, `reactions.add` and
     `reactions.remove`.
   - `conversations.replies` and `conversations.history`, `conversations.info`
@@ -1984,8 +1997,15 @@ Deliverables:
 
 Acceptance: wiremock tests for each method, the upload flow in order, 429
 handling, and that `render` converts and splits through `render`, so that
-`post` sends one chunk as T23 expects. Slack returns HTTP 200 with
-`ok: false` on errors; test that mapping.
+`post` sends one chunk as T23 expects. A test asserts that the
+`chat.postMessage` and `chat.update` request bodies carry neither `link_names`
+nor `parse: full`. Slack returns HTTP 200 with `ok: false` on errors; test
+that mapping.
+
+Live check (manual, recorded in the PR): post a reply whose Markdown has `|`
+inside a link label, such as `[a | b](https://x.io)`, which `render` sends
+as `<https://x.io|a | b>`, and confirm Slack shows the whole label `a | b`
+linking to `https://x.io`.
 
 ### T30
 
