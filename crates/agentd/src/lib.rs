@@ -12,6 +12,8 @@
 //! - [`commands`]: `/agent` command dispatch, the account and agent commands, and
 //!   the relink notice.
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
+//! - [`pipeline`]: the runner's sessions and sandboxes, and the turn hooks
+//!   that give each process its placeholder and agentctl token.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
 //! - [`slack`]: the Slack request URLs' signing secrets, deduplication and
 //!   queue.
@@ -28,6 +30,7 @@ pub mod commands;
 pub mod config;
 pub mod ctl;
 pub mod net;
+pub mod pipeline;
 pub mod server;
 pub mod slack;
 pub mod sweeper;

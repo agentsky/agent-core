@@ -14,7 +14,7 @@ use secrecy::{ExposeSecret, SecretString};
 use serde_json::{Value, json};
 use store::{NewClaudeLink, NewSlackConfigToken, Sealer, Store};
 use surface_slack::{BindingRef, SlackClient, SlackEvent, SlackInbound, SlashCommand};
-use testkit::{Logs, TempDir};
+use testkit::TempDir;
 use time::OffsetDateTime;
 use wiremock::matchers::{body_string_contains, method, path, path_regex};
 use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -28,7 +28,7 @@ use super::slack_tokens::{
 use super::*;
 use crate::slack::Inbound;
 use crate::slack::manager::{ManagerIdentity, SlackManager};
-use crate::telemetry::{LogFormat, subscriber};
+use crate::telemetry::tests::global_logs;
 
 const TEAM: &str = "T0TEAM001";
 const BOT_TOKEN: &str = "xoxb-manager-SECRET-bot";
@@ -262,16 +262,6 @@ async fn mount_rotation(
         .await;
 }
 
-fn capture_logs() -> (Logs, tracing::subscriber::DefaultGuard) {
-    let captured = Logs::default();
-    let logs = subscriber(
-        LogFormat::Json,
-        tracing_subscriber::EnvFilter::new("trace"),
-        captured.clone(),
-    );
-    (captured, tracing::subscriber::set_default(logs))
-}
-
 fn clock(at: OffsetDateTime) -> impl Fn() -> OffsetDateTime {
     move || at
 }
@@ -283,7 +273,7 @@ fn in_hours(hours: i64) -> i64 {
 #[tokio::test]
 async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_either() {
     let h = slack_harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     let exp = in_hours(12);
     mount_rotation(
@@ -325,11 +315,9 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
     let rotations = h.calls("tooling.tokens.rotate").await;
     assert!(rotations[0].headers.get("authorization").is_none());
 
-    let text = logs.snapshot();
-    assert!(
-        text.contains("registered a Slack configuration token"),
-        "{text}"
-    );
+    logs.snapshot()
+        .assert_has("registered a Slack configuration token");
+    let everything = global_logs().snapshot();
     for secret in [
         GIVEN_TOKEN,
         GIVEN_REFRESH,
@@ -338,7 +326,7 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
         BOT_TOKEN,
         "SECRET",
     ] {
-        assert!(!text.contains(secret), "{secret} was logged");
+        everything.assert_lacks(secret);
     }
     for reply in &replies {
         assert!(!reply.contains("SECRET"), "{reply}");
@@ -348,7 +336,7 @@ async fn slack_token_rotates_at_once_and_stores_the_new_pair_without_logging_eit
 #[tokio::test]
 async fn a_refused_refresh_token_stores_nothing_and_says_so() {
     let h = slack_harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     Mock::given(method("POST"))
         .and(path("/api/tooling.tokens.rotate"))
@@ -370,7 +358,9 @@ async fn a_refused_refresh_token_stores_nothing_and_says_so() {
         "{replies:?}"
     );
     assert_eq!(h.stored(alice).await, None);
-    assert!(!logs.snapshot().contains("SECRET"));
+    logs.snapshot()
+        .assert_has("Slack refused a configuration refresh token");
+    global_logs().snapshot().assert_lacks("SECRET");
 }
 
 #[tokio::test]
@@ -636,7 +626,7 @@ async fn the_rotator_renews_each_token_before_it_expires() {
 #[tokio::test]
 async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
     let h = slack_harness().await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     let start = OffsetDateTime::now_utc();
     h.store
@@ -685,7 +675,10 @@ async fn a_refused_renewal_breaks_the_token_and_dms_the_member_once() {
         RotationPass::default()
     );
     assert_eq!(h.posts().await.len(), 1);
-    assert!(!logs.snapshot().contains("SECRET"));
+    logs.snapshot()
+        .assert_has("Slack refused to renew a configuration token")
+        .assert_has("sent the configuration token notice");
+    global_logs().snapshot().assert_lacks("SECRET");
 }
 
 #[tokio::test]
@@ -1472,7 +1465,7 @@ async fn a_checked_pair_is_stored_although_the_first_write_fails() {
 async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let alice = h.linked("U0HUMAN01").await;
     mount_rotation(
         &h.slack,
@@ -1499,7 +1492,9 @@ async fn a_checked_pair_the_store_keeps_refusing_is_reported_lost() {
     );
     assert_eq!(failures_left(&url).await, 10 - i64::from(STORE_ATTEMPTS));
     assert_eq!(h.stored(alice).await, None);
-    assert!(!logs.snapshot().contains("SECRET"));
+    logs.snapshot()
+        .assert_has("couldn't store a checked configuration token");
+    global_logs().snapshot().assert_lacks("SECRET");
 }
 
 #[tokio::test]
@@ -1521,7 +1516,7 @@ async fn a_departed_members_token_is_deleted_although_the_first_deletes_fail() {
 async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() {
     let (store, url, _dir) = file_store().await;
     let h = slack_harness_on(store).await;
-    let (logs, _guard) = capture_logs();
+    let logs = global_logs().tag();
     let grace = h.linked("U0HUMAN02").await;
     h.with_token(grace).await;
     fail_token_deletes(&url, 10).await;
@@ -1551,7 +1546,7 @@ async fn a_departure_the_store_keeps_refusing_is_logged_and_the_queue_goes_on() 
         retries.iter().all(|line| line.contains("U0HUMAN02")),
         "{logs}"
     );
-    assert!(!logs.contains("SECRET"));
+    global_logs().snapshot().assert_lacks("SECRET");
 }
 
 /// Creates `count` public agents of `owner`'s, with names long enough that

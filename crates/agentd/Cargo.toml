@@ -25,6 +25,8 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 rand.workspace = true
+runner.workspace = true
+sandbox.workspace = true
 secrecy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -43,6 +45,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+bollard.workspace = true
 futures.workspace = true
 log.workspace = true
 serde_norway.workspace = true

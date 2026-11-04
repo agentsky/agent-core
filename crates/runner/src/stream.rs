@@ -113,10 +113,16 @@ pub struct TurnResult {
     pub usage: Option<Usage>,
     /// The turn's cost in US dollars, as the CLI reckons it: the rise in
     /// [`process_total_cost_usd`](Self::process_total_cost_usd) since the
-    /// process's previous result, never below 0.
+    /// process's previous result, never below 0. The first result of a
+    /// process started with `--resume` rises from 0, so it holds the total
+    /// the CLI restored as well as the turn's own cost.
     pub cost_usd: Option<f64>,
     /// The line's `total_cost_usd`: the CLI's running total for its
-    /// process, not the turn's cost. On a new process it counts from 0.
+    /// process, not the turn's cost. A process started with `--session-id`
+    /// counts from 0. One started with `--resume` counts from the total
+    /// the CLI saved in the transcript when the session's last process
+    /// exited: Claude Code 2.1.285 appends a `cost-state` line then, and
+    /// none for a process that was killed.
     pub process_total_cost_usd: Option<f64>,
     /// The session the CLI reports.
     pub session_id: Option<SessionId>,

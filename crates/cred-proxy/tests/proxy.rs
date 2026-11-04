@@ -1050,6 +1050,17 @@ fn upstream_must_be_valid() {
         err.to_string(),
         "invalid upstream URL: the scheme must be http or https"
     );
+    let err = CredProxy::new(
+        "http://api.anthropic.com",
+        Registry::new(),
+        Arc::new(Tokens::default()),
+        Arc::new(Unconfigured),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "invalid upstream URL: plain http is allowed only to a loopback IP address"
+    );
     let proxy = CredProxy::new(
         cred_proxy::DEFAULT_UPSTREAM,
         Registry::new(),
