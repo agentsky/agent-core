@@ -11,16 +11,17 @@ use std::error::Error as _;
 
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
-use core_types::ConsentId;
+use core_types::{ConsentId, RoutineToken};
 use secrecy::SecretString;
 
+use crate::cloud::{parse_routine_label, parse_routine_token, parse_routine_url};
 use crate::help::{self, SPECS, Spec};
 use crate::names::{
     Reason, parse_agent_name, parse_skill_name, parse_skill_source, parse_target, parse_user,
 };
 use crate::{
-    AdminCommand, AgentName, ApiKeyCommand, Command, ParseError, ParseErrorKind, Setting,
-    SkillCommand, SkillName, Target, UserRef,
+    AdminCommand, AgentName, ApiKeyCommand, CloudCommand, Command, ParseError, ParseErrorKind,
+    RoutineLabel, RoutineUrl, Setting, SkillCommand, SkillName, Target, UserRef,
 };
 
 /// Parses command text: the text after `/agent`, the whole text of a direct
@@ -146,19 +147,22 @@ fn command_words(tokens: &[Token<'_>]) -> Vec<&'static str> {
 /// `admin`, `slack_token <token>` or `admin apikey set <key>` count. It also
 /// does when any word holds a known token prefix (`sk-ant-`, `xoxb-`,
 /// `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`), or has the shape of a pasted login
-/// code, `<code>#<state>` or a `code=` query parameter, whatever the command.
+/// code, `<code>#<state>` or a `code=` query parameter, whatever the command,
+/// and when `cloud` is followed by `add` and a value, which may be a
+/// routine's token.
 fn looks_secret_bearing(tokens: &[Token<'_>]) -> bool {
     const TOKEN_PREFIXES: [&str; 6] = ["sk-ant-", "xoxb-", "xoxp-", "xoxe.", "xoxe-", "xapp-"];
-    let names_a_secret = |token: &Token<'_>| {
-        let word: String = token
+    let word = |token: &Token<'_>| -> String {
+        token
             .text
             .trim_matches(|c: char| !c.is_ascii_alphanumeric())
             .chars()
             .filter(|c| !matches!(c, '-' | '_'))
             .map(|c| c.to_ascii_lowercase())
-            .collect();
-        matches!(word.as_str(), "login" | "apikey" | "slacktoken")
+            .collect()
     };
+    let names_a_secret =
+        |token: &Token<'_>| matches!(word(token).as_str(), "login" | "apikey" | "slacktoken");
     let is_verb = |token: &Token<'_>| {
         ["set", "clear"]
             .iter()
@@ -172,7 +176,11 @@ fn looks_secret_bearing(tokens: &[Token<'_>]) -> bool {
                 _ => true,
             }
     });
+    let cloud_add_with_value = tokens
+        .windows(3)
+        .any(|run| word(&run[0]) == "cloud" && word(&run[1]) == "add");
     keyword_with_value
+        || cloud_add_with_value
         || tokens.iter().any(|token| {
             let word = token.text.to_ascii_lowercase();
             TOKEN_PREFIXES.iter().any(|prefix| word.contains(prefix))
@@ -383,6 +391,33 @@ enum Cmd {
         #[arg(value_name = "consent-id", value_parser = parse_consent)]
         consent: ConsentId,
     },
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CloudCmd {
+    Add {
+        #[arg(value_name = "routine", value_parser = parse_routine_label)]
+        label: RoutineLabel,
+        #[arg(value_name = "url", value_parser = parse_routine_url)]
+        routine: RoutineUrl,
+        #[arg(value_name = "token", value_parser = parse_routine_token)]
+        token: RoutineToken,
+    },
+    Run {
+        #[arg(value_name = "routine", value_parser = parse_routine_label)]
+        label: RoutineLabel,
+        #[arg(value_name = "task")]
+        task: String,
+    },
+    List,
+    Rm {
+        #[arg(value_name = "routine", value_parser = parse_routine_label)]
+        label: RoutineLabel,
+    },
 }
 
 #[derive(Subcommand)]
@@ -479,6 +514,20 @@ impl Cmd {
             }),
             Cmd::Approve { consent } => Command::Approve { consent },
             Cmd::Decline { consent } => Command::Decline { consent },
+            Cmd::Cloud { command } => Command::Cloud(match command {
+                CloudCmd::Add {
+                    label,
+                    routine,
+                    token,
+                } => CloudCommand::Add {
+                    label,
+                    routine,
+                    token,
+                },
+                CloudCmd::Run { label, task } => CloudCommand::Run { label, task },
+                CloudCmd::List => CloudCommand::List,
+                CloudCmd::Rm { label } => CloudCommand::Rm { label },
+            }),
         })
     }
 }
