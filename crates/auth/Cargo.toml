@@ -1,0 +1,13 @@
+[package]
+name = "auth"
+version.workspace = true
+edition.workspace = true
+description = "Claude PKCE linking, token exchange, refresh and plan lookup for agent-core."
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

@@ -1,0 +1,13 @@
+[package]
+name = "router"
+version.workspace = true
+edition.workspace = true
+description = "Mention gating and credential policy for agent-core turns."
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

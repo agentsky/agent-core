@@ -1,0 +1,13 @@
+[package]
+name = "surface-slack"
+version.workspace = true
+edition.workspace = true
+description = "Slack surface for agent-core."
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

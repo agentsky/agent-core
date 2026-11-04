@@ -1,0 +1,14 @@
+[package]
+name = "agentctl"
+version.workspace = true
+edition.workspace = true
+description = "In-sandbox CLI that agents use to call back into agentd."
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true

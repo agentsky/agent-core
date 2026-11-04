@@ -1,0 +1,13 @@
+[package]
+name = "render"
+version.workspace = true
+edition.workspace = true
+description = "Markdown rendering and message splitting for Slack and Rocket.Chat."
+license-file.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
