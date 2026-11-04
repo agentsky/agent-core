@@ -602,6 +602,26 @@ checksum = "217698eaf96b4a3f0bc4f3662aaa55bdf913cd54d7204591faa790070c6d0853"
 [[package]]
 name = "cred-proxy"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "auth",
+ "axum",
+ "base64 0.23.1",
+ "bytes",
+ "core-types",
+ "futures",
+ "rand",
+ "reqwest",
+ "secrecy",
+ "serde_json",
+ "sha2 0.11.0",
+ "testkit",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "wiremock",
+]
 
 [[package]]
 name = "crossbeam-queue"
