@@ -8,7 +8,7 @@
 //! - [`fake_anthropic`]: a local server that answers like the Anthropic API.
 //! - [`fixtures`]: stream-json lines captured from the real CLI.
 //! - [`held`]: a wiremock responder that answers when the test says so.
-//! - [`rocketchat`]: a fake Rocket.Chat REST server.
+//! - [`rocketchat`]: fake Rocket.Chat REST and realtime servers.
 //! - [`TempDir`]: a directory for one test, removed when the test ends.
 
 #![warn(missing_docs)]

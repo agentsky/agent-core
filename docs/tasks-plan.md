@@ -1221,6 +1221,10 @@ Deliverables:
   the manager invites it where the manager is a member. `allow` and `deny` come
   in T27.
 - On startup, agentd restores realtime connections for every active binding.
+- A realtime connection is `RocketChatSurface::events` (T12). agentd builds
+  each surface with a store-backed `Dedup` and one `BotRoles` over the
+  manager's client, shared by every surface
+  ([impl-notes](impl-notes.md#messages-dont-carry-the-senders-roles)).
 
 Acceptance: tests with `FakeRest` and `FakeDdp` for create, a name collision,
 persona edit by a non-owner (refused), pause (events ignored), delete, and
@@ -2473,3 +2477,8 @@ Not scheduled. Each needs a decision before it becomes a task.
   [Alternatives considered](design.md#alternatives-considered)).
 - **Managed Agents backend** for channel agents funded by a community API key
   (design, same section).
+- **Backfill after a Rocket.Chat reconnect.** A realtime connection that
+  drops misses what was posted until it is back (T12). Every bot in a room
+  would need to miss it for a message to be lost, but a lone agent in a room,
+  or an agentd restart, loses it. Fetching each room's history since the last
+  message seen, through the same deduplication, would close the gap.
