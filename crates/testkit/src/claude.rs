@@ -366,14 +366,13 @@ mod tests {
 
     #[test]
     fn target_dir_is_the_nearest_ancestor_with_a_cachedir_tag() {
-        let root = std::env::temp_dir().join(format!("testkit-target-{}", uuid::Uuid::new_v4()));
+        let root = crate::TempDir::new("testkit-target");
         let deps = root.join("target/debug/deps");
         std::fs::create_dir_all(&deps).unwrap();
         std::fs::write(root.join("target/CACHEDIR.TAG"), "").unwrap();
         let exe = deps.join("runner-0123");
         assert_eq!(target_dir(&exe), Some(root.join("target").as_path()));
         assert_eq!(target_dir(&root.join("elsewhere/exe")), None);
-        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

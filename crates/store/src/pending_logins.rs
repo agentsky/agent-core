@@ -252,7 +252,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn take_returns_a_row_exactly_once_under_concurrent_callers() {
-        let dir = TempDir::new();
+        let dir = TempDir::new("store-test");
         let store = Store::open(&dir.db_url(), sealer()).await.unwrap();
         let member = store.ensure_member(&member_key("u1"), "Ada").await.unwrap();
         for round in 0..20 {

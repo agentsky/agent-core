@@ -7,29 +7,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use testkit::claude::{API_KEY_BETA, CRASH_EXIT_CODE, DEFAULT_MODEL, OAUTH_BETA, SCRIPT_ENV};
-use testkit::{FakeAnthropic, Turn, fake_anthropic, fake_claude_path, fixtures, write_script};
+use testkit::{
+    FakeAnthropic, TempDir, Turn, fake_anthropic, fake_claude_path, fixtures, write_script,
+};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const WAIT: Duration = Duration::from_secs(60);
-
-struct TempDir(PathBuf);
-
-impl TempDir {
-    fn new() -> Self {
-        let dir = std::env::temp_dir().join(format!("testkit-fake-claude-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        Self(dir)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
 
 /// One session's directories and environment, as the runner would set them
 /// up.
@@ -42,11 +28,11 @@ struct Setup {
 
 impl Setup {
     fn new(base_url: &str, turns: &[Turn]) -> Self {
-        let dir = TempDir::new();
+        let dir = TempDir::new("testkit-fake-claude");
         for sub in ["claude", "work", "bin"] {
-            std::fs::create_dir_all(dir.0.join(sub)).unwrap();
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
         }
-        std::fs::write(dir.0.join("persona.md"), "You are a test agent.\n").unwrap();
+        std::fs::write(dir.join("persona.md"), "You are a test agent.\n").unwrap();
         let setup = Self {
             dir,
             id: Uuid::new_v4(),
@@ -58,7 +44,7 @@ impl Setup {
     }
 
     fn path(&self, name: &str) -> PathBuf {
-        self.dir.0.join(name)
+        self.dir.join(name)
     }
 
     fn script(&self, turns: &[Turn]) {
