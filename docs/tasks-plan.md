@@ -861,10 +861,12 @@ Deliverables:
   text of a DM to the manager bot, or the text after `!agent`. A
   `strip_prefix` helper covers the last two.
 - A `Command` enum covering every row of the design's command table:
-  - `Login { code: Option<String> }`, `Logout`, `Me`.
-  - `SlackToken { token, refresh }`.
+  - `Login { code: Option<SecretString> }`, `Logout`, `Me`.
+  - `SlackToken { token, refresh }`, both `SecretString`.
   - `Create { name, persona }`, `Persona { name, text }`.
-  - `Skill { add|rm, name, source }`.
+  - `Skill(Add { name, source } | Rm { name, skill })`. `name` is the agent;
+    `skill rm` names the skill, since an owner may have several agents
+    ([impl-notes](impl-notes.md#skill-rm-needs-the-agent-and-the-skill)).
   - `Allow` and `Deny { name, target }`.
   - `Limits { name, turns_per_day, hops }`.
   - `Pause`, `Resume` and `Delete { name }`.
@@ -879,6 +881,14 @@ Deliverables:
 - `Command::is_secret_bearing()` is true for `Login { code: Some }`,
   `SlackToken` and `Admin(ApiKey { set })`, so callers can enforce
   private-channel rules and redact logs.
+- `ParseError::is_secret_bearing()` says the same of text that fails to
+  parse, including misspelt commands (`api-key set <key>` without `admin`,
+  `slack_token …`) and any word holding a known token prefix (`sk-ant-`,
+  `xoxb-`, `xoxp-`, `xoxe.`, `xoxe-`, `xapp-`)
+  ([impl-notes](impl-notes.md#misspelt-secret-bearing-commands-arent-commands-at-all)).
+- A `skill add` source is an `https://` Git URL with an optional `#ref`, in a
+  narrow character set; anything else, including a word starting with `-`, is
+  a parse error ([impl-notes](impl-notes.md#a-skill-source-reaches-git-clone)).
 - `Command::help()` gives short usage text per command. An unknown command
   returns the help text as the error message.
 
@@ -1815,12 +1825,14 @@ Deliverables:
 - Skill storage per agent: `<data>/skills/<agent>/<name>/`, mounted read-only
   into every session of that agent. The bundled skill is always present.
 - `/agent skill add <name> <source>`, where `source` is one of:
-  - a Git URL with an optional `#ref`, cloned by agentd on the egress network,
-    shallow, with no submodules;
+  - an `https://` Git URL with an optional `#ref`, in the form T08's parser
+    accepts, cloned by agentd on the egress network, shallow, with no
+    submodules, passing the URL after `--` and the ref only inside an
+    `--opt=value` word, so neither can be read as an option;
   - a `SKILL.md` or `.zip` file attached to the DM with the manager bot.
   It validates that `SKILL.md` exists with `name` and `description` front
   matter, and caps the size.
-- `/agent skill rm <name>`.
+- `/agent skill rm <name> <skill>`, where `<name>` is the agent (T08).
 - Skills may declare extra egress hosts in front matter (`allowed-hosts:`). The
   owner confirms them when adding, and they extend T19's allowlist for that
   agent's sandboxes.
@@ -1975,6 +1987,12 @@ Deliverables:
   - Mentions come from `<@U…>` tokens in the text and in `blocks`.
   - `files` become `InFile`.
   - `team_id` comes from the envelope. `authorizations` are ignored for now.
+- Slack sends `&`, `<` and `>` in message and slash command text as
+  `&amp;`, `&lt;` and `&gt;`. The ingress passes that text on as Slack sent
+  it, and the Slack surface decodes the three entities before any of it
+  reaches `commands::parse` (T30), which works on plain text: otherwise a
+  persona typed as `You & me` arrives as `You &amp; me`. Mention and link
+  tokens parse either way.
 - `testkit::slack`: request signing helpers and payload fixtures.
 
 Acceptance:
@@ -2063,6 +2081,10 @@ Deliverables:
 - Manager DMs on Slack work as on Rocket.Chat: the whole text is parsed as a
   command. Files attached there feed `persona` (T14's upload rule) and
   `skill add` (T25), downloaded with the manager's bot token.
+- The `&amp;`, `&lt;` and `&gt;` entities in slash command and manager-DM
+  text are decoded before `commands::parse` sees it (the contract in the
+  `commands` crate docs), with a test that `persona <name> You & me` sets
+  the persona `You & me`.
 - `/agent slack-token <token> <refresh>`, for linked members on Slack.
   - Validate the token with `auth.test` on the tooling API, or by calling
     `tooling.tokens.rotate` at once, which also proves the refresh token works.
