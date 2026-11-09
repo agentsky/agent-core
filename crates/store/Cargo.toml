@@ -11,3 +11,14 @@ publish = false
 workspace = true
 
 [dependencies]
+base64.workspace = true
+chacha20poly1305 = { workspace = true, features = ["zeroize"] }
+core-types.workspace = true
+secrecy.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+uuid.workspace = true
