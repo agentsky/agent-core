@@ -673,6 +673,29 @@ A task that adds a `SurfaceKind` variant must also add a migration that
 relaxes the constraint; until it does, `ensure_member` fails at runtime for
 the new surface.
 
+### A SQLite advisory has no fix a sqlx release can take
+
+**Issue.** In November 2026 the advisory database gained RUSTSEC-2026-0459
+(CVE-2026-119375, dated 2026-10-30) against `libsqlite3-sys` before 0.39.0.
+The bundled SQLite before 3.54.0 can return uninitialized page-cache memory
+when it opens a database together with a crafted `-wal` file of a different
+page size. sqlx's `sqlite` feature builds the bundled SQLite, and
+sqlx-sqlite 0.9.0, from the latest sqlx release, requires `libsqlite3-sys`
+`>=0.30.1, <0.38.0`, so neither `cargo update` nor a floor can reach the
+patched 0.39. sqlx's main branch already allows 0.39, but taking it would
+mean patching every sqlx crate to git and allowing git sources in
+`deny.toml`. Linking the system SQLite instead would not clear the check,
+which flags the crate whatever its features. From T05's branch up, the
+`deny` job failed.
+
+**Solution.** `deny.toml` ignores RUSTSEC-2026-0459 with the reason inline.
+The advisory needs a less trusted party to write the database and its
+`-wal`. agentd opens only the database `store.url` names; sandbox containers
+mount their own volumes and the agent's persona and skills directories,
+never the database's directory; and the tests open only databases they
+create. The entry comes out when a sqlx release allows `libsqlite3-sys`
+0.39; cargo-deny warns once the ignored advisory no longer matches.
+
 ## T06: Slack mrkdwn
 
 ### Escaping applies inside code too
