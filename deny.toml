@@ -10,11 +10,15 @@
 all-features = true
 
 [advisories]
-# Vulnerability advisories always fail the check. cargo-deny reports
-# unmaintained advisories as errors too; the `-W unmaintained` above turns
-# them into warnings.
+# Vulnerability advisories fail the check unless `ignore` lists them, each
+# with the reason it does not reach us and when to remove it. cargo-deny
+# reports unmaintained advisories as errors too; the `-W unmaintained` above
+# turns them into warnings.
 unmaintained = "all"
 yanked = "warn"
+ignore = [
+    { id = "RUSTSEC-2026-0459", reason = "sqlx-sqlite 0.9.0, from the latest sqlx, caps libsqlite3-sys below 0.38, out of reach of the patched 0.39. The flaw needs a less trusted party to write the database and its -wal; agentd opens only its configured database, and no sandbox container mounts that directory. Remove when a sqlx release allows libsqlite3-sys 0.39" },
+]
 
 [licenses]
 # Every license a crate in the graph uses must be listed here or in an
