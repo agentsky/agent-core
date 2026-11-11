@@ -1908,9 +1908,11 @@ Deliverables:
   - A turn whose outcome is `TurnOutcome::resume_refused()` on a process
     the turn started with `SessionStart::Resume` (a `--resume` of a session
     with no transcript) resets the session to `--session-id`:
-    the row is marked not started and the turn runs again, once, on a new
-    process with `SessionStart::New` and the same id, since the CLI never
-    read the message.
+    the row is marked not started and the turn fails with
+    `RunnerError::ResumeRefused`, since the CLI never read the message and
+    the message was built for a transcript that is gone. The caller builds
+    it again for an empty transcript, and the next turn starts a new
+    process with `SessionStart::New` and the same id.
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
   - `run_turn(session, TurnRequest) -> TurnReport` (the `TurnOutcome` and
@@ -1994,8 +1996,8 @@ Acceptance:
     recycles the container and clears the files; another party's turn
     gets a new container even when the record names it.
   - Reset starts with a new id.
-  - A `--resume` the CLI refuses for want of a transcript reruns the turn
-    with `--session-id`.
+  - A `--resume` the CLI refuses for want of a transcript fails the turn
+    with `ResumeRefused`, and the next turn starts with `--session-id`.
   - A recording `TurnHooks` double sees the calls in order for each turn:
     `process_starting` once per process, `turn_starting` and `turn_finished`
     per turn, and `process_stopping` before every stop and after a killed
@@ -2191,8 +2193,10 @@ Deliverables:
      `SessionManager::run_turn`. `run_turn` returns
      `RunnerError::SessionReset` when a reset or a scope-change replacement
      lands between `lookup_or_create` and the turn reaching the front of the
-     session's queue. The pipeline then calls `lookup_or_create` again and
-     retries the turn once on the session it returns.
+     session's queue, and `RunnerError::ResumeRefused` when the CLI refused
+     to resume a session whose transcript is gone. The pipeline then calls
+     `lookup_or_create` again, builds the message again and retries the
+     turn once on the session it returns.
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
