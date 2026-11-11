@@ -529,8 +529,8 @@ impl<H: TurnHooks> SessionManager<H> {
     /// - [`RunnerError::ResumeRefused`] if the CLI refused to resume the
     ///   session for want of a transcript; the session's next turn starts
     ///   it with `--session-id`. The session's slot is released, so the
-    ///   caller must run its rebuilt turn before any other turn or reset
-    ///   of the session.
+    ///   caller must run its rebuilt turn before any other turn on the
+    ///   session.
     /// - [`RunnerError::Sandbox`], [`RunnerError::Store`] and the process's
     ///   own errors if the container or the process couldn't be started, or
     ///   the session's old container couldn't be stopped.
