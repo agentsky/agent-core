@@ -8899,14 +8899,14 @@ delivery state. The card is claimed like the relink notice: a conditional
 `UPDATE` counts the attempt and sets a 10-minute lease. A failed send backs
 off a minute, doubling up to 15 minutes, until the consent expires; a
 deferral names its claim, so a stale claimer can't shorten a newer lease.
-No manager bot on this instance reaching any of the owner's identities is
-a failed send too, not a reason to expire: another instance, or this one
-once configured, may reach them. Only a card that won't fit one message
-expires at once. The thread is told the card couldn't reach the owner,
-rather than that the owner didn't answer, whenever a consent expires with
-its card never posted. A
-card posted but not recorded is recorded again a few times before its claim
-is left to lapse. A decision is one conditional `UPDATE` on a pending
+No manager bot on this instance reaching any of the owner's identities
+leaves the card unclaimed, with no try counted, rather than expiring it:
+another instance, or this one once configured, may reach them. Only a
+card that won't fit one message expires at once. The thread is told the
+card couldn't reach the owner, rather than that the owner didn't answer,
+whenever a consent expires with its card never posted. A card posted but
+not recorded is recorded again a few times before its claim is left to
+lapse. A decision is one conditional `UPDATE` on a pending
 consent whose expiry hasn't passed, and so is an expiry, so neither
 overrides the other. The work a decided consent owes (run the task, or post
 the outcome) is leased too, 10 minutes, renewed every third of that while
@@ -9071,6 +9071,23 @@ refused safely: `Consents::decide` answers `Decided::Settled`, or
 mark, as the relink notices got, would fix it, but needs a migration, which
 a cosmetic leftover isn't worth.
 
+Instances sharing a store may serve different workspaces, and a card can
+be updated only by a manager bot of the workspace it was posted in. At
+first `close_cards` claimed every card to close and then called
+`update_rich`, whose `ReplyError::NoManagerBot` kept the claim like a
+platform refusal, so an instance that couldn't reach a card's workspace
+left it with live-looking buttons for good, the instance that posted it
+included. `close_cards` now asks `Replies::can_update` before claiming and
+leaves a card no manager bot of its own serves to an instance whose does;
+`update_rich` takes its bot from the same lookup, so the two can't
+disagree. `send_cards` had the same order: an instance that couldn't reach
+the owner claimed the card and deferred it, raising its backoff and
+holding it from the instance that could. It now picks the owner's identity
+before claiming and leaves the card unclaimed when its manager bots reach
+none, as the relink and token notices do. Tests run each pass with the
+replies of an instance serving another workspace, then with the harness's
+own, which sends or closes the card at once.
+
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a
 visible box of literal text, so mrkdwn and `<!channel>` in it show as typed
@@ -9090,8 +9107,8 @@ app.
   owner with cards or the disk with copies. A refused request doesn't
   count.
 - The card goes to the owner's identity on the task's surface and team, or
-  else any a manager bot reaches; with none, it is retried until it
-  expires.
+  else any a manager bot reaches; with none, it waits, unclaimed, for an
+  instance whose manager bot does, until it expires.
 - The card says whether the task is the owner's ("from you, as …") or
   "from someone other than you", since a Slack display name is the user's
   to choose and need not be unique, and names the requester by a handle
@@ -9274,9 +9291,13 @@ reason if it wants one.
   session's own directory.
 - With no manager bot anywhere reaching the owner, the thread hears that
   the card couldn't reach them only when the consent expires, a day by
-  default. Each try counts toward the card's backoff, so in a deployment
-  where only some instances reach the owner, one that can may wait up to
-  15 minutes for its turn.
+  default, and no instance warns before then.
+- A card whose workspace no instance serves any longer is never closed,
+  so every instance loads it again on each pass of the close loop. A
+  click on it reaches no instance, and `approve` or `decline` from a
+  workspace still served answers that it was already decided. A store
+  query limited to the workspaces this instance serves would stop the
+  reloads.
 
 ### Rust 1.99 deprecates `fetch_update`
 

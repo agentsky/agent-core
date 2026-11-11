@@ -1477,7 +1477,7 @@ for members of other organizations too, whose own organization is kept as
 | Members of another organization in a Slack Connect channel use agents, spend the community key or bill a member | Closed by default. agentd hears them only when `[slack_connect] teams` lists their organization, and an agent answers them only when its owner allows `outside` or the member by name; `everyone` and room allows don't, and an `outside` allow changes nothing for home members. Their turns run on the community key or not at all, never on a link or the owner's credential, and bans, deny rules and every cap apply. Hops on their behalf need a switch of their own, and they can never ask for a private task, which would run on the owner's credential. |
 | A message's organization is forged or misread, so an outside member passes as a home one | The event decides nothing: the copy read back with the agent's token is routed, a sender is outside only if the copy says so, and an event that disagrees with the copy on it is dropped. A sender is home only when every team field Slack gives (`user_team`, `source_team`, `user_profile.team`, `team`) names the home workspace or organization and the home member list or `users.info` on the manager's token says the user is in the home workspace; from T36b only the first team field given counts ([Who is outside](#who-is-outside)). The check runs on the confirmed copy, never on an event's claim, and never on a bot's post. A made-up user id costs no lookup; a forged event naming a real message the bot can read from the last 15 minutes costs at most one per real sender, cached an hour, and the cost is unbounded only while the home member list can't be read. When the fields say home, only a lookup that says home lets the message go on; any other answer drops it, whatever the event says and whatever is listed, except that a transport error or a rate limit gets the "try again" line. Slash commands, which carry no sender team, rely on Slack running an app's commands only for its own workspace. The workspace an event came through is `authorizations[0].team_id`; an event without one is dropped, never judged by the envelope's `team_id`, and an installation elsewhere is dropped. Envelope fields an owner could sign (`is_ext_shared_channel`, `context_team_id`) are never read. |
 | An outside member runs commands, decides a consent card, links an account, or is DMed | Slack routes `/agent` only for home members; agentd drops any interaction whose sender is outside or has no `user.team_id` before the intake, and runs no command from a manager DM whose sender is outside. The Slack path that opens a DM refuses a user the home check doesn't place in the home workspace, so no link prompt, relink notice, refusal or failure notice reaches one. Refusals reach them as one generic line in the thread, at most once per thread per agent per day, which names no ban; it does show that their organization is listed. Like anyone, they can still get the busy line, posted before routing, and the "try again" line, neither throttled per thread; neither says more than that the agent is busy or Slack failed. |
-| The owner's private work reaches another organization | Cards go to the owner's home DM, never the thread. A card says whether the thread is shared with other organizations, and which, read fresh; a result is withheld if the thread's sharing changed after approval, or can't be read, or its id changed. No turn whose requester is outside, a hop's included, can ask for a private task. An owner-side `agentctl post` into another externally shared conversation is refused. Accepted: sharing a conversation later shows its history, results and posts already in it included, to the new organization, as it shows everything members posted there. |
+| The owner's private work reaches another organization | Cards go to the owner's home DM, never the thread. A card says whether the thread is shared with other organizations, and which, read fresh; a result is withheld if the thread's sharing changed after approval, or can't be read, or its id changed. No turn whose requester is outside, a hop's included, can ask for a private task. An owner-side `agentctl post` into another externally shared conversation is refused when asked for, and isn't posted if, as it goes out after the turn, the conversation is externally shared, its id changed, or its sharing can't be read. Accepted: sharing a conversation later shows its history, results and posts already in it included, to the new organization, as it shows everything members posted there. |
 | Other organizations read what agents say in a shared channel, and their members' messages steer turns | Accepted, as for any channel member: a home member who asks in a shared channel chooses that audience, and outside text reaches only public-side turns, whose sandboxes hold no owner secrets. |
 | A private `G…` channel shared with another organization gets a new id, so the rules naming it stop applying | Agent apps subscribe to `channel_id_changed`. The new id is confirmed with `conversations.info`, and the receiving agent's room rules move to it; nothing else moves, so no other channel's sessions can be joined to this one. |
 
@@ -1809,8 +1809,8 @@ disagrees with the copy is dropped:
   conversation's kind, also gives its sharing: not shared, shared only
   within the organization, or externally shared with `connected_team_ids`.
   The places where sharing guards the owner's work read it again instead of
-  using the cache: a consent card, a private result's delivery and an
-  owner-side post.
+  using the cache: a consent card, a private result's delivery, and an
+  owner-side post when it is asked for and again as it goes out.
 - The sender is looked up as above, never taken as home from the fields
   alone.
 - Whether the sender is outside, and their organization, come from the
@@ -1980,7 +1980,12 @@ see [Deferred work](tasks-plan.md#deferred-work).
   on the owner's side that can post (a private task can only `attach`),
   into another conversation that is externally shared is refused, so a turn
   holding the owner's memory and `shared/` doesn't post into another
-  organization's view unasked. The owner can post there themselves.
+  organization's view unasked. The owner can post there themselves. A post
+  is only queued during the turn and goes out after it, so its sharing is
+  read again, once, as it goes out: one whose conversation is externally
+  shared by then, or whose id changed, or whose sharing can't be read then,
+  isn't posted, and the agent tells the owner in their DM with it, in one
+  line naming the conversation.
 
 ### Hand-offs
 
