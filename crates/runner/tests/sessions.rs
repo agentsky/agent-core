@@ -969,17 +969,37 @@ async fn reset_starts_with_a_new_id() {
 }
 
 #[tokio::test]
-async fn a_refused_resume_reruns_the_turn_with_session_id() {
+async fn a_refused_resume_fails_the_turn_and_the_next_starts_with_session_id() {
     let h = Harness::new(&[Turn::reply("first"), Turn::reply("again")]).await;
     let session = h.thread_session("1.1").await;
     reply(&h.run(session.id, request("one")).await);
     h.manager.stop(session.id).await;
     assert!(!h.manager.is_warm(session.id));
     std::fs::remove_dir_all(projects_dir(&h, &session)).unwrap();
+    let turned_at = h
+        .store
+        .session(session.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_turn_at;
+    assert!(turned_at.is_some());
     h.clear();
     let second = request("two");
-    let report = h.run(session.id, second.clone()).await;
-    assert!(report.reran);
+    let err = h
+        .manager
+        .run_turn(session.id, second.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunnerError::ResumeRefused), "{err}");
+    let stored = h.store.session(session.id).await.unwrap().unwrap();
+    assert!(!stored.resumes(), "{stored:?}");
+    assert_eq!(
+        stored.last_turn_at, turned_at,
+        "the refused exchange isn't recorded as a turn"
+    );
+    let rebuilt = request("two, rebuilt");
+    let report = h.run(session.id, rebuilt.clone()).await;
     assert_eq!(report.process_start, Some(SessionStart::New));
     assert_eq!(
         reply(&report),
@@ -996,11 +1016,11 @@ async fn a_refused_resume_reruns_the_turn_with_session_id() {
             Event::TurnFinished(id, 2, second.turn),
             Event::ProcessStopping(id, 2),
             Event::ProcessStarting(id, CredentialKind::Subscription, 3),
-            Event::TurnStarting(id, 3, second.turn),
-            Event::TurnFinished(id, 3, second.turn),
+            Event::TurnStarting(id, 3, rebuilt.turn),
+            Event::TurnFinished(id, 3, rebuilt.turn),
         ]
     );
-    assert_eq!(h.transcript(&session), ["two"]);
+    assert_eq!(h.transcript(&session), ["two, rebuilt"]);
     let stored = h.store.session(id).await.unwrap().unwrap();
     assert!(stored.started);
 }
@@ -1306,9 +1326,17 @@ async fn a_turn_cut_off_before_its_outcome_was_recorded_resumes_first() {
     let h = Harness::new(&[Turn::reply("one"), Turn::reply("two"), Turn::reply("three")]).await;
     let unknown = h.thread_session("1.1").await;
     assert!(h.store.mark_session_turn_pending(unknown.id).await.unwrap());
+    let err = h
+        .manager
+        .run_turn(unknown.id, request("a"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RunnerError::ResumeRefused),
+        "no transcript: the --resume is refused: {err}"
+    );
     let report = h.run(unknown.id, request("a")).await;
     assert_eq!(reply(&report), "one");
-    assert!(report.reran, "no transcript: the --resume is refused");
     assert_eq!(report.process_start, Some(SessionStart::New));
 
     let read = h.thread_session("2.2").await;
@@ -1318,8 +1346,11 @@ async fn a_turn_cut_off_before_its_outcome_was_recorded_resumes_first() {
     h.store.mark_session_turn_pending(read.id).await.unwrap();
     let report = h.run(read.id, request("c")).await;
     assert_eq!(reply(&report), "two");
-    assert!(!report.reran, "the transcript exists: the --resume works");
-    assert_eq!(report.process_start, Some(SessionStart::Resume));
+    assert_eq!(
+        report.process_start,
+        Some(SessionStart::Resume),
+        "the transcript exists: the --resume works"
+    );
     assert_eq!(h.transcript(&read), ["b", "c"]);
 }
 
@@ -1475,8 +1506,11 @@ async fn a_refusal_shaped_result_from_a_new_process_is_not_a_refused_resume() {
     let session = h.thread_session("1.1").await;
     let report = h.run(session.id, request("hi")).await;
     assert!(report.outcome.resume_refused(), "{report:?}");
-    assert_eq!(report.process_start, Some(SessionStart::New));
-    assert!(!report.reran, "a --session-id start refuses no --resume");
+    assert_eq!(
+        report.process_start,
+        Some(SessionStart::New),
+        "a --session-id start refuses no --resume"
+    );
     assert_eq!(h.process_starts(), 1);
     let stored = h.store.session(session.id).await.unwrap().unwrap();
     assert!(
@@ -1512,12 +1546,17 @@ async fn a_refused_resume_is_caught_on_the_first_turn_sent_to_a_resumed_process(
         h.manager.is_warm(session.id),
         "the resumed process was kept"
     );
-    let report = h.run(session.id, request("two")).await;
-    assert!(report.reran, "{report:?}");
+    let err = h
+        .manager
+        .run_turn(session.id, request("two"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, RunnerError::ResumeRefused), "{err}");
+    let report = h.run(session.id, request("two, rebuilt")).await;
     assert_eq!(report.process_start, Some(SessionStart::New));
     assert_eq!(reply(&report), "first");
     assert_eq!(h.process_starts(), 3);
-    assert_eq!(h.transcript(&session), ["two"]);
+    assert_eq!(h.transcript(&session), ["two, rebuilt"]);
     let stored = h.store.session(session.id).await.unwrap().unwrap();
     assert!(stored.started && !stored.maybe_started, "{stored:?}");
 }

@@ -126,6 +126,12 @@ pub enum RunnerError {
     /// The session was reset, and takes no more turns.
     #[error("the session was reset")]
     SessionReset,
+    /// The CLI refused to resume the session because its transcript is
+    /// gone, so the turn never reached the model. The session's next turn
+    /// starts it afresh with `--session-id` under the same id: build that
+    /// turn's message for an empty transcript.
+    #[error("the session's transcript is gone")]
+    ResumeRefused,
     /// A [`TurnRequest`] doesn't fit its session.
     #[error("invalid turn request: {0}")]
     InvalidRequest(&'static str),
@@ -167,6 +173,10 @@ mod tests {
         assert_eq!(
             RunnerError::SessionReset.to_string(),
             "the session was reset"
+        );
+        assert_eq!(
+            RunnerError::ResumeRefused.to_string(),
+            "the session's transcript is gone"
         );
         assert_eq!(
             RunnerError::InvalidRequest("x").to_string(),

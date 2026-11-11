@@ -11,7 +11,8 @@ use store::{MessageRef, NewMessageRef, Session, Store, StoreError};
 use time::OffsetDateTime;
 
 /// How many thread messages before the turn's own are read to find what
-/// the transcript lacks.
+/// the transcript lacks, and shown to a session that starts with an empty
+/// one.
 pub const HISTORY_LIMIT: usize = 50;
 
 /// A turn message, and the short ids it recorded in its session. It has
@@ -53,13 +54,19 @@ async fn forget(store: &Store, session: SessionId, shown: &[u32]) {
 ///    what it was never shown and didn't post. Those include what people
 ///    said while an earlier turn ran, and what agentd posted as the agent
 ///    in the thread from other sessions, such as a private task's result,
-///    which never entered this session's transcript. A post of the agent's
+///    which never entered this session's transcript. When the session
+///    starts with an empty transcript (it doesn't [`Session::resumes`]),
+///    as after the CLI refused to resume it for want of one, every one of
+///    those messages is shown, rows or not: one the session already has a
+///    row for keeps its short id and isn't recorded again, so forgetting
+///    what this message recorded leaves it alone. A post of the agent's
 ///    bot is marked as from outside the session only when it is attributed
-///    to a turn; the bot's other posts, such as the files a turn uploaded
-///    or agentd's notices, may be this session's. A history that can't be
-///    read is left out.
-/// 2. Such posts from other sessions that the history didn't reach
-///    ([`Store::posted_elsewhere`]), named for `agentctl history`.
+///    to another session; the bot's other posts, such as the files a turn
+///    uploaded or agentd's notices, may be this session's. A history that
+///    can't be read is left out.
+/// 2. Such posts from other sessions that the history didn't reach and
+///    the session has no row for ([`Store::posted_elsewhere`]), named for
+///    `agentctl history`.
 /// 3. Who has spoken in what it shows, and surface hints.
 /// 4. The event's own message, with who asked. Its line breaks are kept,
 ///    and every line after the first is indented, so it can't pass for
@@ -96,18 +103,28 @@ async fn compose(
 ) -> Result<String, StoreError> {
     let thread = &session.thread;
     let mut earlier = Vec::new();
-    for msg in unseen_history(store, surface, session, event).await? {
+    for (msg, known) in unseen_history(store, surface, session, event).await? {
         let msg_ref = msg_ref(thread, &msg);
         let sender = if msg.sender != *bot {
             msg.sender.user.as_str().to_owned()
-        } else if store.posted_message_ref(&msg_ref).await?.is_some() {
+        } else if store
+            .posted_message_ref(&msg_ref)
+            .await?
+            .is_some_and(|posted| posted.session != session.id)
+        {
             "you, outside this session".to_owned()
         } else {
             "you".to_owned()
         };
-        let row = record(store, session, thread, &msg_ref, &msg.sender).await?;
-        shown.push(row.short_id);
-        earlier.push((row.short_id, sender, msg));
+        let short_id = match known {
+            Some(row) => row.short_id,
+            None => {
+                let row = record(store, session, thread, &msg_ref, &msg.sender).await?;
+                shown.push(row.short_id);
+                row.short_id
+            }
+        };
+        earlier.push((short_id, sender, msg));
     }
     let mut posted = Vec::new();
     for row in store
@@ -195,13 +212,15 @@ async fn compose(
 }
 
 /// The thread's last [`HISTORY_LIMIT`] messages before the event that
-/// `session` has no row for, oldest first.
+/// `session`'s transcript lacks, oldest first, each with the session's row
+/// for it if it has one: those the session has no row for, or all of them
+/// when it starts with an empty transcript.
 async fn unseen_history(
     store: &Store,
     surface: &dyn Surface,
     session: &Session,
     event: &InboundEvent,
-) -> Result<Vec<Msg>, StoreError> {
+) -> Result<Vec<(Msg, Option<MessageRef>)>, StoreError> {
     let thread = &session.thread;
     if thread.root.as_ref() == Some(&event.message.id) {
         return Ok(Vec::new());
@@ -220,17 +239,17 @@ async fn unseen_history(
             return Ok(Vec::new());
         }
     };
+    let fresh = !session.resumes();
     let mut unseen = Vec::new();
     for msg in history {
         if msg.id == event.message.id {
             continue;
         }
-        if store
+        let known = store
             .session_message_ref(session.id, &msg_ref(thread, &msg))
-            .await?
-            .is_none()
-        {
-            unseen.push(msg);
+            .await?;
+        if fresh || known.is_none() {
+            unseen.push((msg, known));
         }
     }
     Ok(unseen)

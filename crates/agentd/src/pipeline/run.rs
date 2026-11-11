@@ -119,8 +119,10 @@ pub struct PipelineSettings {
 ///    channel one per thread, rooted at the message when it starts one),
 ///    the turn message built with what the session's transcript lacks, and
 ///    the turn run, with the working emoji on the message until its reply
-///    is delivered. A turn refused with [`RunnerError::SessionReset`] runs
-///    once more, on the session looked up again. What the turn message
+///    is delivered. A turn refused with [`RunnerError::SessionReset`] or
+///    [`RunnerError::ResumeRefused`] runs once more, on the session looked
+///    up again, with its message built again: for the new session, or for
+///    the session's transcript that is now empty. What the turn message
 ///    recorded as shown is forgotten when the turn never reached the model,
 ///    so the next turn shows it again.
 /// 5. **Delivery**, as the agent's bot, in the thread: the directives are
@@ -794,7 +796,9 @@ impl Pipeline {
     }
 
     /// Looks the session up, builds the turn message and runs the turn,
-    /// once more on a session reset in between. What the turn message
+    /// once more, with the message built again, on a session reset in
+    /// between or on the CLI refusing to resume a session whose transcript
+    /// is gone. What the turn message
     /// recorded is forgotten when the turn didn't run, which includes a
     /// process that crashed or timed out before the CLI read the message
     /// (no `init` line): that is [`PipelineError::Unread`].
@@ -856,9 +860,18 @@ impl Pipeline {
                     ) {
                         sessions.stop(session.id).await;
                     }
-                    if matches!(err, RunnerError::SessionReset) && attempt == 1 {
-                        tracing::info!(session = %session.id, "the session was reset before the turn ran; running it on the new one");
-                        continue;
+                    if attempt == 1 {
+                        match err {
+                            RunnerError::SessionReset => {
+                                tracing::info!(session = %session.id, "the session was reset before the turn ran; running it on the new one");
+                                continue;
+                            }
+                            RunnerError::ResumeRefused => {
+                                tracing::info!(session = %session.id, "the session's transcript is gone; running the turn on a fresh one");
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     return Err(err.into());
                 }
@@ -1337,7 +1350,6 @@ mod tests {
             }),
             finished,
             process_start: None,
-            reran: false,
         }
     }
 

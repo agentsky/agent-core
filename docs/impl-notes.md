@@ -4340,7 +4340,10 @@ That refusal also left the session looking unstarted forever: every
 `--resume` gives it again, with `init_seen` false. `TurnOutcome::resume_refused()`
 names it (an error result with that subtype and no `init` line), the
 process is reaped since the CLI exits after it, and the plan's T21 resets
-the session to `--session-id` under the same id and runs the turn again.
+the session to `--session-id` under the same id; the turn fails with
+`RunnerError::ResumeRefused`, and the caller rebuilds its message for the
+empty transcript and runs it again (see "A session whose transcript is gone
+is shown the thread again").
 
 ### A failed write can follow the CLI's answer
 
@@ -4535,7 +4538,7 @@ store before a turn goes to an unstarted session's CLI, and cleared when
 the turn's outcome says what happened (`init_seen`, or a refused
 `--resume`). A session with it set starts its next process with
 `--resume`; if there is no transcript after all the CLI refuses, and the
-plan's rerun with `--session-id` takes over. A `--session-id` start that
+reset to `--session-id` takes over. A `--session-id` start that
 crashes without `init_seen` leaves it set too, so a transcript that
 existed after all is resumed next time.
 
@@ -4878,8 +4881,8 @@ does.
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
 its shape: an `error_during_execution` error result before `system`/`init`.
 Acting on that shape for any process would mark a session unstarted, and
-run its turn again, after a `--session-id` start or a warm process's later
-turn ended that way for some other reason.
+fail its turn as refused, after a `--session-id` start or a warm process's
+later turn ended that way for some other reason.
 
 **Solution.** The runner treats it as a refusal only on the first turn sent
 to a process started with `SessionStart::Resume`. Any other turn with that
@@ -4892,8 +4895,9 @@ that refusal came back as an error result, the turn didn't run again, and
 its message was lost.
 
 If the store fails to mark the session unstarted, the turn fails with
-`RunnerError::Store` instead of running again: the session still reads as
-started, so the second run would `--resume` and be refused again.
+`RunnerError::Store` instead of `RunnerError::ResumeRefused`: the session
+still reads as started, so a rebuilt turn would `--resume` and be refused
+again.
 
 ### What is durable
 
@@ -6066,6 +6070,34 @@ but every line after the first is indented, so none of it starts where a
 form feed, NEL and U+2028 and U+2029 break a line there as `\n` does, since
 the model may read any of them as one; each becomes `\n`. A thread the
 event starts has no history to read.
+
+### A session whose transcript is gone is shown the thread again
+
+**Issue.** When the CLI refused to `--resume` a session for want of a
+transcript, the runner reset the session to `--session-id` and ran the same
+request again. That request's message was built for the transcript that was
+gone: it left out every thread message the session had a row for, its own
+earlier replies and the requests they answered included. The fresh
+transcript started with neither, and every later turn kept leaving them out,
+since their rows were still there.
+
+**Solution.** The runner no longer runs the turn again. It still reaps the
+process and marks the session unstarted, and then fails the turn with
+`RunnerError::ResumeRefused`; `TurnReport::reran` is gone. The pipeline
+treats it like `SessionReset`: what the message recorded is forgotten, and on
+the first attempt the session is looked up again and the message built
+again. A session that doesn't `resumes()` starts with an empty transcript,
+so the builder shows the thread's last 50 messages before the event whether
+or not the session has rows for them. A message with a row keeps its short
+id and isn't recorded again, so only the rows this build added are
+forgotten if the turn fails. A post of the agent's bot is marked as from
+outside the session only when another session's row attributes it, since
+the session's own replies are now shown too. Posts from other sessions past
+the 50 messages that the session already has rows for aren't listed again;
+`agentctl history` reaches them as it reaches the rest of the thread. The
+refused exchange records no turn, and the outbox `turn_finished` returned
+for it is dropped with its staging directory, as on any failed turn. The
+test is `a_session_whose_transcript_is_gone_is_shown_the_thread_again`.
 
 ### Notices have no message ref
 
