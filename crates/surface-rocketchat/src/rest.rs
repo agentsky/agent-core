@@ -1005,7 +1005,8 @@ impl RestClient {
     /// [`SurfaceError::TooLarge`] once it proves larger than `max` bytes, by
     /// its `Content-Length` or while it is read, so a large file costs at
     /// most `max + 1` bytes of memory. A 401 or 403 is
-    /// [`SurfaceError::Forbidden`], a 404 [`SurfaceError::NotFound`].
+    /// [`SurfaceError::Forbidden`], a 404 [`SurfaceError::NotFound`], a
+    /// 502, 503 or 504 [`SurfaceError::Transport`].
     pub async fn download(&self, id: &str, name: &str, max: u64) -> Result<Bytes> {
         let url = self.file_url(&FileRef {
             id: id.to_owned(),
@@ -1040,6 +1041,10 @@ impl RestClient {
                     SurfaceError::Forbidden("file download".into())
                 }
                 StatusCode::NOT_FOUND => SurfaceError::NotFound("file".into()),
+                status if unavailable(status) => SurfaceError::Transport(format!(
+                    "file download failed (HTTP {})",
+                    status.as_u16()
+                )),
                 _ => SurfaceError::Api(format!("file download failed (HTTP {})", status.as_u16())),
             });
         }
@@ -1427,8 +1432,12 @@ fn error_codes(body: &Value, bare: bool) -> impl Iterator<Item = &str> {
 /// - Otherwise 401 is [`SurfaceError::Unauthorized`] (the token was
 ///   rejected), 403 is [`SurfaceError::Forbidden`] and 404 is
 ///   [`SurfaceError::NotFound`], with the first code or the status.
+/// - 502, 503 and 504, a proxy or the server saying it is unavailable, are
+///   [`SurfaceError::Transport`] with the platform's description (truncated)
+///   and code.
 /// - Anything else is [`SurfaceError::Api`] with the platform's description
-///   (truncated) and code.
+///   (truncated) and code. A bare 500 is one: Rocket.Chat answers it for an
+///   exception in the endpoint, which the same call may raise every time.
 pub fn map_error(status: StatusCode, body: Option<&Value>) -> SurfaceError {
     let bare = status != StatusCode::UNAUTHORIZED;
     let codes: Vec<&str> = body
@@ -1449,8 +1458,18 @@ pub fn map_error(status: StatusCode, body: Option<&Value>) -> SurfaceError {
         StatusCode::UNAUTHORIZED => SurfaceError::Unauthorized,
         StatusCode::FORBIDDEN => SurfaceError::Forbidden(first_code()),
         StatusCode::NOT_FOUND => SurfaceError::NotFound(first_code()),
+        status if unavailable(status) => SurfaceError::Transport(describe(status, body)),
         _ => SurfaceError::Api(describe(status, body)),
     }
+}
+
+/// Whether `status` says the server is unavailable rather than that the
+/// call failed: a bad gateway, an unavailable service or a gateway timeout.
+fn unavailable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
 }
 
 /// The platform's description of a failure, with its code if the
@@ -1827,8 +1846,23 @@ mod tests {
             SurfaceError::Api("Something broke".into())
         );
         assert_eq!(
-            map_error(StatusCode::BAD_GATEWAY, None),
-            SurfaceError::Api("HTTP 502".into())
+            map_error(StatusCode::INTERNAL_SERVER_ERROR, None),
+            SurfaceError::Api("HTTP 500".into())
+        );
+        for status in [
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            assert_eq!(
+                map_error(status, None),
+                SurfaceError::Transport(format!("HTTP {}", status.as_u16()))
+            );
+        }
+        let body = json!({ "success": false, "error": "upstream down" });
+        assert_eq!(
+            map_error(StatusCode::SERVICE_UNAVAILABLE, Some(&body)),
+            SurfaceError::Transport("upstream down".into())
         );
     }
 
