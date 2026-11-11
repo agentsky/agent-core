@@ -338,7 +338,7 @@ impl Store {
         in_session(&mut conn, session, msg).await
     }
 
-    /// Whether `session` has recorded any message.
+    /// Whether `session` has any `message_refs` row.
     ///
     /// # Errors
     ///
