@@ -485,7 +485,7 @@ async fn user_by_username_fails_when_the_server_does() {
         .await;
     assert!(matches!(
         manager(&fake).user_by_username("alice").await,
-        Err(SurfaceError::Api(_))
+        Err(SurfaceError::Transport(_))
     ));
 }
 
@@ -580,6 +580,17 @@ async fn download_errors_map_by_status() {
     assert_eq!(
         client.download("f2", "broken.md", 10).await,
         Err(SurfaceError::Api("file download failed (HTTP 500)".into()))
+    );
+    Mock::given(path("/file-upload/f3/later.md"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount(fake.server())
+        .await;
+    assert_eq!(
+        client.download("f3", "later.md", 10).await,
+        Err(SurfaceError::Transport(
+            "file download failed (HTTP 503)".into()
+        ))
     );
 }
 
@@ -1390,7 +1401,7 @@ async fn an_unknown_endpoint_is_not_found() {
 }
 
 #[tokio::test]
-async fn an_html_error_page_is_an_api_error_with_the_status() {
+async fn a_gateways_error_page_is_a_transport_error_with_the_status() {
     let fake = FakeRest::start().await;
     Mock::given(path("/api/v1/me"))
         .respond_with(ResponseTemplate::new(502).set_body_string("<html>Bad Gateway</html>"))
@@ -1399,7 +1410,7 @@ async fn an_html_error_page_is_an_api_error_with_the_status() {
         .await;
     assert_eq!(
         manager(&fake).me().await,
-        Err(SurfaceError::Api("HTTP 502".into()))
+        Err(SurfaceError::Transport("HTTP 502".into()))
     );
 }
 
@@ -1581,6 +1592,32 @@ async fn subscriptions_list_the_rooms_the_user_is_in() {
     assert_eq!(rooms[0].name.as_deref(), Some("general"));
     assert_eq!(rooms[0].id, format!("GENERAL{}", helper.user_id()));
     let requests = fake.requests("subscriptions.get").await;
+    assert_eq!(
+        header(&requests[0], "x-user-id"),
+        Some(helper.user_id().as_str())
+    );
+}
+
+#[tokio::test]
+async fn one_subscription_is_the_users_own_or_none() {
+    let fake = FakeRest::start().await;
+    let client = manager(&fake);
+    let helper = bot(&client, "helper").await;
+    fake.add_room("GENERAL", "c", "general");
+    fake.add_room("OTHER", "c", "other");
+    fake.add_member("GENERAL", helper.user_id().as_str());
+    let found = helper
+        .subscription(&"GENERAL".into())
+        .await
+        .unwrap()
+        .expect("the helper is in GENERAL");
+    assert_eq!(found.room.as_str(), "GENERAL");
+    assert_eq!(found.room_type, RoomType::Channel);
+    assert_eq!(found.id, format!("GENERAL{}", helper.user_id()));
+    assert_eq!(helper.subscription(&"OTHER".into()).await.unwrap(), None);
+    assert_eq!(helper.subscription(&"MISSING".into()).await.unwrap(), None);
+    let requests = fake.requests("subscriptions.getOne").await;
+    assert_eq!(requests[0].url.query(), Some("roomId=GENERAL"));
     assert_eq!(
         header(&requests[0], "x-user-id"),
         Some(helper.user_id().as_str())

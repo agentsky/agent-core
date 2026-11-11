@@ -1271,7 +1271,8 @@ Deliverables:
   and retries deactivations that failed
   ([impl-notes](impl-notes.md#connections-follow-the-store),
   [impl-notes](impl-notes.md#a-creation-can-stop-halfway)).
-- Until T23, what isn't a command goes to `Acknowledge`: each active agent a
+- Until T23, and from then on when agentd runs no turns (no `[sandbox]`),
+  what isn't a command goes to `Acknowledge`: each active agent a
   person's message addresses reacts with `:eyes:`
   ([impl-notes](impl-notes.md#before-turns-a-bot-reacts-instead-of-replying)).
 - A realtime connection is `RocketChatSurface::events` (T12). agentd builds
@@ -1870,9 +1871,11 @@ Deliverables:
   - A turn whose outcome is `TurnOutcome::resume_refused()` on a process
     the turn started with `SessionStart::Resume` (a `--resume` of a session
     with no transcript) resets the session to `--session-id`:
-    the row is marked not started and the turn runs again, once, on a new
-    process with `SessionStart::New` and the same id, since the CLI never
-    read the message.
+    the row is marked not started and the turn fails with
+    `RunnerError::ResumeRefused`, since the CLI never read the message and
+    the message was built for a transcript that is gone. The caller builds
+    it again for an empty transcript, and the next turn starts a new
+    process with `SessionStart::New` and the same id.
   - `reset(session)`: mints a new id and marks the old row reset, so the next
     turn uses `--session-id` with a fresh id.
   - `run_turn(session, TurnRequest) -> TurnReport` (the `TurnOutcome` and
@@ -1956,8 +1959,8 @@ Acceptance:
     recycles the container and clears the files; another party's turn
     gets a new container even when the record names it.
   - Reset starts with a new id.
-  - A `--resume` the CLI refuses for want of a transcript reruns the turn
-    with `--session-id`.
+  - A `--resume` the CLI refuses for want of a transcript fails the turn
+    with `ResumeRefused`, and the next turn starts with `--session-id`.
   - A recording `TurnHooks` double sees the calls in order for each turn:
     `process_starting` once per process, `turn_starting` and `turn_finished`
     per turn, and `process_stopping` before every stop and after a killed
@@ -2151,8 +2154,11 @@ Deliverables:
      `SessionManager::run_turn`. `run_turn` returns
      `RunnerError::SessionReset` when a reset or a scope-change replacement
      lands between `lookup_or_create` and the turn reaching the front of the
-     session's queue. The pipeline then calls `lookup_or_create` again and
-     retries the turn once on the session it returns.
+     session's queue, and `RunnerError::ResumeRefused` when the CLI refused
+     to resume a session whose transcript is gone. The pipeline then calls
+     `lookup_or_create` again, builds the message again and retries the
+     turn on the session it returns, at most once for each of the two
+     causes, so a turn takes at most three attempts.
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
@@ -2173,6 +2179,15 @@ Deliverables:
 - Turn message builder:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
+  - For a session that starts with an empty transcript, as after the CLI
+    refused to resume it, the thread's last 50 messages whether or not the
+    session has `message_refs` rows for them; a message with a row keeps its
+    short id. When the thread has messages older than those 50, a line
+    says to read them with `agentctl history --before` the oldest shown.
+    If reading the thread fails with a rate limit, an unreachable platform
+    or one that answers it is unavailable, and the session already has
+    rows, the turn fails before the CLI reads it, so the next turn tries
+    again; any other failure goes on without the history.
   - Messages agentd posted for this agent in this thread outside this session,
     found in `message_refs` by agent, thread (`surface`, `team_id`,
     `conversation`, `thread_root`) and a different `session_id`, so results
@@ -2377,7 +2392,8 @@ Deliverables:
   `cost_usd` holds the restored total too. This task takes it off, from that
   line read without following links and with its size capped, or from a
   total the runner keeps in `sessions` when a process exits cleanly
-  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)).
+  ([impl-notes](impl-notes.md#a-resumed-process-restores-the-sessions-total-cost)),
+  and makes `fake-claude` restore the total as the real CLI does.
   `/agent me` shows today's and this month's turns and tokens.
 - `/agent limits <name> turns=N/day hops=N`, enforced in the router through
   `RouterView::policy`: past the daily cap, reply once per thread per day.
@@ -2927,23 +2943,30 @@ Not scheduled. Each needs a decision before it becomes a task.
   first, since refusing a path the CLI needs breaks turns. Methods are
   already limited: T18 forwards only `GET`, `HEAD`, `POST`, `PUT`, `PATCH`,
   `DELETE` and `OPTIONS`.
-- **Killing leftover processes at turn end.** T18 unpoints the placeholder
-  when a turn ends, so a background process the model left running can't
-  spend credentials between turns, and T21 recycles the session's container
-  when the party changes, which ends every process running in it
+- **Processes a turn leaves running.** T18 unpoints the placeholder when a
+  turn ends, so a background process the model left running can't spend
+  credentials between turns, and T21 recycles the session's container when
+  the party changes, which ends every process running in it
   ([impl-notes](impl-notes.md#another-partys-turn-gets-a-new-container)).
-  A leftover can still spend the credentials of its own party's later
-  turns while they run (a requester's, or a `requester_groups` group's);
-  only killing the processes a turn leaves behind in the container when it
-  ends removes that. When the party changes T21 also clears the session
-  directory's stray entries, `home/`, `tmp/` and everything in `claude/` but
-  the transcript file and its directory (a `.bashrc` the Bash tool's shells
-  source, a `CLAUDE.md` the CLI loads as user memory). Files still outlive
-  the container in `work/` and `shared/`, and in the kept transcript files:
-  a turn can leave something there that runs or instructs code in a later
-  requester's process. During a blue-green overlap of two agentd
-  instances, the other instance's warm container of a session, and what is
-  left running in it, can also write to the session's files after a clear.
+  What remains:
+  - A process left behind can still spend the credentials of its own
+    party's later turns while they run (a requester's, or a
+    `requester_groups` group's), and act through `agentctl` on them, and
+    it can use the egress allowlist between turns. Killing what a turn
+    leaves behind has no clean boundary: the CLI stays running between
+    turns, the Bash tool's background shells are its children, a job
+    started with `&` is reparented to the container's init once its shell
+    exits, and the Docker sandbox kills a process by its pid alone.
+  - Files outlive the container in part. When the party changes T21
+    clears the session directory's stray entries, `home/`, `tmp/` and
+    everything in `claude/` but the transcript file and its directory (a
+    `.bashrc` the Bash tool's shells source, a `CLAUDE.md` the CLI loads
+    as user memory). What a turn leaves in `work/` or `shared/`, such as
+    a git hook, or in the kept transcript files still runs or instructs
+    code in a later requester's process. During a blue-green overlap of
+    two agentd instances, the other instance's warm container of a
+    session, and what is left running in it, can also write to the
+    session's files after a clear.
 - **Private hosts in the egress allowlist.** T19 denies private addresses
   whatever rule allowed the host, so a Git server on an office network is
   out of reach. A per-rule grant, a configured host with the private
@@ -2957,6 +2980,17 @@ Not scheduled. Each needs a decision before it becomes a task.
 - **Steering** a running turn with a new message, instead of queueing it.
 - **Switching models over the stream-json control channel** instead of
   restarting the process.
+- **A refusal in the thread when a link read fails.** `StoreView::load`
+  (T23) propagates a failed `claude_links` read, so the whole load aborts:
+  nothing runs and a log line records the store error, but the thread gets
+  no answer. Having the view's link lookup (`is_linked`, `link_state` from
+  T26) answer `None` for a failed read, refused as `PolicyUnavailable` like
+  `member_for`, `is_banned` and `policy`, would answer the thread instead.
+  It changes the `RouterView` interface (T22) and its implementations in
+  T23 and T26 for a reply only, since the request already fails closed. A
+  failed read must never count as "not linked": from T26 a non-owner's turn
+  would then run on the community key when one is configured, and a broken
+  link would skip the relink prompt.
 - **Per-scope container cap tuning** from real usage (T21 sets a default).
 - **Fairness at the per-scope cap**, a follow-up to T21's pool. A session
   keeps its container while it has turns, so a busy session can hold its

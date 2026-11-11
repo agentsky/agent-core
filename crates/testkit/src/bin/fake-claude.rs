@@ -227,6 +227,9 @@ async fn run(args: Args) -> Result<ExitCode, String> {
         total_cost_usd: Cell::new(0.0),
     };
 
+    if session.crashes_at_start() {
+        std::process::exit(CRASH_EXIT_CODE);
+    }
     let mut lines = AsyncBufReader::new(tokio::io::stdin()).lines();
     let mut failed = false;
     while let Some(line) = lines
@@ -277,10 +280,7 @@ impl Session {
             let text = format!("API Error: {}", err.message);
             return self.fail(&text, err.kind, err.status, started);
         }
-        let turns: Vec<Turn> = std::fs::read(&self.script)
-            .map_err(|err| err.to_string())
-            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()))
-            .map_err(|err| format!("reading the script {}: {err}", self.script.display()))?;
+        let turns = self.script_turns()?;
         let Some(turn) = turns.get(index) else {
             let text = format!("fake-claude: the script has no turn {index}");
             return self.fail(&text, "invalid_request", None, started);
@@ -319,6 +319,23 @@ impl Session {
         self.emit_reply(message)?;
         self.emit_result(&turn.reply, false, None, "end_turn", started)?;
         Ok(false)
+    }
+
+    fn script_turns(&self) -> Result<Vec<Turn>, String> {
+        std::fs::read(&self.script)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| serde_json::from_slice(&bytes).map_err(|err| err.to_string()))
+            .map_err(|err| format!("reading the script {}: {err}", self.script.display()))
+    }
+
+    /// Whether the script turn the next message would play has
+    /// `crash_at_start`. A script or transcript that can't be read is left
+    /// to that turn to report.
+    fn crashes_at_start(&self) -> bool {
+        let (Ok(index), Ok(turns)) = (self.user_turns(), self.script_turns()) else {
+            return false;
+        };
+        turns.get(index).is_some_and(|turn| turn.crash_at_start)
     }
 
     fn user_turns(&self) -> Result<usize, String> {

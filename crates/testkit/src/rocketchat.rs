@@ -567,6 +567,27 @@ impl Respond for Router {
                     .collect();
                 ok(json!({ "update": update, "remove": [] }))
             }
+            (false, ["subscriptions.getOne"]) => {
+                let id = param("roomId");
+                if id.is_empty() {
+                    return failure("must have required property 'roomId'");
+                }
+                let subscription = state
+                    .rooms
+                    .get(&id)
+                    .filter(|room| room.members.contains(&caller))
+                    .map_or(Value::Null, |room| {
+                        json!({
+                            "_id": format!("{id}{caller}"),
+                            "rid": id,
+                            "t": room.t,
+                            "name": room.name.clone().unwrap_or_default(),
+                            "u": { "_id": caller },
+                            "open": true,
+                        })
+                    });
+                ok(json!({ "subscription": subscription }))
+            }
             (true, ["logout"]) => {
                 let token = header(request, "x-auth-token");
                 state.tokens.remove(&token);

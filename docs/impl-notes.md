@@ -4023,15 +4023,15 @@ T21 recycles the session's container when the party changes, which ends
 every process a turn left running
 ([T21](#another-partys-turn-gets-a-new-container)), so a background
 process left from turn N spends only the credentials of its own party's
-later turns while they run (a requester's, or a configured group's). Only
-killing the processes a turn leaves behind when it ends removes that. Some
-files outlive the container, though. When the party changes T21 clears the
-session directory's stray entries, `home/`, `tmp/`, and everything in
-`claude/` but the transcript file and its directory, but what a turn leaves
-in the session's `work/`, in `shared/`, or in the transcript can run or
-instruct code in a later requester's process, which then spends that
-requester's credential.
-The plan's Deferred work has an entry for both.
+later turns while they run (a requester's, or a configured group's). Killing
+what a turn leaves behind has no clean boundary. Some files outlive the
+container, though. When the party changes T21 clears the session
+directory's stray entries, `home/`, `tmp/`, and everything in `claude/` but
+the transcript file and its directory, but what a turn leaves in the
+session's `work/`, in `shared/`, or in the transcript can run or instruct
+code in a later requester's process, which then spends that requester's
+credential. The plan's Deferred work ("Processes a turn leaves running")
+records both.
 
 ### Headers the proxy changes besides the credential
 
@@ -4270,9 +4270,11 @@ front; a wildcard over names anyone can register (`*.ngrok.io`) lets a
 sandbox pick any public address; and egress is gated on a live placeholder
 at the source address, not on a running turn, so a process left from an
 earlier turn can use the allowlist between turns (the plan's deferred
-"Killing leftover processes" entry covers that). Resolving the name with a
-trailing dot also skips `/etc/hosts` on glibc, so an operator can't pin an
-allowed host to a fixed address there; pin it in DNS instead.
+"Processes a turn leaves running" entry records it; T21 recycles the
+container on a change of party, not at turn end, so the process keeps it
+until the container goes). Resolving the name with a trailing dot also
+skips `/etc/hosts` on glibc, so an operator can't pin an allowed host to a
+fixed address there; pin it in DNS instead.
 
 ### Log lines don't name the host
 
@@ -4363,7 +4365,10 @@ That refusal also left the session looking unstarted forever: every
 `--resume` gives it again, with `init_seen` false. `TurnOutcome::resume_refused()`
 names it (an error result with that subtype and no `init` line), the
 process is reaped since the CLI exits after it, and the plan's T21 resets
-the session to `--session-id` under the same id and runs the turn again.
+the session to `--session-id` under the same id; the turn fails with
+`RunnerError::ResumeRefused`, and the caller rebuilds its message for the
+empty transcript and runs it again (see "A session whose transcript is gone
+is shown the thread again").
 
 ### A failed write can follow the CLI's answer
 
@@ -4558,7 +4563,7 @@ store before a turn goes to an unstarted session's CLI, and cleared when
 the turn's outcome says what happened (`init_seen`, or a refused
 `--resume`). A session with it set starts its next process with
 `--resume`; if there is no transcript after all the CLI refuses, and the
-plan's rerun with `--session-id` takes over. A `--session-id` start that
+reset to `--session-id` takes over. A `--session-id` start that
 crashes without `init_seen` leaves it set too, so a transcript that
 existed after all is resumed next time.
 
@@ -4671,7 +4676,7 @@ in a later requester's process: a `home/.bashrc` the Bash tool's shells source,
 a `claude/CLAUDE.md` the CLI loads as user memory, a script or git hook in
 `work/` or `shared/`, or text in the transcript. A leftover process can also
 still use its own party's later turns, and the egress allowlist between
-turns. The plan's Deferred work ("Killing leftover processes at turn end")
+turns. The plan's Deferred work ("Processes a turn leaves running")
 records both; the next note clears the session's files.
 
 ### A change of party clears the session's files
@@ -4901,8 +4906,8 @@ does.
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
 its shape: an `error_during_execution` error result before `system`/`init`.
 Acting on that shape for any process would mark a session unstarted, and
-run its turn again, after a `--session-id` start or a warm process's later
-turn ended that way for some other reason.
+fail its turn as refused, after a `--session-id` start or a warm process's
+later turn ended that way for some other reason.
 
 **Solution.** The runner treats it as a refusal only on the first turn sent
 to a process started with `SessionStart::Resume`. Any other turn with that
@@ -4915,8 +4920,9 @@ that refusal came back as an error result, the turn didn't run again, and
 its message was lost.
 
 If the store fails to mark the session unstarted, the turn fails with
-`RunnerError::Store` instead of running again: the session still reads as
-started, so the second run would `--resume` and be refused again.
+`RunnerError::Store` instead of `RunnerError::ResumeRefused`: the session
+still reads as started, so a rebuilt turn would `--resume` and be refused
+again.
 
 ### What is durable
 
@@ -5884,8 +5890,8 @@ placeholder, and the test asserts the read-only root, the transcript at
 `$CLAUDE_CONFIG_DIR/projects/<id>/<id>.jsonl` holding both turns, a
 `--resume` start for the second, and that every request the fake saw came
 through the proxy with the swapped key. On CI the sandbox runs as the test
-process's own uid, which has no entry in the image's `/etc/passwd`;
-locally, as root, it ran as 10001.
+process's own uid, which has no entry in the image's `/etc/passwd`, and the
+CLI ran there all the same; locally, as root, it ran as 10001.
 
 ### The native CLI honors `NO_PROXY`
 
@@ -5972,6 +5978,11 @@ shutdown skips it, since the time is spent and a late stop would race the
 store's close, and a second signal during it cuts it short; `reap_orphans`
 at the next start stops what is left either way.
 
+With T23b's pipeline, `Server::run` reaches it through
+`Pipeline::stop_sessions`, once the turns and then the listeners have
+drained in time and before the pipeline is dropped. Turns cut short,
+in-flight work dropped, or a drain that ends with no time left skip it.
+
 A stop cut short, by the timeout or a second signal, still races the
 store's close for the sessions it had begun: `stop` runs each session's
 release in a task of its own, which dropping `stop_all` doesn't end. Those
@@ -6013,3 +6024,401 @@ over the store.
 answers `NotConfigured`, so a placeholder pointed at the community key gets
 401 from the proxy. The router never picks the community key before T26
 either, since `community_key_configured` answers false until then.
+
+### Surfaces take reactions back and say where the bot may post
+
+**Issue.** The working indicator on Rocket.Chat is a reaction put up at
+turn start and taken off at the end, but `Surface` could only add one.
+And a reply there is a `chat.postMessage`, which joins the poster to a
+public channel it isn't in, while Rocket.Chat delivers a message once for
+every bot in the room, so a mention of an agent that isn't in the room can
+arrive through another bot's connection (T14's note). The pipeline had no
+way to tell before it ran the turn.
+
+**Solution.** `Surface` gains `unreact` (Rocket.Chat's `chat.react` with
+`shouldReact: false`, Slack's `reactions.remove`) and `can_post`. On
+Rocket.Chat `can_post` asks `subscriptions.getOne?roomId=` (whose answer
+is `{"subscription": null}` for a room the user isn't in, per
+`@rocket.chat/rest-typings`) every time. A first version trusted a listing
+of `subscriptions.get` for a minute, and a bot removed from a room in that
+minute posted there and was added back by the post; asking room by room
+also spares the full listing, and finds a DM the manager bot just opened.
+`post` and `upload` refuse a
+room the bot isn't in with `SurfaceError::Forbidden`, which also gives
+agentctl's owner-side posts the refusal T15 left to the surface. Slack
+never joins a poster to a conversation and refuses the post itself
+(`not_in_channel`), so its `can_post` only checks the workspace. The
+pipeline asks `can_post` before it runs a turn, so an agent whose bot isn't
+in the room neither answers nor spends a turn. `MockSurface` records
+`unreact` and has `keep_out_of` for a conversation the bot isn't in. The
+design's trait is updated.
+
+### The pipeline takes `Acknowledge`'s place only with turns
+
+**Issue.** The plan has the pipeline replace T14's `Acknowledge` as every
+Rocket.Chat connection's onward sender, but without `[sandbox]` agentd runs
+no turns, and T14's tests watch for the `:eyes:` reaction.
+
+**Solution.** `Server::run` passes messages to the pipeline when it has
+`Turns` and to `Acknowledge` otherwise, so an agentd without sandboxes
+still shows which bot a mention reached. The plan's T14 bullet says so.
+
+### Short ids are `#` and a number
+
+**Issue.** T15 accepts platform message ids, and T23 resolves the short
+ids the turn message shows. A bare number would be ambiguous: nothing
+stops a platform id from being all digits, and T15's own tests use `1`,
+`2` and `3` as Slack-style ids.
+
+**Solution.** The turn message shows `[#7]`, and `agentctl react` and
+`agentctl history --before` take `#7`: `#` and one to nine digits, which no
+platform id starts with, resolved in the calling token's session through
+`Store::message_ref_by_short_id`. A short id of another conversation is
+refused as `react`'s rule refuses any, and `--before` must name a message
+in the turn's conversation. A short id the session doesn't have is
+`not_found`. Anything else is read as a platform id, as before.
+
+### The turn message shows what the session has no row for
+
+**Issue.** "Thread messages since the agent's last reply" read as the
+agent's bot's last message in the history. But a private task's result is
+posted as the same bot from another session, and would then count as the
+agent's reply, hiding both the result and what came before it from the
+channel session. A first version started after the last message the
+session itself posted instead, and that still hid what people said while a
+turn ran: such a message comes before the turn's reply in the thread, so
+the next turn skipped it. It also recorded what it showed before the turn
+ran, so a turn that failed before reaching the model hid its own request
+from every later turn.
+
+**Solution.** The builder reads up to 50 messages of the thread before the
+event and shows every one the session has no row for: a person's message,
+said before or during an earlier turn, or the agent's own post from outside
+the session, marked as such when it is attributed to another session's turn
+(see the next note for the bot's posts that aren't). The session's own
+replies and what it was shown have rows and are left out, unless the session
+starts with an empty transcript (see the next note). Each message shown is
+recorded in the session, which gives it its short id and keeps it out of the
+next turn; the builder returns the short ids it recorded, and the pipeline
+deletes those rows (`Store::forget_message_refs`, inbound rows only) when
+`run_turn` fails, which covers every failure before the CLI read the
+message, a `SessionReset` included, so the next turn shows them again. A
+failed write the CLI still read would be shown twice, which is better than
+never. Building that fails halfway forgets what it recorded too. Posts from
+other sessions that the 50 messages didn't reach come from
+`Store::posted_elsewhere`, listed by short id for `agentctl history`, since
+`message_refs` keeps no text. The event's own message is shown last, with
+the requester when it isn't the sender (a hop). Message text is kept to one
+line in the context block, so a message can't forge its structure; the
+event's own text keeps its line breaks, since a request often holds code,
+but every line after the first is indented, so none of it starts where a
+`[#N] name:` entry or a block would. A carriage return, a vertical tab, a
+form feed, NEL and U+2028 and U+2029 break a line there as `\n` does, since
+the model may read any of them as one; each becomes `\n`. A thread the event
+starts has no history to read.
+
+### A session whose transcript is gone is shown the thread again
+
+**Issue.** When the CLI refused to `--resume` a session for want of a
+transcript, the runner reset the session to `--session-id` and ran the same
+request again. That request's message was built for the transcript that was
+gone: it left out every thread message the session had a row for, its own
+earlier replies and the requests they answered included. The fresh
+transcript started with neither, and every later turn kept leaving them out,
+since their rows were still there.
+
+**Solution.** The runner no longer runs the turn again. It still reaps the
+process and marks the session unstarted, and then fails the turn with
+`RunnerError::ResumeRefused`; `TurnReport::reran` is gone. The pipeline
+treats it like `SessionReset`: what the message recorded is forgotten, the
+session is looked up again and the message built again. Each of the two
+causes is retried at most once, so a turn takes at most three attempts: a
+reset that lands on the session between a refusal and its retry, as a queued
+reset can once the refusal frees the session's queue, is still retried on
+the replacement. A session that doesn't `resumes()` starts with an empty
+transcript, so the builder shows the thread's last 50 messages before the
+event whether or not the session has rows for them. A message with a row
+keeps its short id and isn't recorded again, so only the rows this build
+added are forgotten if the turn fails. A post of the agent's bot is marked
+as from outside the session only when another session's row attributes it,
+since the session's own replies are now shown too. The builder reads 51
+messages; when it gets all 51, the thread has more than the 50 shown, and a
+line points to `agentctl history --before` the oldest one shown. Review
+found that judging this from the 50 alone, by whether the oldest is the
+thread's root, showed the line where nothing older existed: in a thread
+when Slack leaves out a root that was deleted or has no sender
+(`a_thread_whose_history_leaves_out_its_root_has_nothing_older_to_point_to`),
+and in a DM or at the top level, which has no root, whenever exactly 50
+came back (`dms_and_channels_use_their_own_sessions_and_volumes` checks 50
+and 51). Rocket.Chat drops system messages after fetching, so it can return
+fewer than 51 though older messages exist, and the line is then missed, as
+it was before. Posts from other sessions past the 50 messages that the
+session already has rows for aren't listed again; `agentctl history`
+reaches them as it reaches the rest of the thread. The refused exchange
+records no turn, and the outbox `turn_finished` returned for it is dropped
+with its staging directory, as on any failed turn. The tests are
+`a_session_whose_transcript_is_gone_is_shown_the_thread_again` and
+`a_reset_after_a_refused_resume_is_retried_on_the_replacement`.
+
+A history read that fails used to leave the history out. For a session that
+starts with an empty transcript and already has rows, that would lose the
+earlier messages for good: the `--session-id` turn starts the transcript,
+and their rows keep them out of every later turn. So when the read failed in
+a way a later one may not, a rate limit or an unreachable platform
+(`SurfaceError::RateLimited` or `Transport`), building fails there with the
+surface's error (`Store::has_message_refs` tells whether the session has
+rows), the turn posts `FAILED_TEXT` before any CLI reads it, and the session
+stays unstarted for the next turn to try again. Any other error, such as a
+room type Rocket.Chat has no history for, a missing scope, a channel the bot
+isn't in or a revoked token, would fail every later read too, and failing on
+it would leave the thread unanswered until a reset; the turn goes on without
+the history then, with a warning, and the earlier messages are lost to the
+new transcript. `SurfaceError::Api` counts as lasting, since it can't tell
+an outage from a refusal. A resuming session, or a fresh one with no rows,
+still goes without the history on any error, since nothing is lost. The
+tests are
+`a_failed_history_read_for_a_session_whose_transcript_is_gone_fails_the_turn`
+and
+`a_lasting_history_error_for_a_session_whose_transcript_is_gone_goes_on_without_it`.
+
+Review found that a platform restart read as lasting: both surfaces mapped
+an HTTP 5xx without an error code to `Api("HTTP 503")`, and Slack its
+`internal_error`, `service_unavailable`, `fatal_error` and
+`request_timeout` codes to `Api` too, so the turn went on without the
+history and the earlier messages were lost for good. A 5xx says the
+platform, or a proxy in front of it, is unavailable, not that it refused
+the call, so it is now `Transport`, which `SurfaceError` documents as a
+platform that couldn't be reached or said it couldn't answer this time. On
+Slack that is any 5xx, from the Web API, a `response_url`, a file download
+or an upload URL. The status is checked before the body is parsed, so a 5xx
+is `Transport` whatever code it carries, and a proxy's
+`{"ok":false,"error":"Service Unavailable"}` doesn't read as lasting. The
+four codes in `TRANSIENT_CODES` are `Transport` too: `fatal_error` and
+`internal_error`, after which the call may have partly taken effect,
+`service_unavailable`, and `request_timeout`, Slack's word for POST data it
+got missing or truncated. A turn that fails on one is retried by the next
+message, while going on without the history loses it. On Rocket.Chat it is
+502, 503 and 504, from the REST API or a file download. A bare 500 stays
+`Api` there: Rocket.Chat answers it for an exception in the endpoint, which
+the same call may raise every time. Neither surface's client retries
+`Transport`; only a 429 is retried, so no call is repeated that wasn't
+before.
+
+The runner frees the session's queue when it returns `ResumeRefused`, so
+another turn could run on the session before the rebuilt one; the pipeline
+never lets it, since an agent's turns in a thread run one at a time in its
+lane, and the lane's next turn waits for this one's retry.
+
+### Notices have no message ref
+
+**Issue.** `message_refs` rows belong to a session, and a refused message
+starts none. A turn that failed before reaching the model has a session,
+but a row with `agent_id` set would attribute the notice to a turn that
+never ran.
+
+**Solution.** agentd's own notices are posted without a row: a refusal,
+a failure before the turn reached the model (a second `SessionReset`
+included), the busy line, the notice that part of a reply was lost, and
+the one a shutdown posts. Nothing reads one: no turn is billed for it, and
+a reply in its thread replies to the thread's root, not to the notice. A
+turn's own failure message (a usage limit, a login that expired, a crash, a
+timeout) comes from a turn that ran, and is recorded as its reply. A crash
+or timeout before the CLI printed `init` is not one: the CLI never read the
+message, so it counts as a failure before the turn reached the model. What
+its turn message recorded is forgotten, so the next turn shows the request
+again, and its notice has no row. `fake-claude`'s `Turn::crash_at_start`
+plays that crash.
+
+The files a turn uploads have no row either: `Surface::upload` returns no
+message, and Slack's `files.completeUploadExternal` doesn't say which
+message shares the files, so the trait wasn't changed for Rocket.Chat alone.
+An attributed upload would also be a second message of one turn that another
+agent's thread could answer. The next turn then shows a notice or an upload
+of the agent's bot as `you`, and only a post attributed to another session
+as `you, outside this session`, since an unattributed one may be the
+session's own. The attribution of an agent's post is waited for only when
+the router reads it (see "An agent's post can arrive before its
+attribution"), so an upload, which mentions no one, holds up no other
+agent's lane.
+
+### `SurfaceLookup` is asynchronous, and the pipeline posts through it
+
+**Issue.** T15's `SurfaceLookup` was synchronous, but finding an agent's
+surface means reading its binding and token from the store.
+
+**Solution.** It is an `async_trait` now, and `StoreSurfaces` implements
+it: each agent's active binding on the conversation's surface and team,
+with a `RocketChatSurface` built from the manager's configuration and the
+bot's token, or a `SlackSurface` over the manager app's `TeamDirectory`,
+kept per binding. Each Slack lookup also gives the directory the
+workspace's active agents' bot users with `set_managed_bots`. `App` builds
+it and hands the same lookup to the agentctl API and the pipeline; tests
+pass their own through `App::with_surfaces`. Slack agents' messages still
+reach no pipeline until T31 routes them, as T30's note says, but their
+replies would already go out through this lookup.
+
+### Each agent answers a thread's messages in order, in the pipeline's tasks
+
+**Issue.** A turn takes minutes, and a Rocket.Chat connection hands each
+message to its onward sender and waits. A first version spawned a task per
+message and per candidate: two messages in one thread could reach the
+session's queue in either order, and since each built its turn message
+before queueing, the later one could show the earlier as history and the
+earlier then run too, answered twice. Nothing bounded the tasks, and
+`Server::run` neither waited for them nor stopped them: a shutdown returned
+at once mid-turn, and the late reply was posted with the store already
+closed.
+
+**Solution.** The sink looks the candidates up and queues the message for
+each in a lane per agent and thread, whose task answers its messages one at
+a time in arrival order, so the turn message is built only once the turn
+before it has delivered. A lane holds at most 8 waiting messages, and the
+pipeline at most 64 waiting or running; a person's message past either gets
+one line in its thread saying the agent is busy, posted from the sink,
+which also slows the connection down. A bot's message gets none, whether
+the surface flags the bot or agentd knows it as an agent's or the manager
+bot: the router ignores most of them anyway, and two bots could otherwise
+answer each other's busy lines. The lanes' tasks run in a `JoinSet` of the
+pipeline's own (`tokio-util`'s `TaskTracker` isn't a dependency), and a
+panicking message doesn't stop its lane. The set is behind a
+`std::sync::Mutex`, so queueing never waits: a sink cancelled mid-send, as
+a Rocket.Chat connection's is on every reconnect, can't leave a lane
+created without its task. Queueing checks that the pipeline is open, adds
+the message to its lane and starts a new lane's task all under the lanes'
+lock, and `close` sets the flag under the same lock, so a message is either
+queued before the close, in a lane whose task the drain waits for, or
+dropped as one sent after closing is, even one that passed `dispatch`'s
+check just before. Messages queued in a lane before the close, including
+those waiting behind a running turn, are answered within the drain:
+Rocket.Chat has marked them processed and Slack has acknowledged them, so
+dropping them would lose them silently. A message that reaches `dispatch`
+only after the close is still dropped, with the same loss: a Slack event
+acknowledged and deduplicated but still in the ingress queue, which
+`Server::run` drains after closing the pipeline, or a Rocket.Chat message
+a connection was still delivering when it stopped. `drain` polls the set
+under the lock without holding it across a wait, so a drain cut off by its
+timeout leaves the tasks for `cut_short`, which takes the set and shuts it
+down. On shutdown `Server::run` stops the public listener and the chat
+connections, closes the pipeline, and gives the turns taken the drain
+timeout while the proxy and ctl listeners, which a running turn's CLI and
+agentctl need, still serve; only then do those stop, and the pipeline is
+dropped before the store is closed. Turns still running or delivering their
+reply at the timeout are aborted, their working emoji taken off and their
+threads told to ask again, within five seconds: the guard that holds a
+turn's working emoji is kept until its reply, or its failure notice, has
+gone out, so a reply stuck on a slow post isn't lost without a word. That
+is the simplest option that tells people: the turns and their queue stay in
+memory rather than the store, so a crash, unlike a shutdown, still loses
+them silently, and messages still waiting in a lane at the timeout are
+dropped without a word, since no decision was made about them. The working
+emoji is held by a guard, so a panicking turn takes it off too.
+
+### An agent's post can arrive before its attribution
+
+**Issue.** agentd records a post's `message_refs` row just after
+`chat.postMessage` returns, and the platform may deliver the post to
+another agent's connection first. The router then saw a managed bot's
+message with no attribution and ignored it, dropping the hop.
+
+**Solution.** When the sender is another agent's bot, the message mentions
+the candidate, and it has no attribution yet, the view reads it again,
+with pauses doubling from 25 ms, for up to two seconds before routing. Only
+that candidate's lane waits. The router reads the attribution in that case
+only, so any other post of an agent's bot, such as an upload, which never
+gets one, is routed at once.
+
+### Delivery goes on past a failed part
+
+**Issue.** A failed post of the reply ended the delivery: the directives'
+reactions, the outbox's reactions and the queued agentctl posts were lost,
+and so were the chunks after a failed one. The reply had no size cap,
+while `agentctl post` caps its text at `MAX_POST_BYTES`.
+
+**Solution.** Each chunk, the upload, each reaction and each queued post is
+tried whatever happened to the others; a chunk refused with a rate limit is
+posted once more after the wait the platform asks for, up to five seconds.
+If any part was lost, the thread gets one line saying so. The reply is cut
+at `MAX_POST_BYTES` on a character boundary, with a note that it was cut; a
+backtick or tilde code fence the cut leaves open is closed first, so the
+note isn't rendered as code. Failures before the turn reached the model
+(writing the persona, reading the plan's model, building the turn message,
+starting the process) post the short failure notice too, once the bot is
+known to be able to post; a link prompt waits for the same check. The
+usage-limit and login texts name "the Claude account this request runs on"
+rather than "your", since a turn may run on the community key.
+
+### A turn whose start hook failed stops the process
+
+**Issue.** When `turn_starting` fails, the runner keeps the process warm
+(T21). A placeholder that can't be pointed, because it was revoked when a
+new container took its address, would fail every later turn the same way.
+
+**Solution.** The pipeline stops the session's process after a turn that
+failed in `turn_starting`, so the next turn mints anew.
+
+### Who counts as a managed bot
+
+**Issue.** `RouterView::managed_bot` must know every bot user agentd made,
+whatever the binding's state, but `Store::agent_for_bot` finds active
+bindings only.
+
+**Solution.** `Store::agent_of_bot_user` finds the agent of a bot user on a
+binding in any state, and the view asks it for the sender and each
+mention, besides the manager bots' identities from the configuration.
+Candidates still come from active bindings.
+
+### `fake-claude` still counts cost from 0 on resume
+
+**Issue.** The real CLI restores a resumed session's total cost (see above),
+and `fake-claude` counts each process from 0, as T04 wrote it.
+
+**Solution.** Left as it is: the runner's tests rely on it, and changing
+both belongs with T27's correction, which the plan's T27 now names.
+
+### A lost outbox or attribution is a lost part
+
+**Issue.** Delivery told the thread only about parts it couldn't post.
+When `turn_finished` failed, as when `Ctl::end_turn` couldn't clear the
+token's turn in the store, the outbox was never taken and went with the
+process, so the turn's attachments, reactions and queued
+posts were lost without a word. When the platform accepted a chunk but its
+`message_refs` row couldn't be recorded, the post went unattributed: a
+mention of another agent in it is ignored as an unattributed managed bot's
+(the view's two-second wait can't find a row never written), a person's
+reply to it reaches no agent, and the next turn shows it again as history.
+
+**Solution.** Both count as a lost part, so the thread gets the one line
+saying part of the reply couldn't be delivered. Delivery can't tell
+whether a lost outbox held anything, so it says so whenever
+`turn_finished` failed. The line is the only signal: the post can't be
+attributed after the fact, since the store already failed once. A hook
+that panics fails the whole turn instead, which posts `FAILED_TEXT`, and a
+reaction Slack or Rocket.Chat refuses is only logged: a mistyped emoji
+loses nothing the thread needs to hear about.
+
+### A thread's messages are looked up one at a time
+
+**Issue.** The sink looked a message's candidates up, several store round
+trips, before queueing it in its lanes. A Rocket.Chat connection hands its
+messages over one at a time, but every connection in a room (the manager's
+and each bot's) may deliver a message, whichever records it in `Dedup`
+first, and the sinks of different connections run at once. Two messages
+of one thread delivered by different connections could reach the lane in
+the order their lookups ended rather than the order they were sent: the
+later one's turn then showed the earlier as history, and the earlier's
+turn ran anyway, answering it twice.
+
+**Solution.** `dispatch` takes a lock per thread (the lanes' thread, so a
+DM's or a thread-less channel's conversation) before the lookup and holds
+it until the message is queued for every candidate. Tokio's mutex grants
+in the order asked, so a thread's messages reach its lanes in the order
+their dispatches started; the busy lines are posted after the lock is
+released, so sending still waits only for the lookups of the thread's
+earlier messages, never for a turn. An entry lives only while a dispatch
+holds or waits for it, and a sender cancelled while waiting leaves none,
+as `auth`'s `KeyedLocks` does. That type is crate-private to `auth`, and
+a key-to-lock map isn't authentication, so agentd has its own copy next
+to the pipeline rather than importing it. The lock can't restore an order
+lost before `dispatch` starts: two connections that record two messages
+in `Dedup`, or reach the sink, in the opposite order of the messages are
+dispatched in that order.
