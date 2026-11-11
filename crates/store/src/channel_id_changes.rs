@@ -5,10 +5,11 @@
 //! waits until it is settled: Slack confirmed where the channel is now, and
 //! the rules of the binding's agent moved there. A try is claimed by moving
 //! `next_attempt_at` past it, so one that fails, or whose process dies, is
-//! made again once that has passed, by this instance or another. A settled
-//! row is kept a while, so a later change in a chain finds where the
-//! channel went and a replay is known; one still waiting a while after it
-//! arrived is given up.
+//! made again once that has passed, by this instance or another serving
+//! the binding's workspace, the only ones that can ask Slack about it. A
+//! settled row is kept a while, so a later change in a chain finds where
+//! the channel went and a replay is known; one still waiting a while after
+//! it arrived is given up, by any instance.
 
 use core_types::{AgentId, BindingId, ConversationId, TeamId};
 use time::OffsetDateTime;
@@ -189,8 +190,10 @@ impl Store {
         Ok(ChannelIdChangeRecord::Recorded)
     }
 
-    /// Up to `limit` waiting changes that may be claimed at `now`, the one
-    /// due longest first, so changes tried and not settled go to the back.
+    /// Up to `limit` waiting changes of bindings in `team` that may be
+    /// claimed at `now`, the one due longest first, so changes tried and
+    /// not settled go to the back. Only an instance serving `team` can ask
+    /// Slack about them, so another workspace's are left to its instance.
     ///
     /// # Errors
     ///
@@ -199,14 +202,17 @@ impl Store {
     /// doesn't parse.
     pub async fn due_channel_id_changes(
         &self,
+        team: &TeamId,
         now: OffsetDateTime,
         limit: u32,
     ) -> Result<Vec<ChannelIdChange>> {
         let rows: Vec<Row> = sqlx::query_as(
-            "SELECT binding_id, old_channel, new_channel, received_at FROM channel_id_changes \
-             WHERE settled_at IS NULL AND next_attempt_at <= ? \
-             ORDER BY next_attempt_at, received_at LIMIT ?",
+            "SELECT c.binding_id, c.old_channel, c.new_channel, c.received_at \
+             FROM channel_id_changes c JOIN agent_bindings b ON b.id = c.binding_id \
+             WHERE b.team_id = ? AND c.settled_at IS NULL AND c.next_attempt_at <= ? \
+             ORDER BY c.next_attempt_at, c.received_at LIMIT ?",
         )
+        .bind(team.as_str())
         .bind(to_unix(now))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
