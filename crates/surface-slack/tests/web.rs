@@ -794,6 +794,26 @@ async fn a_refused_upload_shares_nothing() {
 }
 
 #[tokio::test]
+async fn an_upload_refused_without_a_server_error_is_an_api_error() {
+    let (server, api) = server().await;
+    mount_upload_flow(&server).await;
+    Mock::given(method("POST"))
+        .and(wiremock::matchers::path_regex("^/upload/v1/"))
+        .respond_with(ResponseTemplate::new(403))
+        .mount(&server)
+        .await;
+    let dir = TempDir::new("surface-slack");
+    let err = api
+        .upload_files(&channel(), None, &[staged(&dir, "a.txt", "x")])
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err,
+        SurfaceError::Api("the file upload was refused (HTTP 403)".into())
+    );
+}
+
+#[tokio::test]
 async fn a_rate_limited_upload_is_rate_limited() {
     let (server, api) = server().await;
     mount_upload_flow(&server).await;
@@ -1067,6 +1087,23 @@ async fn an_http_failure_with_an_error_code_maps_the_code() {
 }
 
 #[tokio::test]
+async fn a_server_error_is_transport_whatever_code_it_carries() {
+    let (server, api) = server().await;
+    Mock::given(method("POST"))
+        .and(path("/api/conversations.info"))
+        .respond_with(
+            ResponseTemplate::new(503)
+                .set_body_json(json!({"ok": false, "error": "channel_not_found"})),
+        )
+        .mount(&server)
+        .await;
+    assert_eq!(
+        api.conversation_info(&channel()).await.unwrap_err(),
+        SurfaceError::Transport("HTTP 503".into())
+    );
+}
+
+#[tokio::test]
 async fn an_unreachable_slack_is_a_transport_error_without_the_token() {
     let client = SlackClient::new("http://127.0.0.1:9/api/").unwrap();
     let err = client
@@ -1150,6 +1187,10 @@ mod response_url {
             (
                 ResponseTemplate::new(400).set_body_string("no_text"),
                 SurfaceError::Api("no_text".into()),
+            ),
+            (
+                ResponseTemplate::new(403),
+                SurfaceError::Api("HTTP 403".into()),
             ),
             (
                 ResponseTemplate::new(500).set_body_string("Internal <b>error</b>"),
@@ -1412,6 +1453,20 @@ mod downloads {
         assert_eq!(
             err,
             SurfaceError::Api("the file download was refused (HTTP 302)".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_download_that_fails_on_slacks_side_is_transport() {
+        let (server, api) = server().await;
+        serve(&server, ResponseTemplate::new(503)).await;
+        let err = api
+            .download_file(&file(url(&server), None), 1024)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err,
+            SurfaceError::Transport("the file download failed (HTTP 503)".into())
         );
     }
 
