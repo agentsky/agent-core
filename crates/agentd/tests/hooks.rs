@@ -6,8 +6,9 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use agentd::community::StoreCommunityKey;
 use agentd::ctl::{Ctl, CtlSettings, NoSurfaces};
-use agentd::pipeline::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks, NoCommunityKey};
+use agentd::pipeline::{AGENTCTL_TOKEN_VAR, AGENTCTL_URL_VAR, Hooks};
 use auth::{Auth, OAuthConfig, TokenSource};
 use axum::Router;
 use axum::body::Body;
@@ -92,7 +93,7 @@ async fn rig() -> Rig {
         &fake.uri(),
         registry.clone(),
         tokens,
-        Arc::new(NoCommunityKey),
+        Arc::new(StoreCommunityKey::new(store.clone())),
     )
     .unwrap()
     .into_router();
@@ -148,11 +149,18 @@ impl Rig {
     /// A request to the credential proxy from the container, carrying
     /// `placeholder` as a bearer token: its status and body.
     async fn through_proxy(&self, placeholder: &SecretString) -> (StatusCode, String) {
+        self.through_proxy_in(
+            "authorization",
+            format!("Bearer {}", placeholder.expose_secret()),
+        )
+        .await
+    }
+
+    /// A request to the credential proxy from the container, carrying
+    /// `value` in the header `name`: its status and body.
+    async fn through_proxy_in(&self, name: &str, value: String) -> (StatusCode, String) {
         let mut request = Request::post("/v1/messages?beta=true")
-            .header(
-                "authorization",
-                format!("Bearer {}", placeholder.expose_secret()),
-            )
+            .header(name, value)
             .header("content-type", "application/json")
             .body(Body::from(r#"{"model":"m","messages":[]}"#))
             .unwrap();
@@ -426,4 +434,77 @@ async fn a_turn_whose_token_record_fails_still_unpoints() {
     let (status, body) = rig.through_proxy(&env.placeholder).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     drop(rig.ctl);
+}
+
+#[tokio::test]
+async fn a_community_turn_gets_the_key_an_admin_set_and_only_through_the_proxy() {
+    const KEY: &str = "sk-ant-api03-community-hooks-test";
+    let rig = rig().await;
+    let (env, process) = rig
+        .hooks
+        .process_starting(
+            &rig.session,
+            CONTAINER.parse::<IpAddr>().unwrap(),
+            CredentialKind::ApiKey,
+        )
+        .await
+        .unwrap();
+    for value in env.env.values() {
+        assert!(!value.expose_secret().contains(KEY));
+    }
+    let placeholder = env.placeholder.expose_secret().to_owned();
+    let turn = rig.turn(CredentialRef::Community);
+    rig.hooks
+        .turn_starting(&rig.session, &process, &turn)
+        .await
+        .unwrap();
+    let (status, body) = rig.through_proxy_in("x-api-key", placeholder.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "no key is set yet: {body}"
+    );
+    assert!(rig.fake.requests().await.is_empty());
+
+    let admin: MemberKey = "rocketchat:chat.example:root".parse().unwrap();
+    rig.store
+        .set_community_api_key(&SecretString::from(KEY), &admin, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let (status, body) = rig.through_proxy_in("x-api-key", placeholder.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen = rig.fake.message_requests().await;
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].headers.get("x-api-key").unwrap(), KEY);
+    assert!(seen[0].headers.get("authorization").is_none());
+    assert!(!body.contains(KEY));
+
+    rig.store
+        .clear_community_api_key(&admin, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    let (status, body) = rig.through_proxy_in("x-api-key", placeholder.clone()).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "a cleared key is gone at once"
+    );
+    assert!(!body.contains(KEY));
+    assert_eq!(rig.fake.message_requests().await.len(), 1);
+
+    rig.store
+        .set_community_api_key(&SecretString::from(KEY), &admin, OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    rig.hooks
+        .turn_finished(&rig.session, &process, &turn)
+        .await
+        .unwrap();
+    let (status, _) = rig.through_proxy_in("x-api-key", placeholder).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "between turns the placeholder reaches no key"
+    );
+    assert_eq!(rig.fake.message_requests().await.len(), 1);
 }

@@ -11,6 +11,8 @@
 //!   agentd keeps as them.
 //! - [`commands`]: `/agent` command dispatch, the account and agent commands, and
 //!   the relink notice.
+//! - [`community`]: the community API key, which the credential proxy
+//!   reads from the store.
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`pipeline`]: the runner's sessions and sandboxes, and the turn hooks
 //!   that give each process its placeholder and agentctl token.
@@ -27,6 +29,7 @@ pub mod agents;
 pub mod app;
 pub mod cli;
 pub mod commands;
+pub mod community;
 pub mod config;
 pub mod ctl;
 pub mod net;
