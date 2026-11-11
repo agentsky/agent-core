@@ -61,15 +61,15 @@ async fn forget(store: &Store, session: SessionId, shown: &[u32]) {
 ///    as after the CLI refused to resume it for want of one, every one of
 ///    those messages is shown, rows or not: one the session already has a
 ///    row for keeps its short id and isn't recorded again, so forgetting
-///    what this message recorded leaves it alone; when the history read
-///    is a full window that doesn't start at the thread's root, a line
-///    points to `agentctl history` for older messages. A post of the
-///    agent's bot is marked as from outside the session only when it is
-///    attributed to another session; the bot's other posts, such as the
-///    files a turn uploaded or agentd's notices, may be this session's. A
-///    history that can't be read is left out, except that building fails
-///    on a rate limit or an unreachable platform for a session that starts
-///    with an empty transcript and already has rows, whose messages would
+///    what this message recorded leaves it alone; when the thread has a
+///    message older than those, a line points to `agentctl history` for
+///    older messages. A post of the agent's bot is marked as from outside
+///    the session only when it is attributed to another session; the
+///    bot's other posts, such as the files a turn uploaded or agentd's
+///    notices, may be this session's. A history that can't be read is
+///    left out, except that building fails on a rate limit or an
+///    unreachable or unavailable platform for a session that starts with
+///    an empty transcript and already has rows, whose messages would
 ///    otherwise never be shown.
 /// 2. Such posts from other sessions that the history didn't reach and
 ///    the session has no row for ([`Store::posted_elsewhere`]), named for
@@ -231,9 +231,9 @@ struct Unseen {
     /// The messages, oldest first, each with the session's row for it if
     /// it has one.
     messages: Vec<(Msg, Option<MessageRef>)>,
-    /// Whether the thread may have older messages than these that an empty
-    /// transcript lacks too: the read filled its window, and its oldest
-    /// message isn't the thread's root.
+    /// Whether the thread has older messages than these that an empty
+    /// transcript lacks too: the read, one message wider than the window,
+    /// reached past it.
     older: bool,
 }
 
@@ -263,7 +263,7 @@ async fn unseen_history(
         .history(
             thread,
             Some(Cursor::from(event.message.id.clone())),
-            HISTORY_LIMIT,
+            HISTORY_LIMIT + 1,
         )
         .await
     {
@@ -283,13 +283,10 @@ async fn unseen_history(
             return Ok(Unseen::default());
         }
     };
-    let older = fresh
-        && history.len() >= HISTORY_LIMIT
-        && history
-            .first()
-            .is_some_and(|oldest| thread.root.as_ref() != Some(&oldest.id));
+    let beyond = history.len().saturating_sub(HISTORY_LIMIT);
+    let older = fresh && beyond > 0;
     let mut messages = Vec::new();
-    for msg in history {
+    for msg in history.into_iter().skip(beyond) {
         if msg.id == event.message.id {
             continue;
         }
@@ -304,9 +301,10 @@ async fn unseen_history(
 }
 
 /// Whether a later read may succeed where one that failed with `err`
-/// didn't: the platform asked to slow down or couldn't be reached. Any
-/// other error, an [`SurfaceError::Api`] one included since it can't tell
-/// a platform outage from a refusal, is taken to fail every read.
+/// didn't: the platform asked to slow down, couldn't be reached or answered
+/// that it is unavailable. Any other error, including an
+/// [`SurfaceError::Api`] one, since it can't tell a platform outage from a
+/// refusal, is taken to fail every read.
 fn transient(err: &SurfaceError) -> bool {
     matches!(
         err,

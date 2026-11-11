@@ -227,7 +227,8 @@ pub enum SurfaceError {
     /// The platform answered with another error.
     #[error("platform error: {0}")]
     Api(String),
-    /// The platform couldn't be reached, or its answer couldn't be read.
+    /// The platform couldn't be reached, or answered that it is unavailable,
+    /// or its answer couldn't be read.
     #[error("transport error: {0}")]
     Transport(String),
 }

@@ -6129,15 +6129,18 @@ event whether or not the session has rows for them. A message with a row
 keeps its short id and isn't recorded again, so only the rows this build
 added are forgotten if the turn fails. A post of the agent's bot is marked
 as from outside the session only when another session's row attributes it,
-since the session's own replies are now shown too. When the read filled its
-50-message window and the oldest message in it isn't the thread's root, a
-line points to `agentctl history --before` the oldest one shown; both
-surfaces include the root in a thread's history, so a window that starts
-there holds the whole thread. Posts from other sessions past the 50 messages
-that the session already has rows for aren't listed again; `agentctl
-history` reaches them as it reaches the rest of the thread. The refused
-exchange records no turn, and the outbox `turn_finished` returned for it is
-dropped with its staging directory, as on any failed turn. The tests are
+since the session's own replies are now shown too. The builder reads 51
+messages; when it gets all 51, the thread has more than the 50 shown, and a
+line points to `agentctl history --before` the oldest one shown. Review
+found that judging this from the 50 alone, by whether the oldest is the
+thread's root, showed the line for a thread with nothing older when Slack
+leaves out a root that was deleted or has no sender
+(`a_thread_whose_history_leaves_out_its_root_has_nothing_older_to_point_to`).
+Posts from other sessions past the 50 messages that the session already has
+rows for aren't listed again; `agentctl history` reaches them as it reaches
+the rest of the thread. The refused exchange records no turn, and the outbox `turn_finished`
+returned for it is dropped with its staging directory, as on any failed
+turn. The tests are
 `a_session_whose_transcript_is_gone_is_shown_the_thread_again` and
 `a_reset_after_a_refused_resume_is_retried_on_the_replacement`.
 
@@ -6161,6 +6164,24 @@ tests are
 `a_failed_history_read_for_a_session_whose_transcript_is_gone_fails_the_turn`
 and
 `a_lasting_history_error_for_a_session_whose_transcript_is_gone_goes_on_without_it`.
+
+Review found that a platform restart read as lasting: both surfaces mapped
+an HTTP 5xx without an error code to `Api("HTTP 503")`, and Slack its
+`internal_error`, `service_unavailable` and `fatal_error` codes to `Api`
+too, so the turn went on without the history and the earlier messages were
+lost for good. A 5xx says the platform, or a proxy in front of it, is
+unavailable, not that it refused the call, so it is now `Transport`, which
+`SurfaceError` documents as a platform that couldn't be reached or answered
+that it is unavailable. On Slack that is any 5xx without a code, from the
+Web API, a `response_url`, a file download or an upload URL, and the three
+codes, which Slack documents as failures on its side; `fatal_error` is among
+them because Slack names it a catastrophic server error, and a turn that
+fails on it is retried by the next one, while going on without the history
+loses it. On Rocket.Chat it is 502, 503 and 504, from the REST API or a file
+download. A bare 500 stays `Api` there: Rocket.Chat answers it for an
+exception in the endpoint, which the same call may raise every time. Neither
+surface's client retries `Transport`; only a 429 is retried, so no call is
+repeated that wasn't before.
 
 The runner frees the session's queue when it returns `ResumeRefused`, so
 another turn could run on the session before the rebuilt one; the pipeline

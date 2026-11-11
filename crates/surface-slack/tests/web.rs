@@ -510,7 +510,7 @@ async fn a_refused_upload_shares_nothing() {
         .unwrap_err();
     assert_eq!(
         err,
-        SurfaceError::Api("the file upload was refused (HTTP 500)".into())
+        SurfaceError::Transport("the file upload was refused (HTTP 500)".into())
     );
     let sent = requests(&server).await;
     assert!(
@@ -734,7 +734,7 @@ async fn http_failures_and_unreadable_bodies_are_errors() {
 
     assert_eq!(
         api.auth_test().await.unwrap_err(),
-        SurfaceError::Api("HTTP 503".into())
+        SurfaceError::Transport("HTTP 503".into())
     );
     assert!(matches!(
         api.user_info(&"U1".into()).await.unwrap_err(),
@@ -879,11 +879,19 @@ mod response_url {
             ),
             (
                 ResponseTemplate::new(500).set_body_string("Internal <b>error</b>"),
-                SurfaceError::Api("unknown_error".into()),
+                SurfaceError::Transport("HTTP 500".into()),
             ),
             (
                 ResponseTemplate::new(502),
-                SurfaceError::Api("HTTP 502".into()),
+                SurfaceError::Transport("HTTP 502".into()),
+            ),
+            (
+                ResponseTemplate::new(400).set_body_string("<html>"),
+                SurfaceError::Api("HTTP 400".into()),
+            ),
+            (
+                ResponseTemplate::new(200).set_body_string("<html>"),
+                SurfaceError::Api("unknown_error".into()),
             ),
             (
                 ResponseTemplate::new(200).set_body_json(json!({"ok": false})),
