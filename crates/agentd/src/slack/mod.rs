@@ -20,11 +20,11 @@ pub mod manager;
 use std::sync::Arc;
 
 use axum::Router;
-use core_types::{SendError, Sender, Sink, UserId};
+use core_types::{MemberKey, SendError, Sender, Sink, UserId};
 use secrecy::SecretString;
 use store::Store;
 use surface_slack::{
-    BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, SlackEvent, SlackInbound, ingress,
+    BindingRef, BoxError, Dedup, Queue, SigningSecrets, SlackApp, SlackInbound, ingress,
 };
 use time::OffsetDateTime;
 
@@ -112,7 +112,9 @@ impl Dedup for StoreDedup {
 /// `/agent` slash command or a DM to the app goes to the command intake,
 /// and a `user_change` whose user is `deleted` deletes that member's
 /// configuration token for the workspace, with the store tried a few times
-/// since Slack doesn't send the event again. A request from any other
+/// since Slack doesn't send the event again. The deletion waits in the
+/// intake behind the commands of the member's that arrived first, so such
+/// a `slack-token` still rotating can't store the token after it. A request from any other
 /// workspace, or one that names none, is dropped.
 /// Everything else, agents' messages included, is logged by binding and
 /// kind and dropped until the turn pipeline (T31) takes it.
@@ -133,11 +135,8 @@ impl Inbound {
         }
     }
 
-    async fn member_left(&self, event: &SlackEvent) {
-        let Some(key) = member_who_left(event) else {
-            return;
-        };
-        let (store, key) = (&self.store, &key);
+    async fn member_left(store: Store, key: MemberKey) {
+        let (store, key) = (&store, &key);
         let deleted = retry_store(
             "deleting a departed member's configuration token",
             key,
@@ -186,7 +185,10 @@ impl Sink<SlackInbound> for Inbound {
                 .map(|(member, text, origin)| (member, text, origin, Vec::new())),
             SlackInbound::Message(event) => dm_command(&event, identity),
             SlackInbound::Event(event) => {
-                self.member_left(&event).await;
+                if let Some(key) = member_who_left(&event) {
+                    let job = Self::member_left(self.store.clone(), key.clone());
+                    commands.after_commands_of(key, job).await?;
+                }
                 None
             }
             SlackInbound::Interaction(_) => None,
