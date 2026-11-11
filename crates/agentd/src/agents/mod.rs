@@ -223,8 +223,8 @@ impl RocketChatAgents {
     /// # Errors
     ///
     /// Any other [`SurfaceError`] from `rooms.info`, such as
-    /// [`SurfaceError::Api`] for a server or proxy failure: only
-    /// [`SurfaceError::NotFound`] (an unknown room) and
+    /// [`SurfaceError::Transport`] for a server or proxy that is
+    /// unavailable: only [`SurfaceError::NotFound`] (an unknown room) and
     /// [`SurfaceError::Forbidden`] (a private group the manager isn't in,
     /// or an archived room) mean `None`.
     pub async fn public_channel(
