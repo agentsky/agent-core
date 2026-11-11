@@ -37,8 +37,8 @@ pub use net::*;
 pub use scope::*;
 pub use surface::*;
 pub use surface_trait::{
-    Binding, Caps, InFile, LengthUnit, Limit, Msg, OutFile, SendError, Sender, Sink, Surface,
-    SurfaceError,
+    Binding, Caps, InFile, LengthUnit, Limit, Msg, OutFile, Posted, SendError, Sender, Sink,
+    Surface, SurfaceError,
 };
 pub use throttle::Throttle;
 pub use turn::*;

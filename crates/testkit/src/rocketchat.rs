@@ -134,6 +134,27 @@ impl State {
         })
     }
 
+    /// The `mentions` the server computes for `text`: each `@username` of a
+    /// known user, and `@all` and `@here` as themselves.
+    fn mentions_json(&self, text: &str) -> Value {
+        let mentions: Vec<Value> = text
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix('@'))
+            .map(|name| {
+                name.trim_end_matches(|c: char| {
+                    !c.is_alphanumeric() && c != '_' && c != '-' && c != '.'
+                })
+            })
+            .filter_map(|name| match name {
+                "all" | "here" => Some(json!({ "_id": name, "username": name })),
+                _ => self
+                    .user_by_name(name)
+                    .map(|u| json!({ "_id": u.id, "username": u.username })),
+            })
+            .collect();
+        Value::Array(mentions)
+    }
+
     fn message_json(&self, message: &FakeMessage) -> Value {
         let sender = self.users.get(&message.user_id);
         let mut value = json!({
@@ -147,6 +168,7 @@ impl State {
                 "name": sender.map(|u| u.name.as_str()),
             },
             "_updatedAt": iso(message.ts),
+            "mentions": self.mentions_json(&message.text),
         });
         if let Some(tmid) = &message.tmid {
             value["tmid"] = json!(tmid);
@@ -232,6 +254,16 @@ impl FakeRest {
 
     /// Adds an active user with the `user` role and returns its id.
     pub fn add_user(&self, username: &str) -> String {
+        self.add_user_with_roles(username, &["user"])
+    }
+
+    /// Adds an active user with the `bot` role, as an integration's bot
+    /// is, and returns its id.
+    pub fn add_bot(&self, username: &str) -> String {
+        self.add_user_with_roles(username, &["bot"])
+    }
+
+    fn add_user_with_roles(&self, username: &str, roles: &[&str]) -> String {
         let mut state = self.state();
         let id = format!("user-{}", state.next());
         state.users.insert(
@@ -240,7 +272,7 @@ impl FakeRest {
                 id: id.clone(),
                 username: username.into(),
                 name: username.into(),
-                roles: vec!["user".into()],
+                roles: roles.iter().map(|role| (*role).to_owned()).collect(),
                 active: true,
                 avatar_url: None,
                 verified: false,
@@ -299,6 +331,11 @@ impl FakeRest {
             .files
             .insert(id.clone(), (name.to_owned(), content.to_vec()));
         id
+    }
+
+    /// Every message stored, oldest first.
+    pub fn messages(&self) -> Vec<FakeMessage> {
+        self.state().messages.clone()
     }
 
     /// A user by username.

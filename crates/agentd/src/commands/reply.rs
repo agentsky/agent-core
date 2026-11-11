@@ -403,7 +403,7 @@ impl Replies {
             return Ok(MsgRef { conv, id });
         }
         let text = bot.render_one(&message.markdown)?;
-        Ok(bot.surface.post(&bot.target(&room), &text).await?)
+        Ok(bot.surface.post(&bot.target(&room), &text).await?.msg)
     }
 
     /// Whether a manager bot can update `msg`, a message
