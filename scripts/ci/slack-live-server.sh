@@ -78,8 +78,11 @@ case $url in
     https://?*) ;;
     *) die "CF_URL_BASE must be an https:// URL" ;;
 esac
+# Only a host name and port, so that the value, which an input can supply,
+# can't end the TOML string it is written into below and add keys of its
+# own, such as an [slack] api_url that would receive the manager's token.
 case ${url#https://} in
-    */* | *'?'* | *'#'*) die "CF_URL_BASE must have no path, query or fragment" ;;
+    '' | *[!A-Za-z0-9.:-]*) die "CF_URL_BASE must be https:// and a host name, with no path, query or fragment" ;;
 esac
 case $wait_minutes in
     '' | *[!0-9]*) die "WAIT_MINUTES must be a whole number of minutes" ;;
