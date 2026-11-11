@@ -342,6 +342,20 @@ impl Store {
         in_session(&mut conn, session, msg).await
     }
 
+    /// Whether `session` has recorded any message.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Database`] if the query fails.
+    pub async fn has_message_refs(&self, session: SessionId) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM message_refs WHERE session_id = ?)")
+                .bind(session.to_string())
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
     /// The message with short id `short_id` in `session`.
     ///
     /// # Errors
@@ -716,6 +730,7 @@ mod tests {
         let (session, other) = (SessionId::new_v4(), SessionId::new_v4());
         let person = requester("U1", None);
         let (a, b, c) = (msg("C1", "1.1"), msg("C1", "1.2"), msg("C1", "1.3"));
+        assert!(!store.has_message_refs(session).await.unwrap());
         let kept = store
             .record_message_ref(&inbound(session, &a, None, &person), at(1))
             .await
@@ -743,6 +758,8 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(forgotten, 1);
+        assert!(store.has_message_refs(session).await.unwrap());
+        assert!(!store.has_message_refs(SessionId::new_v4()).await.unwrap());
         assert_eq!(store.session_message_ref(session, &c).await.unwrap(), None);
         assert_eq!(
             store.session_message_ref(session, &a).await.unwrap(),
