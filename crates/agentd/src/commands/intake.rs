@@ -8,7 +8,7 @@
 //! else, but one member's commands run one at a time in the order they
 //! arrived: `logout` then `login` never swaps. A command's turn ends with
 //! its reply. What it still has to do after that, its
-//! [`FollowUp`](super::FollowUp) (a reset waiting for a running turn),
+//! [`FollowUp`] (a reset waiting for a running turn),
 //! goes on in the same task without holding up the member's next command,
 //! and the intake waits for it at shutdown as for the command itself. The
 //! cleanup when a member leaves runs in the same order, so a command of
