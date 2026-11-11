@@ -3231,6 +3231,19 @@ the refusal is one agentd gives only after deleting the session's
 leases. With no lost answer before it, nothing was granted, and it still
 fails at once.
 
+Review later found that a late attempt could shorten the lease. agentd
+takes `now` before it waits to write the lease, so an attempt held up past
+agentctl's timeout and landing after a retry was granted reset the expiry
+to its own earlier `now + ttl`: a retry granted at 1,031 s until 1,061 s
+was cut back to 1,030 s by the first attempt, taken at 1,000 s, and
+another session could then take the lock while the command still ran. A
+late renewal could do the same. The acquire and the renewal now keep the
+later of the stored and the new expiry, and return it. An answer can then
+carry more than `ttl`, but agentd measures `seconds_left` from a `now`
+taken no earlier than agentctl sent the request, and agentctl counts it
+from that send, so whatever expiry an answer carries, agentctl never
+relies on the lease past it.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
@@ -5607,13 +5620,33 @@ the member's id, and returns the last to its caller: `Inbound` logs that
 one, as before, by member key and error. It stays in `slack_tokens`, since
 agentd has no shared store or retry module.
 
-The retries run inline in the sink, so a failing departure holds the shared
-Slack event queue for 1.75 s of waits plus each attempt's own store time,
-which can include SQLite's busy timeout. Once agent apps land, that queue
-also carries agents' messages, which wait too. That is accepted: a store
-failing on writes stalls agent traffic anyway, the hold is bounded at four
-attempts, and handing the departure to a task instead would lose its order
-against later events for the same member.
+The retries run in the command intake, in the member's turn (next
+section), so a failing departure holds up that member's later commands for
+1.75 s of waits plus each attempt's own store time, which can include
+SQLite's busy timeout, and not the shared Slack event queue.
+
+### A departure raced a token still rotating
+
+**Issue.** Review found that `Inbound` ran a departure as soon as the Slack
+queue handed it over, outside the order the intake keeps for the member. A
+`/agent slack-token` the member sent just before leaving could still be
+waiting on `tooling.tokens.rotate` when the departure deleted their token.
+It then stored the rotated pair, and since Slack doesn't send the
+`user_change` again, the departed member's token stayed and was renewed.
+
+**Solution.** `CommandSubmitter::after_commands_of(member, job)` runs a job
+in the member's turn, after every command they submitted before it and
+before any they submit after. The intake's queue carries either a command
+or such a job. `Inbound` hands the departure to it under the key
+`member_who_left` gives, the same `MemberKey` the member's slash commands
+and DMs are submitted under, and the intake's drain at shutdown runs it
+like a command. The order is the one in which agentd received the
+requests, within one instance. Slack sends events and slash commands
+separately, so a `slack-token` the member sent just before leaving can
+still arrive after the `user_change` and store a token, and so can one
+handled by a second instance in a blue-green overlap. The test is
+`a_departure_waits_for_the_members_slack_token_still_rotating`, whose
+mocked rotation answers after half a second.
 
 ### Which failures a member hears about
 
