@@ -1,0 +1,204 @@
+# The development stack: Rocket.Chat and MongoDB, agentd, and the sandbox
+# image agentd starts sessions from. README.md next to this file walks
+# through bringing it up. The shape follows "Network and deployment shape"
+# in docs/tasks-plan.md:
+#
+# - `egress` is a normal bridge. Rocket.Chat and MongoDB are on it only.
+# - `sandbox` is internal, so it has no route out, and the host has no
+#   address on it either (inhibit_ipv4), so a sandbox can't reach services
+#   listening on the host. Sandboxes attach to it only. Inter-container
+#   traffic is off on it (enable_icc), so sandboxes can't reach each other;
+#   that also cuts them off from agentd until isolate-sandbox.sh, next to
+#   this file, lets them reach agentd's ports 8080 and 8081 through
+#   iptables. Its bridge has a fixed name, br-agent-sbx, for those rules.
+# - agentd is on both, with a static address on each, and binds each
+#   listener to its own address (config/agentd.example.toml uses these):
+#   the public listener on 172.31.0.2:8443, the credential proxy on
+#   172.30.0.2:8080 and the agentctl API on 172.30.0.2:8081. Other
+#   containers get addresses from the upper half of each subnet (ip_range),
+#   so one started first can't take agentd's.
+#
+# The networks set `name:`, so Docker knows them as `sandbox` and `egress`
+# (the sandbox crate's default `[sandbox] network`), not with the project
+# name as a prefix.
+#
+# Variables, read from the environment or from .env next to this file:
+#
+#   AGENTD_MASTER_KEY        Required by agentd; `agentd gen-key` prints one.
+#   AGENTD_RC_MANAGER_TOKEN  The Rocket.Chat manager's personal access token.
+#   DOCKER_GID               Required. The group owning the Docker socket.
+#   AGENT_CORE_CONFIG        agentd's configuration file. Default: the
+#                            example, whose addresses match this file.
+#   AGENT_CORE_DATA          agentd's data directory on the host. Default:
+#                            ./data.
+#   AGENT_CORE_SANDBOX_NETWORK, AGENT_CORE_EGRESS_NETWORK
+#                            Docker's names for the two networks. Default:
+#                            sandbox and egress.
+#   RC_ADMIN_USERNAME, RC_ADMIN_PASS, RC_ADMIN_EMAIL
+#                            Rocket.Chat's first admin, created on the first
+#                            start when RC_ADMIN_PASS is set.
+#   ROCKETCHAT_VERSION       Default 7.13.9.
+#   ROCKETCHAT_ROOT_URL      Default http://localhost:3000.
+
+name: agent-core
+
+services:
+  mongodb:
+    image: mongo:7.0
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    # Rocket.Chat needs a replica set. The check initiates it on the first
+    # start and reports healthy once this node is the writable primary.
+    healthcheck:
+      test:
+        - CMD
+        - mongosh
+        - --quiet
+        - --eval
+        - >-
+          try { rs.status() } catch (e) {
+          rs.initiate({ _id: 'rs0', members: [{ _id: 0, host: 'mongodb:27017' }] }) }
+          quit(db.hello().isWritablePrimary ? 0 : 1)
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 30s
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - egress
+    restart: unless-stopped
+
+  rocketchat:
+    image: rocketchat/rocket.chat:${ROCKETCHAT_VERSION:-7.13.9}
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    environment:
+      MONGO_URL: mongodb://mongodb:27017/rocketchat?replicaSet=rs0
+      ROOT_URL: ${ROCKETCHAT_ROOT_URL:-http://localhost:3000}
+      PORT: "3000"
+      DEPLOY_METHOD: docker
+      ADMIN_USERNAME: ${RC_ADMIN_USERNAME:-admin}
+      ADMIN_PASS: ${RC_ADMIN_PASS:-}
+      ADMIN_EMAIL: ${RC_ADMIN_EMAIL:-admin@agent-core.invalid}
+      OVERWRITE_SETTING_Show_Setup_Wizard: completed
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - >-
+          fetch('http://127.0.0.1:3000/api/info')
+          .then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 60s
+    ports:
+      - "127.0.0.1:3000:3000"
+    networks:
+      - egress
+    restart: unless-stopped
+
+  # Gives agentd's data directory to uid 10001, agentd's user. Docker
+  # creates a missing bind mount source owned by root.
+  data-init:
+    image: busybox:1.37
+    command: ["sh", "-c", "chown 10001:10001 /data && chmod 0700 /data"]
+    volumes:
+      - ${AGENT_CORE_DATA:-./data}:/data
+    network_mode: none
+
+  agentd:
+    build:
+      context: ../..
+      dockerfile: images/agentd/Dockerfile
+    image: agent-core/agentd:dev
+    depends_on:
+      data-init:
+        condition: service_completed_successfully
+    command: ["serve", "--config", "/etc/agentd/agentd.toml"]
+    # Secrets come from the environment only. A variable that is unset
+    # here stays unset in the container.
+    environment:
+      - AGENTD_MASTER_KEY
+      - AGENTD_RC_MANAGER_TOKEN
+    volumes:
+      - ${AGENT_CORE_CONFIG:-../../config/agentd.example.toml}:/etc/agentd/agentd.toml:ro
+      - ${AGENT_CORE_DATA:-./data}:/var/lib/agentd
+      # Development only: the Docker socket gives agentd, and anyone who
+      # takes it over, root on the host. Production should put a socket
+      # proxy in front of the daemon that allows only the container, exec
+      # and event calls agentd makes.
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      - "${DOCKER_GID:?set DOCKER_GID to the group owning the Docker socket; see README.md}"
+    tmpfs:
+      - /tmp
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      egress:
+        ipv4_address: 172.31.0.2
+      sandbox:
+        ipv4_address: 172.30.0.2
+        aliases:
+          - cred-proxy.internal
+          - agentctl.internal
+    # The public listener, for a TLS terminator or tunnel on this machine.
+    ports:
+      - "127.0.0.1:8443:8443"
+    restart: unless-stopped
+
+  # Not a running service: `docker compose --profile sandbox build` builds
+  # the image agentd starts sessions from, and
+  # `docker compose run --rm sandbox bash` opens a shell in it on the
+  # sandbox network. It has the network, init, read-only root, tmpfs and
+  # dropped capabilities agentd gives sessions, but none of their mounts,
+  # environment or resource limits.
+  sandbox:
+    profiles:
+      - sandbox
+    build:
+      context: ../..
+      dockerfile: images/sandbox/Dockerfile
+    image: agent-core/sandbox:dev
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:exec
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - sandbox
+
+networks:
+  egress:
+    name: ${AGENT_CORE_EGRESS_NETWORK:-egress}
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+          ip_range: 172.31.0.128/25
+          gateway: 172.31.0.1
+  sandbox:
+    name: ${AGENT_CORE_SANDBOX_NETWORK:-sandbox}
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-agent-sbx
+      com.docker.network.bridge.inhibit_ipv4: "true"
+      com.docker.network.bridge.enable_icc: "false"
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          ip_range: 172.30.0.128/25
+          gateway: 172.30.0.1
+
+volumes:
+  mongodb-data:
