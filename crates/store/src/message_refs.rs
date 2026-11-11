@@ -608,6 +608,7 @@ mod tests {
         };
         let hand_off = |agent| NewHandOff {
             agent,
+            conv: &first.conv,
             event_json: "{}",
             created_at: at(2),
             due_at: at(3),
@@ -618,7 +619,14 @@ mod tests {
             .unwrap();
         assert!(row.hands_off);
         let due = store
-            .take_due_hand_offs(at(3), std::time::Duration::from_secs(60), at(1), 10, &[])
+            .take_due_hand_offs(
+                at(3),
+                std::time::Duration::from_secs(60),
+                at(1),
+                10,
+                &[],
+                |conv| *conv == first.conv,
+            )
             .await
             .unwrap();
         assert_eq!(due.taken.iter().map(|h| h.id).collect::<Vec<_>>(), ids);
