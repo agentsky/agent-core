@@ -735,7 +735,7 @@ impl<H: TurnHooks> Inner<H> {
 
     /// `turn_starting`, then the turn to `running` once the store records
     /// that the session may have started. Returns the outcome, and whether
-    /// it is the CLI refusing the process's `--resume`.
+    /// that outcome is the CLI refusing the process's `--resume`.
     async fn send(
         &self,
         session: &Session,
