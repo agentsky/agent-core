@@ -37,15 +37,17 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::routing::get;
-use core_types::{BindingId, InboundEvent, SendError, Sender, Sink, TeamId, Throttle, UserId};
+use core_types::{
+    BindingId, InboundEvent, MemberKey, SendError, Sender, Sink, TeamId, Throttle, UserId,
+};
 use futures::FutureExt as _;
 use secrecy::SecretString;
 use store::{CloudDeleted, Store};
 use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
-    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
-    SlackInbound, ingress,
+    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackInbound,
+    ingress,
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -403,8 +405,10 @@ impl Dedup for StoreDedup {
 ///   configuration token for the workspace, and every cloud routine and
 ///   hand-off of the member, whichever surface registered them, telling
 ///   no one, with the store tried a few times since Slack doesn't send the
-///   event again. Only home members' commands go on (see the design's
-///   Slack Connect "Commands"):
+///   event again. The deletion waits in the intake behind the commands of
+///   the member's that arrived first, so such a `slack-token` still
+///   rotating can't store the token after it. Only home members' commands
+///   go on (see the design's Slack Connect "Commands"):
 ///   - A DM whose sender's own team fields make them outside is dropped
 ///     here, without touching the network; the rest are checked against
 ///     the member list or `users.info` in the member's own intake task
@@ -471,11 +475,8 @@ impl Inbound {
         self
     }
 
-    async fn member_left(&self, event: &SlackEvent, home_org: Option<&TeamId>) {
-        let Some(key) = member_who_left(event, home_org) else {
-            return;
-        };
-        let (store, key) = (&self.store, &key);
+    async fn member_left(store: Store, key: MemberKey) {
+        let (store, key) = (&store, &key);
         let deleted = retry_store(
             "deleting a departed member's configuration token",
             key,
@@ -568,7 +569,10 @@ impl Sink<SlackInbound> for Inbound {
             }
             SlackInbound::Message(event, _) => dm_command(&event, identity),
             SlackInbound::Event(event) => {
-                self.member_left(&event, identity.enterprise.as_ref()).await;
+                if let Some(key) = member_who_left(&event, identity.enterprise.as_ref()) {
+                    let job = Self::member_left(self.store.clone(), key.clone());
+                    commands.after_commands_of(key, job).await?;
+                }
                 None
             }
             SlackInbound::ChannelIdChanged(_) => None,
