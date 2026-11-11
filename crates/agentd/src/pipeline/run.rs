@@ -185,8 +185,10 @@ pub const ATTRIBUTION_WAIT: Duration = Duration::from_secs(2);
 ///    is delivered. Only the owner's own turn on the owner's side runs in
 ///    the agent's private session; a decision that would put anyone else's
 ///    there fails the turn before it starts. A turn refused with
-///    [`RunnerError::SessionReset`] runs once more, on the session looked
-///    up again. What the turn message recorded as shown is forgotten when
+///    [`RunnerError::SessionReset`] or [`RunnerError::ResumeRefused`] runs
+///    once more, on the session looked up again, with its message built
+///    again: for the new session, or for the session's transcript that is
+///    now empty. What the turn message recorded as shown is forgotten when
 ///    the turn never reached the model, so the next turn shows it again.
 /// 6. **Delivery**, as the agent's bot, in the thread: the directives are taken
 ///    out of the reply, the turn's staged attachments uploaded, the reply cut
@@ -1791,10 +1793,12 @@ impl Pipeline {
     }
 
     /// Looks the session up, builds the turn message and runs the turn,
-    /// once more on a session reset in between. What the turn message
-    /// recorded is forgotten when the turn didn't run, which includes a
-    /// process that crashed or timed out before the CLI read the message
-    /// (no `init` line): that is [`PipelineError::Unread`].
+    /// once more, with the message built again, on a session reset in
+    /// between or on the CLI refusing to resume a session whose transcript
+    /// is gone. What the turn message recorded is forgotten when the turn
+    /// didn't run, which includes a process that crashed or timed out
+    /// before the CLI read the message (no `init` line): that is
+    /// [`PipelineError::Unread`].
     async fn turn(
         &self,
         event: &InboundEvent,
@@ -1853,9 +1857,18 @@ impl Pipeline {
                     ) {
                         sessions.stop(session.id).await;
                     }
-                    if matches!(err, RunnerError::SessionReset) && attempt == 1 {
-                        tracing::info!(session = %session.id, "the session was reset before the turn ran; running it on the new one");
-                        continue;
+                    if attempt == 1 {
+                        match err {
+                            RunnerError::SessionReset => {
+                                tracing::info!(session = %session.id, "the session was reset before the turn ran; running it on the new one");
+                                continue;
+                            }
+                            RunnerError::ResumeRefused => {
+                                tracing::info!(session = %session.id, "the session's transcript is gone; running the turn on a fresh one");
+                                continue;
+                            }
+                            _ => {}
+                        }
                     }
                     return Err(err.into());
                 }
@@ -2794,7 +2807,7 @@ fn unread(outcome: &TurnOutcome) -> bool {
 
 /// Why handling a message failed.
 #[derive(Debug, thiserror::Error)]
-enum PipelineError {
+pub(super) enum PipelineError {
     #[error("the turn isn't the owner's own, so it can't run on the agent's private side")]
     NotTheOwnersTurn,
     #[error("the CLI ended before it read the turn's message")]
@@ -3671,7 +3684,6 @@ mod tests {
             }),
             finished,
             process_start: None,
-            reran: false,
         }
     }
 
