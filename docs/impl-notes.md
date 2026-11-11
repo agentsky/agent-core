@@ -2931,6 +2931,19 @@ the refusal is one agentd gives only after deleting the session's
 leases. With no lost answer before it, nothing was granted, and it still
 fails at once.
 
+Review later found that a late attempt could shorten the lease. agentd
+takes `now` before it waits to write the lease, so an attempt held up past
+agentctl's timeout and landing after a retry was granted reset the expiry
+to its own earlier `now + ttl`: a retry granted at 1,031 s until 1,061 s
+was cut back to 1,030 s by the first attempt, taken at 1,000 s, and
+another session could then take the lock while the command still ran. A
+late renewal could do the same. The acquire and the renewal now keep the
+later of the stored and the new expiry, and return it. An answer can then
+carry more than `ttl`, but agentd measures `seconds_left` from a `now`
+taken no earlier than agentctl sent the request, and agentctl counts it
+from that send, so whatever expiry an answer carries, agentctl never
+relies on the lease past it.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
