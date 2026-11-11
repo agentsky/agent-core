@@ -4,7 +4,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ConsentId, MemberId, MemberKey};
+use crate::{ConsentId, MemberId, MemberKey, Outside};
 
 /// The kind of credential a turn runs on. A warm `claude` process can't
 /// switch kinds, so a change restarts it.
@@ -45,6 +45,13 @@ pub struct Requester {
     pub member: Option<MemberId>,
     /// The requester's identity on the surface.
     pub key: MemberKey,
+    /// Whether the requester is from outside the workspace agentd serves,
+    /// as their message said ([`InboundEvent::outside`](crate::InboundEvent::outside));
+    /// `None` for a member of it, and always on Rocket.Chat. A hop's
+    /// requester takes it from the attribution of the post that named the
+    /// agent, never from the posting bot.
+    #[serde(default)]
+    pub outside: Option<Outside>,
 }
 
 /// How many agent-to-agent hops led to a turn. A turn a person started is
@@ -146,8 +153,28 @@ mod tests {
         json_round_trip(&Requester {
             member: Some(member),
             key: key.clone(),
+            outside: None,
         });
-        json_round_trip(&Requester { member: None, key });
+        let outside = Requester {
+            member: None,
+            key: key.clone(),
+            outside: Some(Outside {
+                team: "T0THEIRS1".into(),
+            }),
+        };
+        assert_eq!(
+            json_round_trip(&outside)["outside"],
+            serde_json::json!({"team": "T0THEIRS1"})
+        );
+        let stored: Requester = serde_json::from_value(serde_json::json!({
+            "member": null,
+            "key": serde_json::to_value(&key).unwrap(),
+        }))
+        .unwrap();
+        assert_eq!(
+            stored.outside, None,
+            "a requester stored before outside reads as home"
+        );
 
         assert_eq!(json_round_trip(&Hop(2)), serde_json::json!(2));
         assert!(serde_json::from_str::<Hop>("256").is_err());

@@ -37,7 +37,8 @@
 //! 5. 400 if a verified body can't be parsed, or names an id that isn't
 //!    shaped like Slack's (see [Shapes](#shapes)).
 //! 6. An empty 200, and nothing more, for what an agent's app doesn't need
-//!    (see [Agents' apps](#agents-apps)).
+//!    (see [Agents' apps](#agents-apps)), and for an `event_callback` that
+//!    names no installation (see [The workspace](#the-workspace)).
 //! 7. 503 if the binding has too many requests in flight: acknowledged, and
 //!    not yet handed on (see [`InFlight`]). Each agent's app may have
 //!    [`MAX_IN_FLIGHT_PER_AGENT`] at once, the apps of one owner's agents
@@ -62,8 +63,9 @@
 //! level, the next warning saying how many there were: a refusal at any
 //! step, Slack's `app_rate_limited` notice, a retried delivery, an
 //! answered challenge, an agent's message older than the confirmation
-//! window, a message dropped for its owner's rate, a message [`normalize`]
-//! finds malformed, and a queued body that no longer parses. Each
+//! window, an event that names no installation, a message dropped for its
+//! owner's rate, a message [`normalize`] finds malformed, and a queued body
+//! that no longer parses. Each
 //! binding's are counted apart, so one app's flood hides no other's. A
 //! request refused with 400 takes none of the bucket's tokens, since it
 //! writes nothing and its log is throttled like the rest.
@@ -102,6 +104,39 @@
 //!   a replay inside the five-minute window.
 //!
 //! Each key is kept for [`DEDUP_RETENTION`].
+//!
+//! These keys don't change for Slack Connect. Slack delivers an event once
+//! to each app that may see it, however many workspaces the app is
+//! installed in, and each agent's app is installed only in the workspace
+//! agentd serves, so a message in a shared channel reaches each binding
+//! once, with Slack's retries under the same `event_id`; neither key
+//! depends on how many workspaces the channel spans, nor on whether two
+//! apps see one message under the same `event_id`, which Slack doesn't say
+//! (see the design's Slack Connect section, "Delivery and deduplication").
+//!
+//! # The workspace
+//!
+//! The workspace an event came through is its installation's,
+//! `authorizations[0].team_id`, shaped like a team id ([`is_team_id`]).
+//! In a Slack Connect channel the envelope's `team_id` may hold the team
+//! of whoever acted, so it is never used instead, and nothing reads the
+//! envelope's `is_ext_shared_channel`, `context_team_id` or
+//! `enterprise_id`. An `event_callback` with no such team, or a null one,
+//! gets its 200 and is dropped, with a warning at most once per binding
+//! per [`WARNING_INTERVAL`]; `url_verification` and `app_rate_limited`
+//! don't carry one and are handled as before. The workspace keys the
+//! message's sender and conversation ([`normalize::Context::team`]) and is
+//! a non-message event's [`SlackEvent::team`]. Slash commands and
+//! interactions carry no `authorizations`: theirs is the payload's
+//! `team_id` or `team.id`, and an interaction also names the clicker's own
+//! team ([`Interaction::sender_team`]).
+//!
+//! Once the queue knows the workspace agentd serves
+//! ([`Queue::with_workspace`]), an event installed in another one (an
+//! owner who made their agent's app public and installed it there) is
+//! dropped before it is deduplicated, with a warning at most once per
+//! binding per [`WARNING_INTERVAL`], so it can't take the key a delivery
+//! of the same message through the home installation needs.
 //!
 //! # Shapes
 //!
@@ -157,8 +192,9 @@ use core_types::{
 };
 use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use secrecy::SecretString;
-use serde::Deserialize;
-use serde::de::IgnoredAny;
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -367,7 +403,15 @@ pub fn ingress(secrets: Arc<dyn SigningSecrets>, capacity: usize) -> (Router, Qu
         .route("/slack/b/{binding}/interactivity", post(interactivity))
         .route("/slack/b/{binding}/commands", post(commands))
         .with_state(state);
-    (router, Queue { receiver, notes })
+    (
+        router,
+        Queue {
+            receiver,
+            notes,
+            workspace: None,
+            home_org: None,
+        },
+    )
 }
 
 /// What the ingress logs at most once per binding per
@@ -379,6 +423,8 @@ enum Note {
     Challenge,
     Retry,
     Stale,
+    Uninstalled,
+    Elsewhere,
     OwnerRate,
     Malformed,
     Reparsed,
@@ -452,6 +498,21 @@ impl Ingress {
             None => tracing::debug!(
                 %binding,
                 "dropped an agent's Slack message older than the confirmation window"
+            ),
+        }
+    }
+
+    /// Logs an `event_callback` dropped for naming no installation.
+    fn uninstalled(&self, binding: BindingRef) {
+        match note(&self.notes, binding, Note::Uninstalled) {
+            Some(quiet) => tracing::warn!(
+                %binding,
+                dropped_since_last_warning = quiet,
+                "dropped a Slack event whose authorizations name no installation team"
+            ),
+            None => tracing::debug!(
+                %binding,
+                "dropped a Slack event whose authorizations name no installation team"
             ),
         }
     }
@@ -886,6 +947,10 @@ async fn handle(
             ingress.stale(binding);
             return StatusCode::OK.into_response();
         }
+        Ok(Checked::Uninstalled) => {
+            ingress.uninstalled(binding);
+            return StatusCode::OK.into_response();
+        }
         Err(reason) => {
             ingress.refused(binding, kind, StatusCode::BAD_REQUEST, &reason);
             return StatusCode::BAD_REQUEST.into_response();
@@ -1024,6 +1089,142 @@ struct EnvelopeHead {
     event_id: Option<String>,
     event: Option<EventHead>,
     minute_rate_limited: Option<i64>,
+    #[serde(default)]
+    authorizations: Installation,
+}
+
+/// The workspace an event came through: `authorizations[0].team_id`, when
+/// it is a string shaped like a team id, and `None` for anything else.
+/// Only the first authorization is read, and the rest are skipped without
+/// being kept, so a long list costs nothing.
+#[derive(Debug, Default)]
+struct Installation(Option<TeamId>);
+
+impl<'de> Deserialize<'de> for Installation {
+    fn deserialize<D: Deserializer<'de>>(value: D) -> Result<Self, D::Error> {
+        value.deserialize_any(FirstAuthorization)
+    }
+}
+
+struct FirstAuthorization;
+
+impl<'de> Visitor<'de> for FirstAuthorization {
+    type Value = Installation;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Self::Value, A::Error> {
+        let first = items.next_element::<Authorization>()?;
+        while items.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Installation(first.and_then(|first| first.0)))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Self::Value, A::Error> {
+        while entries.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Installation(None))
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, value: D) -> Result<Self::Value, D::Error> {
+        value.deserialize_any(self)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Installation(None))
+    }
+}
+
+/// One authorization's `team_id`, read as [`Installation`] says; an
+/// authorization that isn't an object has none.
+struct Authorization(Option<TeamId>);
+
+#[derive(Deserialize)]
+struct AuthorizationFields {
+    #[serde(default, deserialize_with = "normalize::team_id_or_nothing")]
+    team_id: Option<TeamId>,
+}
+
+impl<'de> Deserialize<'de> for Authorization {
+    fn deserialize<D: Deserializer<'de>>(value: D) -> Result<Self, D::Error> {
+        value.deserialize_any(AuthorizationVisitor)
+    }
+}
+
+struct AuthorizationVisitor;
+
+impl<'de> Visitor<'de> for AuthorizationVisitor {
+    type Value = Authorization;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("any value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, entries: A) -> Result<Self::Value, A::Error> {
+        let fields = AuthorizationFields::deserialize(MapAccessDeserializer::new(entries))?;
+        Ok(Authorization(fields.team_id))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<Self::Value, A::Error> {
+        while items.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Authorization(None))
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, value: D) -> Result<Self::Value, D::Error> {
+        value.deserialize_any(self)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(Authorization(None))
+    }
 }
 
 #[derive(Deserialize)]
@@ -1047,7 +1248,8 @@ struct MessageIds {
 
 #[derive(Deserialize)]
 struct EventCallback {
-    team_id: Option<String>,
+    #[serde(default)]
+    authorizations: Installation,
     event_id: String,
     event: Map<String, Value>,
 }
@@ -1079,6 +1281,7 @@ enum Checked {
     RateLimited { minute_rate_limited: Option<i64> },
     Ignore(&'static str),
     Stale,
+    Uninstalled,
 }
 
 struct Queued {
@@ -1111,6 +1314,7 @@ fn check(
             match head.kind.as_str() {
                 "event_callback" => Ok(match check_callback(&head, body)? {
                     None if agent => Checked::Ignore("an agent's app's event other than a message"),
+                    _ if head.authorizations.0.is_none() => Checked::Uninstalled,
                     Some(ts)
                         if agent
                             && ts
@@ -1199,6 +1403,8 @@ fn command_form(body: &[u8]) -> Result<CommandForm, &'static str> {
 pub struct Queue {
     receiver: mpsc::UnboundedReceiver<Queued>,
     notes: Arc<Notes>,
+    workspace: Option<TeamId>,
+    home_org: Option<TeamId>,
 }
 
 impl fmt::Debug for Queue {
@@ -1210,6 +1416,19 @@ impl fmt::Debug for Queue {
 }
 
 impl Queue {
+    /// Takes events only from installations in `workspace`, the one agentd
+    /// serves ([The workspace](self#the-workspace)), and normalizes messages
+    /// knowing that `home_org`, the `enterprise_id` `auth.test` gave for it,
+    /// is its own Enterprise Grid organization
+    /// ([`normalize::Context::home_org`]). Without it, every installation's
+    /// events are taken, and the receiver of the queue tells them apart.
+    #[must_use]
+    pub fn with_workspace(mut self, workspace: TeamId, home_org: Option<TeamId>) -> Self {
+        self.workspace = Some(workspace);
+        self.home_org = home_org;
+        self
+    }
+
     /// Handles queued requests one at a time, in the order they arrived,
     /// sending each that survives deduplication and normalization to `out`.
     ///
@@ -1217,7 +1436,15 @@ impl Queue {
     /// closed, dropping what is left.
     pub async fn run(mut self, dedup: Arc<dyn Dedup>, out: Sender<SlackInbound>) {
         while let Some(queued) = self.receiver.recv().await {
-            let Some(inbound) = process(queued, dedup.as_ref(), &self.notes).await else {
+            let Some(inbound) = process(
+                queued,
+                dedup.as_ref(),
+                &self.notes,
+                self.workspace.as_ref(),
+                self.home_org.as_ref(),
+            )
+            .await
+            else {
                 continue;
             };
             let (binding, kind) = (inbound.binding(), inbound.kind());
@@ -1229,7 +1456,13 @@ impl Queue {
     }
 }
 
-async fn process(queued: Queued, dedup: &dyn Dedup, notes: &Notes) -> Option<SlackInbound> {
+async fn process(
+    queued: Queued,
+    dedup: &dyn Dedup,
+    notes: &Notes,
+    workspace: Option<&TeamId>,
+    home_org: Option<&TeamId>,
+) -> Option<SlackInbound> {
     let Queued {
         binding,
         bot_user,
@@ -1257,16 +1490,29 @@ async fn process(queued: Queued, dedup: &dyn Dedup, notes: &Notes) -> Option<Sla
                 .inspect_err(|_| reparsed("the event"))
                 .ok()?;
             drop(body);
-            process_event(
+            let Some(team) = callback.authorizations.0.clone() else {
+                reparsed("the event's installation");
+                return None;
+            };
+            if workspace.is_some_and(|workspace| *workspace != team) {
+                match note(notes, binding, Note::Elsewhere) {
+                    Some(quiet) => {
+                        tracing::warn!(%binding, installation = %team, dropped_since_last_warning = quiet, "dropped a Slack event installed in another workspace")
+                    }
+                    None => {
+                        tracing::debug!(%binding, installation = %team, "dropped a Slack event installed in another workspace")
+                    }
+                }
+                return None;
+            }
+            let context = EventContext {
                 binding,
-                bot_user.as_ref(),
+                bot_user: bot_user.as_ref(),
+                team: &team,
+                home_org,
                 received_at,
-                callback,
-                dedup,
-                notes,
-                place,
-            )
-            .await
+            };
+            process_event(&context, callback, dedup, notes, place).await
         }
         Kind::Commands => {
             let form = command_form(&body)
@@ -1340,6 +1586,12 @@ async fn process(queued: Queued, dedup: &dyn Dedup, notes: &Notes) -> Option<Sla
                     team: team.into(),
                     user: user.into(),
                 });
+            let sender_team = payload
+                .get("user")
+                .and_then(|user| user.get("team_id"))
+                .and_then(Value::as_str)
+                .filter(|team| is_team_id(team))
+                .map(TeamId::from);
             let kind = payload
                 .get("type")
                 .and_then(Value::as_str)
@@ -1349,6 +1601,7 @@ async fn process(queued: Queued, dedup: &dyn Dedup, notes: &Notes) -> Option<Sla
                 binding: binding.id(),
                 kind,
                 sender,
+                sender_team,
                 response_url,
                 payload,
                 received_at,
@@ -1357,21 +1610,32 @@ async fn process(queued: Queued, dedup: &dyn Dedup, notes: &Notes) -> Option<Sla
     }
 }
 
-async fn process_event(
+/// What [`process_event`] needs besides the event.
+struct EventContext<'a> {
     binding: BindingRef,
-    bot_user: Option<&UserId>,
+    bot_user: Option<&'a UserId>,
+    team: &'a TeamId,
+    home_org: Option<&'a TeamId>,
     received_at: OffsetDateTime,
+}
+
+async fn process_event(
+    context: &EventContext<'_>,
     callback: EventCallback,
     dedup: &dyn Dedup,
     notes: &Notes,
     place: InFlight,
 ) -> Option<SlackInbound> {
+    let EventContext {
+        binding,
+        bot_user,
+        team,
+        home_org,
+        received_at,
+    } = *context;
     let EventCallback {
-        team_id,
-        event_id,
-        event,
+        event_id, event, ..
     } = callback;
-    let team = team_id.filter(|team| !team.is_empty()).map(TeamId::from);
     let event_type = event
         .get("type")
         .and_then(Value::as_str)
@@ -1385,21 +1649,18 @@ async fn process_event(
         }
         return Some(SlackInbound::Event(SlackEvent {
             binding: binding.id(),
-            team,
+            team: team.clone(),
             event_id,
             event_type,
             event,
             received_at,
         }));
     }
-    let Some(team) = team else {
-        tracing::debug!(%binding, event_id, "dropped a Slack message without a team_id");
-        return None;
-    };
     let context = normalize::Context {
         binding: binding.id(),
         bot_user,
-        team: &team,
+        team,
+        home_org,
         event_id: &event_id,
         received_at,
     };

@@ -163,6 +163,7 @@ impl Harness {
             reply_to: None,
             files: Vec::new(),
             received_at: OffsetDateTime::now_utc(),
+            outside: None,
         }
     }
 

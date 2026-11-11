@@ -157,6 +157,18 @@ pub enum StoreError {
 /// A `Result` whose error is [`StoreError`].
 pub type Result<T, E = StoreError> = std::result::Result<T, E>;
 
+/// Refuses a requester from outside the workspace: no column holds
+/// [`Requester::outside`](core_types::Requester::outside) until T36b adds
+/// them, and a row written without it would read back as home.
+fn home_requester(requester: &core_types::Requester) -> Result<()> {
+    if requester.outside.is_some() {
+        return Err(StoreError::Refused {
+            what: "a requester from outside the workspace",
+        });
+    }
+    Ok(())
+}
+
 /// The database: a connection pool, migrated to the latest schema, and the
 /// [`Sealer`] for its encrypted columns.
 ///

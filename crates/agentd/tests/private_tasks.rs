@@ -457,6 +457,7 @@ impl Stack {
             reply_to: root.map(|root| msg("GENERAL", root)),
             files: vec![],
             received_at: OffsetDateTime::now_utc(),
+            outside: None,
         }
     }
 
@@ -1451,6 +1452,7 @@ async fn owner_requester_at_hop_one_needs_a_card() {
                 requester: &core_types::Requester {
                     member: Some(stack.alice),
                     key: key("alice"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 consent: None,
@@ -2049,6 +2051,7 @@ async fn a_card_that_cant_reach_the_owner_expires_without_running() {
                 requester: &core_types::Requester {
                     member: None,
                     key: key("bob"),
+                    outside: None,
                 },
                 hop: core_types::Hop::ZERO,
                 task: TASK,

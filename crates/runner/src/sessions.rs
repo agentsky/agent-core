@@ -1440,6 +1440,7 @@ mod tests {
                     team: "T1".into(),
                     user: "U1".into(),
                 },
+                outside: None,
             },
             hop: core_types::Hop::ZERO,
             side: Side::Public,

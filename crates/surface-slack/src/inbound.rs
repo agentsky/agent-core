@@ -38,13 +38,15 @@ impl SlackInbound {
         }
     }
 
-    /// The workspace the request came from: a message's conversation's, an
-    /// event's envelope's, a command's or an interaction's sender's.
-    /// `None` when Slack named none.
+    /// The workspace the request came through: a message's or an event's
+    /// installation's (see the ingress's
+    /// [The workspace](mod@crate::ingress#the-workspace)), a command's
+    /// `team_id`, an interaction's `team.id`. `None` when an interaction
+    /// named none.
     pub fn team(&self) -> Option<&TeamId> {
         match self {
             Self::Message(event, _) => Some(&event.conv.team),
-            Self::Event(event) => event.team.as_ref(),
+            Self::Event(event) => Some(&event.team),
             Self::Command(command) => Some(&command.sender.team),
             Self::Interaction(interaction) => {
                 interaction.sender.as_ref().map(|sender| &sender.team)
@@ -72,8 +74,9 @@ impl SlackInbound {
 pub struct SlackEvent {
     /// The binding whose app received the event.
     pub binding: BindingId,
-    /// The envelope's `team_id`, when it has one.
-    pub team: Option<TeamId>,
+    /// The workspace the event came through: its installation's,
+    /// `authorizations[0].team_id`, never the envelope's `team_id`.
+    pub team: TeamId,
     /// The envelope's `event_id`.
     pub event_id: String,
     /// The event's `type`, such as `user_change`.
@@ -146,6 +149,11 @@ pub struct Interaction {
     pub kind: String,
     /// Who interacted, from `team.id` and `user.id`, when both are present.
     pub sender: Option<MemberKey>,
+    /// The clicker's own team, the payload's `user.team_id`, when it has
+    /// one shaped like a team id. In a Slack Connect conversation it names
+    /// a member of another organization's, where `team.id` may name the
+    /// workspace the app is installed in.
+    pub sender_team: Option<TeamId>,
     /// The payload's `response_url`, when it has one. Kept secret like a
     /// [`SlashCommand`]'s.
     pub response_url: Option<SecretString>,
@@ -162,6 +170,7 @@ impl fmt::Debug for Interaction {
             .field("binding", &self.binding)
             .field("kind", &self.kind)
             .field("sender", &self.sender)
+            .field("sender_team", &self.sender_team)
             .field("received_at", &self.received_at)
             .finish_non_exhaustive()
     }
@@ -177,7 +186,7 @@ mod tests {
     fn an_events_debug_leaves_out_the_event_object() {
         let event = SlackEvent {
             binding: BindingId::new_v4(),
-            team: Some("T1".into()),
+            team: "T1".into(),
             event_id: "Ev1".into(),
             event_type: "app_mention".into(),
             event: json!({ "type": "app_mention", "text": "the launch code is 1234" }),

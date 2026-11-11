@@ -140,6 +140,7 @@ impl Rig {
                     team: "chat.example".into(),
                     user: "alice".into(),
                 },
+                outside: None,
             },
             hop: Hop::ZERO,
             side: Side::Public,

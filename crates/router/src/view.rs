@@ -34,7 +34,9 @@ pub const DEFAULT_MAX_HOPS: Hop = Hop(3);
 ///    `event.sender`. For a managed agent's message: [`message_ref`] for
 ///    `event.message`, then [`member_for`] for the recorded requester's key
 ///    if no member was recorded.
-/// 6. [`is_banned`] for the requester.
+/// 6. [`is_banned`] for the requester, unless the requester is from
+///    outside the workspace, which the router ignores without another
+///    lookup; and so for the rest.
 /// 7. [`policy`] for `agent`.
 /// 8. [`thread_budget`], unless the event is in a one-to-one DM.
 /// 9. [`link_state`] for the requester's member (the owner's, when the

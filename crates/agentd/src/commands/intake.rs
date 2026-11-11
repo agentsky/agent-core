@@ -13,6 +13,11 @@
 //! and the intake waits for it at shutdown as for the command itself. The
 //! cleanup when a member leaves runs in the same order, so a command of
 //! theirs that arrived first can't store what it deletes.
+//!
+//! A Slack manager DM's home check runs there too, first
+//! ([Who may run them](super#who-may-run-them)), so a slow `users.info`
+//! holds up only that member's commands, never the Slack queue that
+//! submitted it.
 
 use std::collections::HashMap;
 use std::fmt;

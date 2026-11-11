@@ -118,6 +118,10 @@ async fn harness() -> Harness {
             json!({"channel": {"id": "D0DM00001"}}),
         ),
         ("users.list", json!({"members": []})),
+        (
+            "users.info",
+            json!({"user": {"id": "U0ADA0001", "team_id": TEAM}}),
+        ),
     ] {
         mount(&slack, name, MANAGER_TOKEN, ok(body)).await;
     }
@@ -141,6 +145,7 @@ async fn harness() -> Harness {
             bot_id: "B0MANAGER".to_owned(),
             app_id: "A0MANAGER".to_owned(),
             app_name: None,
+            enterprise: None,
         },
     );
     let bots = SlackBots::new(store.clone(), client, manager.surface());
@@ -408,6 +413,7 @@ fn bot_message(binding: BindingId, team: &str) -> InboundEvent {
         reply_to: None,
         files: vec![],
         received_at: OffsetDateTime::now_utc(),
+        outside: None,
     }
 }
 
