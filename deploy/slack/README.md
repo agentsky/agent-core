@@ -407,6 +407,10 @@ Rocket.Chat, in CI.
   - `/agent admin ban @<member> testing`: they may run only `me`, `logout`,
     `cloud rm`, and `pause` or `delete` of their own agents, and
     `/agent me` says so. Then `/agent admin unban @<member>`.
+  - Undo the rest before section D, whose checks need `helper` open to
+    the unlinked member: `/agent limits helper turns=off`, and
+    `/agent allow helper @<member>` for the member denied above, since
+    `allow everyone` keeps a deny of one member.
 
 ### D. Private tasks and agents asking agents
 
