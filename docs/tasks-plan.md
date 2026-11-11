@@ -2177,7 +2177,8 @@ Deliverables:
      session's queue, and `RunnerError::ResumeRefused` when the CLI refused
      to resume a session whose transcript is gone. The pipeline then calls
      `lookup_or_create` again, builds the message again and retries the
-     turn once on the session it returns.
+     turn on the session it returns, at most once for each of the two
+     causes, so a turn takes at most three attempts.
   4. Deliver the reply:
      1. Extract directives.
      2. Upload staged attachments first.
@@ -2201,12 +2202,12 @@ Deliverables:
   - For a session that starts with an empty transcript, as after the CLI
     refused to resume it, the thread's last 50 messages whether or not the
     session has `message_refs` rows for them; a message with a row keeps its
-    short id. When those 50 don't reach back to the thread's root, a line
-    says to read older ones with `agentctl history --before` the oldest
-    shown. If reading the thread fails with a rate limit or an unreachable
-    platform and the session already has rows, the turn fails before the
-    CLI reads it, so the next turn tries again; any other failure goes on
-    without the history.
+    short id. When the thread has messages older than those 50, a line
+    says to read them with `agentctl history --before` the oldest shown.
+    If reading the thread fails with a rate limit, an unreachable platform
+    or one that answers it is unavailable, and the session already has
+    rows, the turn fails before the CLI reads it, so the next turn tries
+    again; any other failure goes on without the history.
   - Messages agentd posted for this agent in this thread outside this session,
     found in `message_refs` by agent, thread (`surface`, `team_id`,
     `conversation`, `thread_root`) and a different `session_id`, so results
