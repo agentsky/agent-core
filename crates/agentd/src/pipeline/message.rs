@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 
 use core_types::{
     ConvKind, Cursor, Hop, InboundEvent, MemberKey, Msg, MsgRef, Requester, SessionId, Surface,
-    ThreadKey,
+    SurfaceError, ThreadKey,
 };
 use store::{MessageRef, NewMessageRef, Session, Store, StoreError};
 use time::OffsetDateTime;
@@ -62,14 +62,15 @@ async fn forget(store: &Store, session: SessionId, shown: &[u32]) {
 ///    those messages is shown, rows or not: one the session already has a
 ///    row for keeps its short id and isn't recorded again, so forgetting
 ///    what this message recorded leaves it alone; when the history read
-///    is a full window, a line points to `agentctl history` for older
-///    messages. A post of the agent's bot is marked as from outside the
-///    session only when it is attributed to another session; the bot's
-///    other posts, such as the files a turn uploaded or agentd's notices,
-///    may be this session's. A history that can't be read is left out,
-///    except that building fails for a session that starts with an empty
-///    transcript and already has rows, whose messages would otherwise
-///    never be shown.
+///    is a full window that doesn't start at the thread's root, a line
+///    points to `agentctl history` for older messages. A post of the
+///    agent's bot is marked as from outside the session only when it is
+///    attributed to another session; the bot's other posts, such as the
+///    files a turn uploaded or agentd's notices, may be this session's. A
+///    history that can't be read is left out, except that building fails
+///    on a rate limit or an unreachable platform for a session that starts
+///    with an empty transcript and already has rows, whose messages would
+///    otherwise never be shown.
 /// 2. Such posts from other sessions that the history didn't reach and
 ///    the session has no row for ([`Store::posted_elsewhere`]), named for
 ///    `agentctl history`.
@@ -230,8 +231,9 @@ struct Unseen {
     /// The messages, oldest first, each with the session's row for it if
     /// it has one.
     messages: Vec<(Msg, Option<MessageRef>)>,
-    /// Whether the thread has older messages than these that an empty
-    /// transcript lacks too.
+    /// Whether the thread may have older messages than these that an empty
+    /// transcript lacks too: the read filled its window, and its oldest
+    /// message isn't the thread's root.
     older: bool,
 }
 
@@ -240,9 +242,12 @@ struct Unseen {
 /// of them when it starts with an empty transcript.
 ///
 /// A history that can't be read is left out, unless the session starts
-/// with an empty transcript and has rows: their messages would then never
+/// with an empty transcript, has rows, and the read failed in a way a later
+/// one may not ([`transient`]): the messages of those rows would then never
 /// be shown, so building fails with [`PipelineError::Surface`] and the
-/// session stays unstarted for the next turn to try again.
+/// session stays unstarted for the next turn to try again. A failure that
+/// would fail every later read too leaves the history out, so the thread
+/// still gets answers.
 async fn unseen_history(
     store: &Store,
     surface: &dyn Surface,
@@ -263,15 +268,26 @@ async fn unseen_history(
         .await
     {
         Ok(history) => history,
-        Err(err) if fresh && store.has_message_refs(session.id).await? => {
-            return Err(err.into());
-        }
         Err(err) => {
+            if fresh && transient(&err) {
+                match store.has_message_refs(session.id).await {
+                    Ok(true) => return Err(err.into()),
+                    Ok(false) => {}
+                    Err(store_err) => {
+                        tracing::warn!(session = %session.id, error = %err, "couldn't read the thread for a turn");
+                        return Err(store_err.into());
+                    }
+                }
+            }
             tracing::warn!(session = %session.id, error = %err, "couldn't read the thread for a turn; going without it");
             return Ok(Unseen::default());
         }
     };
-    let older = fresh && history.len() >= HISTORY_LIMIT;
+    let older = fresh
+        && history.len() >= HISTORY_LIMIT
+        && history
+            .first()
+            .is_some_and(|oldest| thread.root.as_ref() != Some(&oldest.id));
     let mut messages = Vec::new();
     for msg in history {
         if msg.id == event.message.id {
@@ -285,6 +301,17 @@ async fn unseen_history(
         }
     }
     Ok(Unseen { messages, older })
+}
+
+/// Whether a later read may succeed where one that failed with `err`
+/// didn't: the platform asked to slow down or couldn't be reached. Any
+/// other error, an [`SurfaceError::Api`] one included since it can't tell
+/// a platform outage from a refusal, is taken to fail every read.
+fn transient(err: &SurfaceError) -> bool {
+    matches!(
+        err,
+        SurfaceError::RateLimited { .. } | SurfaceError::Transport(_)
+    )
 }
 
 fn msg_ref(thread: &ThreadKey, msg: &Msg) -> MsgRef {
