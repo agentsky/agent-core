@@ -121,13 +121,20 @@ early, and a second run waits for the first.
 
 1. Create a tunnel in Cloudflare's dashboard and give it a public hostname
    whose service is `http://localhost:8443`.
-2. Set the repository secrets `CF_TOKEN`, the tunnel's token, and
+2. Create the environment `slack-live` under Settings, Environments, and
+   limit its deployment branches to `main`, so that its secrets reach only
+   runs of reviewed code: anyone who can push a branch could change the
+   workflow or its script there and dispatch it. Keep the secrets below in
+   the environment, not in the repository secrets, which every branch's
+   workflows can read.
+3. Set the environment secrets `CF_TOKEN`, the tunnel's token, and
    `CF_URL_BASE`, the hostname as `https://<public host>`, which becomes
    `public_url`. The run's `CF_TOKEN` and `CF_URL_BASE` inputs override them
    for one run, but anyone who can read the repository's runs can read an
    input, so keep the token in the secret.
-3. Run it once without the manager app's secrets to create the app (A1),
-   then set them as the secrets `AGENTD_SLACK_MANAGER_SIGNING_SECRET` and
+4. Run it once without the manager app's secrets to create the app (A1),
+   then set them as the environment secrets
+   `AGENTD_SLACK_MANAGER_SIGNING_SECRET` and
    `AGENTD_SLACK_MANAGER_BOT_TOKEN` and run it again. Put the owner's
    `slack:<team id>:<user id>` in the `community-admins` input.
 

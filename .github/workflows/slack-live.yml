@@ -5,7 +5,12 @@ name: Slack live server
 # scripts/ci/slack-live-server.sh. It is started by hand only, and stops on
 # its own or when the run is cancelled.
 #
-# Repository secrets:
+# Secrets of the `slack-live` environment, which Settings > Environments
+# must limit to the main branch ("Selected branches and tags": main), so
+# that only reviewed code reaches them: a run dispatched from any other
+# branch, whose workflow or script anyone who can push could have
+# changed, is refused them. Keep them out of the repository secrets,
+# which every branch's workflows can read.
 #
 #   CF_TOKEN     The tunnel's token. Its public hostname's service in
 #                Cloudflare's dashboard must be http://localhost:8443.
@@ -55,6 +60,7 @@ jobs:
   serve:
     name: agentd for the Slack live checks
     runs-on: ubuntu-24.04
+    environment: slack-live
     # The image builds, at most 300 minutes up, and cleaning up, within a
     # hosted runner's six hours.
     timeout-minutes: 355
