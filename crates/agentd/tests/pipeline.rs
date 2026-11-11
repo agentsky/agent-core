@@ -1587,7 +1587,7 @@ impl Stack {
         self.turns.sessions().stop(session).await;
         let row = self.store().session(session).await.unwrap().unwrap();
         let transcripts = self
-            ._dir
+            .dir
             .join(sandbox::volume_rel_path(&row.volume()))
             .join("sessions")
             .join(session.to_string())
