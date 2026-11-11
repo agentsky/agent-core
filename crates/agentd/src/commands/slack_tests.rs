@@ -1955,6 +1955,22 @@ fn click(user: &str, action: &str, value: &str, response_url: SecretString) -> I
 /// A consent of `helper`, owned by U0OWNER, asked for by U0BOB, whose card
 /// was sent and which the owner then approved.
 async fn approved_with_a_card(h: &SlackHarness) -> core_types::ConsentId {
+    let id = awaiting_a_card(h).await;
+    assert_eq!(
+        h.consents.send_cards(h.commands.replies()).await.unwrap(),
+        1
+    );
+    h.store
+        .decide_consent(id, true, &slack_key("U0OWNER"), OffsetDateTime::now_utc())
+        .await
+        .unwrap()
+        .unwrap();
+    id
+}
+
+/// A consent of `helper`, owned by U0OWNER, asked for by U0BOB, whose card
+/// wasn't sent yet.
+async fn awaiting_a_card(h: &SlackHarness) -> core_types::ConsentId {
     let owner = h.linked("U0OWNER").await;
     let bob = h.linked("U0BOB").await;
     let team = TeamId::new(TEAM);
@@ -2008,16 +2024,70 @@ async fn approved_with_a_card(h: &SlackHarness) -> core_types::ConsentId {
         .await
         .unwrap()
         .unwrap();
+    id
+}
+
+/// The replies of another instance sharing the store, whose Slack manager
+/// app serves another workspace.
+fn other_workspace_replies(h: &SlackHarness) -> Replies {
+    let client = SlackClient::new(&format!("{}/api/", h.slack.uri())).unwrap();
+    let manager = SlackManager::with_identity(
+        client.clone(),
+        client.bot(SecretString::from(BOT_TOKEN)),
+        ManagerIdentity {
+            team: TeamId::new("T0OTHER01"),
+            ..identity()
+        },
+    );
+    Replies::new(None).with_slack(&manager)
+}
+
+#[tokio::test]
+async fn a_card_this_instance_cannot_send_is_left_for_one_that_can() {
+    let h = slack_harness().await;
+    let id = awaiting_a_card(&h).await;
+    assert_eq!(
+        h.consents
+            .send_cards(&other_workspace_replies(&h))
+            .await
+            .unwrap(),
+        0
+    );
     assert_eq!(
         h.consents.send_cards(h.commands.replies()).await.unwrap(),
-        1
+        1,
+        "the instance that reaches the owner sends the card at once"
     );
-    h.store
-        .decide_consent(id, true, &slack_key("U0OWNER"), now)
-        .await
-        .unwrap()
-        .unwrap();
-    id
+    assert!(h.store.consent(id).await.unwrap().unwrap().card.is_some());
+}
+
+#[tokio::test]
+async fn a_card_this_instance_cannot_update_is_left_for_one_that_can() {
+    let h = slack_harness().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat.update"))
+        .respond_with(ok(json!({"ts": "1727700000.000100"})))
+        .mount(&h.slack)
+        .await;
+    let id = approved_with_a_card(&h).await;
+    assert_eq!(
+        h.consents
+            .close_cards(&other_workspace_replies(&h))
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        h.store.consent(id).await.unwrap().unwrap().card_closed_at,
+        None,
+        "the card isn't claimed"
+    );
+    assert_eq!(
+        h.consents.close_cards(h.commands.replies()).await.unwrap(),
+        1,
+        "the instance that serves the card closes it"
+    );
+    assert_eq!(h.calls("chat.update").await.len(), 1);
 }
 
 #[tokio::test]
