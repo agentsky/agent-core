@@ -2216,6 +2216,15 @@ Deliverables:
 - Turn message builder:
   - Thread messages since the agent's last reply that the transcript lacks,
     fetched with `Surface::history`.
+  - For a session that starts with an empty transcript, as after the CLI
+    refused to resume it, the thread's last 50 messages whether or not the
+    session has `message_refs` rows for them; a message with a row keeps its
+    short id. When those 50 don't reach back to the thread's root, a line
+    says to read older ones with `agentctl history --before` the oldest
+    shown. If reading the thread fails with a rate limit or an unreachable
+    platform and the session already has rows, the turn fails before the
+    CLI reads it, so the next turn tries again; any other failure goes on
+    without the history.
   - Messages agentd posted for this agent in this thread outside this session,
     found in `message_refs` by agent, thread (`surface`, `team_id`,
     `conversation`, `thread_root`) and a different `session_id`, so results
