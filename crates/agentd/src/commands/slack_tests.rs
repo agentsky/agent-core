@@ -1049,6 +1049,51 @@ async fn a_deleted_user_loses_their_configuration_token() {
     assert!(h.posts().await.is_empty());
 }
 
+#[tokio::test]
+async fn a_departure_waits_for_the_members_slack_token_still_rotating() {
+    let h = slack_harness().await;
+    let grace = h.linked("U0HUMAN02").await;
+    Mock::given(method("POST"))
+        .and(path("/api/tooling.tokens.rotate"))
+        .respond_with(
+            ok(json!({
+                "token": "xoxe.xoxp-1-NEW-SECRET-token",
+                "refresh_token": "xoxe-1-NEW-SECRET-refresh",
+                "team_id": TEAM,
+                "user_id": "U0HUMAN02",
+                "iat": in_hours(12) - 43_200,
+                "exp": in_hours(12),
+            }))
+            .set_delay(Duration::from_millis(500)),
+        )
+        .expect(1)
+        .mount(&h.slack)
+        .await;
+    let running = Running::start(&h);
+    let (response_url, hook) = h.response_url();
+    let mut command = slash(
+        &format!("slack-token {GIVEN_TOKEN} {GIVEN_REFRESH}"),
+        response_url,
+    );
+    command.sender = slack_key("U0HUMAN02");
+    running.send(SlackInbound::Command(command)).await;
+    running.send(departure()).await;
+    running.stop().await;
+    let replies: Vec<String> = h
+        .requests()
+        .await
+        .iter()
+        .filter(|request| request.url.path() == hook)
+        .map(|request| json_body(request)["text"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(replies.len(), 1, "{replies:?}");
+    assert!(
+        replies[0].starts_with("Your Slack configuration token is registered."),
+        "{replies:?}"
+    );
+    assert_eq!(h.stored(grace).await, None);
+}
+
 #[test]
 fn only_agent_slash_commands_are_taken_and_their_text_is_decoded() {
     let url = SecretString::from("https://hooks.slack.com/commands/x");
