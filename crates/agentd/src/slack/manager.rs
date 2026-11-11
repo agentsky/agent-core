@@ -185,4 +185,11 @@ impl OpenDm for SlackDms {
     async fn open_dm(&self, member: &MemberKey) -> Result<ConversationId, SurfaceError> {
         self.0.open_dm(&member.user).await
     }
+
+    async fn name_of(&self, member: &MemberKey) -> Result<String, SurfaceError> {
+        let user = self.0.user_info(&member.user).await?;
+        user.name
+            .or(user.real_name)
+            .ok_or(SurfaceError::NotFound("the user's name".to_owned()))
+    }
 }

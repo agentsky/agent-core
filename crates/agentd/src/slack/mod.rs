@@ -9,7 +9,8 @@
 //!   store in front of it.
 //! - [`StoreDedup`]: deduplication in the store's `processed_events`.
 //! - [`Inbound`]: where verified requests go. Commands to the manager app
-//!   go to the [`CommandIntake`](crate::commands::intake::CommandIntake),
+//!   and consent cards' buttons go to the
+//!   [`CommandIntake`](crate::commands::intake::CommandIntake),
 //!   and a `user_change` saying a member left deletes their configuration
 //!   token. Messages to agents' apps go to [`Messages`], which looks their
 //!   bot senders up and hands them to the turn pipeline outside the Slack
@@ -54,7 +55,7 @@ use tokio::task::JoinSet;
 
 use crate::app::App;
 use crate::commands::intake::CommandSubmitter;
-use crate::commands::slack::{dm_command, member_who_left, slash_command};
+use crate::commands::slack::{consent_action, dm_command, member_who_left, slash_command};
 use crate::commands::slack_tokens::retry_store;
 use bots::SlackBots;
 use manager::ManagerIdentity;
@@ -389,13 +390,13 @@ impl Dedup for StoreDedup {
 /// Requests from any workspace but the one agentd serves, or naming none,
 /// are dropped. Then:
 ///
-/// - To the manager app: an `/agent` slash command or a DM to the app goes
-///   to the command intake, and a `user_change` whose user is `deleted`
-///   deletes that member's configuration token for the workspace, with the
-///   store tried a few times since Slack doesn't send the event again. The
-///   deletion waits in the intake behind the commands of the member's that
-///   arrived first, so such a `slack-token` still rotating can't store the
-///   token after it.
+/// - To the manager app: an `/agent` slash command, a DM to the app, or a
+///   click on a consent card's button goes to the command intake, and a
+///   `user_change` whose user is `deleted` deletes that member's
+///   configuration token for the workspace, with the store tried a few
+///   times since Slack doesn't send the event again. The deletion waits in
+///   the intake behind the commands of the member's that arrived first, so
+///   such a `slack-token` still rotating can't store the token after it.
 /// - To an agent's app: a message goes to [`Messages`], without waiting.
 ///
 /// Everything else is logged by binding and kind and dropped.
@@ -494,7 +495,8 @@ impl Sink<SlackInbound> for Inbound {
                 }
                 None
             }
-            SlackInbound::Interaction(_) => None,
+            SlackInbound::Interaction(interaction) => consent_action(interaction)
+                .map(|(member, text, origin)| (member, text, origin, Vec::new())),
         };
         match command {
             Some((member, text, origin, files)) => {

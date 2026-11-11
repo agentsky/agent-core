@@ -190,4 +190,8 @@ impl OpenDm for RocketChatDms {
         let user = self.0.user_info(&member.user).await?;
         self.0.create_dm(&user.username).await
     }
+
+    async fn name_of(&self, member: &MemberKey) -> Result<String, SurfaceError> {
+        Ok(self.0.user_info(&member.user).await?.username)
+    }
 }

@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use core_types::{AgentId, BindingId, ConvRef, Surface, SurfaceKind};
+use core_types::{AgentId, BindingId, ConvRef, Surface, SurfaceKind, TeamId};
 use store::{BindingState, Store, StoreError};
 use surface_rocketchat::rest::Credentials;
 use surface_rocketchat::{BotRoles, RocketChatConfig, RocketChatSurface};
@@ -28,7 +28,9 @@ use crate::slack::bots::SlackBots;
 ///   named at once.
 ///
 /// A binding that isn't active, or an agent without one on the
-/// conversation's surface and team, has no surface.
+/// conversation's surface and team, has no surface, and neither does any
+/// agent on a surface and team this instance doesn't serve
+/// ([`SurfaceLookup::serves`]).
 pub struct StoreSurfaces {
     store: Store,
     rocketchat: Option<(RocketChatConfig, BotRoles)>,
@@ -70,6 +72,16 @@ impl StoreSurfaces {
         self.built.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn slack_in(&self, team: &TeamId) -> Option<&SlackBots> {
+        self.slack.as_ref().filter(|bots| bots.team() == team)
+    }
+
+    fn rocketchat_in(&self, team: &TeamId) -> Option<&(RocketChatConfig, BotRoles)> {
+        self.rocketchat
+            .as_ref()
+            .filter(|(template, _)| template.team == *team)
+    }
+
     async fn lookup(
         &self,
         agent: AgentId,
@@ -89,7 +101,7 @@ impl StoreSurfaces {
             return Ok(None);
         };
         if conv.surface == SurfaceKind::Slack {
-            let Some(bots) = self.slack.as_ref().filter(|bots| *bots.team() == conv.team) else {
+            let Some(bots) = self.slack_in(&conv.team) else {
                 return Ok(None);
             };
             bots.name_managed().await?;
@@ -103,11 +115,7 @@ impl StoreSurfaces {
         else {
             return Ok(None);
         };
-        let Some((template, bots)) = self
-            .rocketchat
-            .as_ref()
-            .filter(|(template, _)| template.team == conv.team)
-        else {
+        let Some((template, bots)) = self.rocketchat_in(&conv.team) else {
             return Ok(None);
         };
         let mut config = template.clone();
@@ -133,13 +141,18 @@ impl StoreSurfaces {
 
 #[async_trait::async_trait]
 impl SurfaceLookup for StoreSurfaces {
-    async fn surface(&self, agent: AgentId, conv: &ConvRef) -> Option<Arc<dyn Surface>> {
-        match self.lookup(agent, conv).await {
-            Ok(surface) => surface,
-            Err(err) => {
-                tracing::warn!(%agent, error = %err, "looking up an agent's surface failed");
-                None
-            }
+    async fn surface(
+        &self,
+        agent: AgentId,
+        conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        self.lookup(agent, conv).await
+    }
+
+    fn serves(&self, conv: &ConvRef) -> bool {
+        match conv.surface {
+            SurfaceKind::Slack => self.slack_in(&conv.team).is_some(),
+            SurfaceKind::RocketChat => self.rocketchat_in(&conv.team).is_some(),
         }
     }
 }

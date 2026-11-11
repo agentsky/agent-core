@@ -11,9 +11,9 @@ use core_types::{AgentId, InFile, MemberId, MemberKey, SurfaceError, SurfaceKind
 use store::{Agent, AgentCreation, AgentState, BindingState, NewAgent, StoreError, Visibility};
 use time::OffsetDateTime;
 
+use super::reply::shown_name;
 use super::{Commands, Failure, Origin};
 use crate::agents::{CreateError, RocketChatAgents};
-use crate::ctl::is_invisible;
 
 /// The largest persona, in bytes: 64 KB.
 pub const PERSONA_MAX_BYTES: usize = 64 * 1024;
@@ -402,6 +402,7 @@ impl Commands {
             return Ok(no_such_agent(name));
         };
         let changed = self.inner.store.set_agent_paused(agent.id, paused).await?;
+        self.wake_consents();
         tracing::info!(agent = %agent.id, paused, changed, "pausing or resuming an agent");
         Ok(match (paused, changed) {
             (true, true) => format!(
@@ -427,6 +428,7 @@ impl Commands {
             return Ok(no_such_agent(name));
         }
         tracing::info!(agent = %agent.id, "deleted an agent");
+        self.wake_consents();
         if let Some(reply) = self.delete_on_slack(&agent, name, &bindings).await {
             return Ok(reply);
         }
@@ -451,20 +453,14 @@ impl Commands {
     }
 }
 
-/// `text` as a Markdown code span, so a member's display name shows as
-/// written and can't form a link, a mention or any other formatting.
-/// Backticks, control characters and characters that change how it reads
-/// without showing ([`is_invisible`]) are left out.
+/// A member's display name `text` as a Markdown code span, so it can't
+/// form a link, a mention or any other formatting, shown as
+/// [`shown_name`] shows a name, its backticks left out; `someone` when
+/// nothing is left.
 fn code_span(text: &str) -> String {
-    let text: String = text
-        .chars()
-        .filter(|c| *c != '`' && !c.is_control() && !is_invisible(*c))
-        .collect();
-    let text = text.trim();
-    if text.is_empty() {
-        "someone".to_owned()
-    } else {
-        format!("`{text}`")
+    match shown_name(text) {
+        Some(name) => format!("`{}`", name.replace('`', "").trim()),
+        None => "someone".to_owned(),
     }
 }
 
@@ -494,17 +490,18 @@ mod tests {
         assert_eq!(shown, "`[Admin](https://evil.example)`");
         let rendered = render::slack::to_mrkdwn(&format!("owned by {shown}"), &NoNames);
         assert!(!rendered.contains('<'), "{rendered}");
-        assert_eq!(code_span("a`b\n@here"), "`ab@here`");
+        assert_eq!(code_span("a`b\n@here"), "`ab\u{FFFD}@here`");
         assert_eq!(code_span(" ` "), "someone");
         assert_eq!(
             code_span("ad\u{202E}nimda\u{202C} \u{2066}x\u{2069}"),
-            "`adnimda x`"
+            "`ad\u{FFFD}nimda\u{FFFD} \u{FFFD}x\u{FFFD}`"
         );
         assert_eq!(
             code_span("a\u{200B}d\u{200D}a\u{FEFF}\u{200F}\u{2060}"),
-            "`ada`"
+            "`a\u{FFFD}d\u{FFFD}a\u{FFFD}\u{FFFD}\u{FFFD}`",
+            "a name can't pass for `ada` by hiding characters"
         );
-        assert_eq!(code_span("\u{200B}\u{202E}"), "someone");
+        assert_eq!(code_span("\u{200B}\u{202E}"), "`\u{FFFD}\u{FFFD}`");
     }
 
     struct NoNames;
