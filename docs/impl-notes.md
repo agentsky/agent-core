@@ -9085,6 +9085,23 @@ none, as the relink and token notices do. Tests run each pass with the
 replies of an instance serving another workspace, then with the harness's
 own, which sends or closes the card at once.
 
+The work a decided consent owes had the same flaw. `settle_consents`
+claimed whatever was owed, and an instance whose Slack or Rocket.Chat
+configuration doesn't serve the thread's workspace found no surface for
+the agent there, since `StoreSurfaces` answers `None` alike for that and
+for an agent with no active binding, and finished the work: an approved
+task was dropped with its files, and a declined or expired outcome went
+unposted, for every instance. `SurfaceLookup::serves` now says whether an
+instance serves a conversation's surface and team, from the same
+configuration `StoreSurfaces` looks surfaces up in, and `settle_consents`
+leaves the work of a consent whose thread its instance doesn't serve
+unclaimed, for one that does. On a team it serves, no surface still means
+no usable active binding there, and the work finishes as before. A deleted
+agent's consent, which posts nothing, finishes anywhere. Tests have the
+harness serve no surface for one pass, check that nothing was claimed or
+deleted, then serve the thread again, which runs the task or posts the
+outcome.
+
 The Slack card shows the task under the label "The task, exactly as
 written:", in a `rich_text` block's `rich_text_preformatted` element: a
 visible box of literal text, so mrkdwn and `<!channel>` in it show as typed
@@ -9295,6 +9312,9 @@ reason if it wants one.
   workspace still served answers that it was already decided. A store
   query limited to the workspaces this instance serves would stop the
   reloads.
+- Likewise, the work a consent owes in a thread on a workspace no instance
+  serves any longer is never done or finished: every instance loads it
+  again on each pass, and its staged files stay.
 
 ### Rust 1.99 deprecates `fetch_update`
 

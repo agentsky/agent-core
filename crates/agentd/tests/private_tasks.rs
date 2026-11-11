@@ -8,8 +8,8 @@ mod common;
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -51,11 +51,14 @@ const TASK: &str = "Summarize in.txt";
 const WAIT: Duration = Duration::from_secs(60);
 
 /// Every agent's bot acts through the one mock. While `failing` is above
-/// 0, a lookup fails as the store would, and counts it down.
+/// 0, a lookup fails as the store would, and counts it down. While
+/// `serving` is false, the instance serves no surface, as one whose
+/// configuration names other workspaces, and finds no bot's surface.
 #[derive(Debug)]
 struct Mocks {
     mock: Arc<MockSurface>,
     failing: Arc<AtomicUsize>,
+    serving: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -84,7 +87,14 @@ impl SurfaceLookup for Mocks {
                 column: "state",
             });
         }
-        Ok(Some(self.mock.clone()))
+        Ok(self
+            .serving
+            .load(Ordering::SeqCst)
+            .then(|| self.mock.clone() as Arc<dyn Surface>))
+    }
+
+    fn serves(&self, _conv: &ConvRef) -> bool {
+        self.serving.load(Ordering::SeqCst)
     }
 }
 
@@ -178,6 +188,7 @@ struct Stack {
     binding: BindingId,
     alice: MemberId,
     failing: Arc<AtomicUsize>,
+    serving: Arc<AtomicBool>,
     stop: oneshot::Sender<()>,
     abort: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
@@ -284,9 +295,11 @@ async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
     let store = agentd::app::open_store(&config).await.unwrap();
     let mock = Arc::new(MockSurface::new());
     let failing = Arc::new(AtomicUsize::new(0));
+    let serving = Arc::new(AtomicBool::new(true));
     let lookup = Mocks {
         mock: mock.clone(),
         failing: failing.clone(),
+        serving: serving.clone(),
     };
     let app = App::with_surfaces(config, store.clone(), None, Arc::new(lookup)).unwrap();
     let alice = link(&store, "alice").await;
@@ -400,6 +413,7 @@ async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
         binding,
         alice,
         failing,
+        serving,
         stop,
         abort,
         task,
@@ -411,6 +425,13 @@ async fn start_with_drain(limits: &str, drain_timeout_secs: u64) -> Stack {
 impl Stack {
     fn store(&self) -> &Store {
         self.app.store()
+    }
+
+    /// Has this instance serve the thread's surface, as the harness does
+    /// at first, or serve none, as an instance that serves other
+    /// workspaces of the shared store.
+    fn serve(&self, serving: bool) {
+        self.serving.store(serving, Ordering::SeqCst);
     }
 
     /// Makes every session's next turn play `turn`.
@@ -927,6 +948,116 @@ async fn expiry_posts_outcome() {
             .unwrap(),
         Decided::Settled(ConsentState::Expired)
     ));
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn an_approved_task_waits_for_an_instance_serving_its_thread() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack.recorded_card(consent).await;
+    let staged = stack.data.join("consents").join(consent.to_string());
+    stack.serve(false);
+    stack.approve(consent).await;
+    let consents = stack.app.ctl().consents();
+    stack.pipeline.settle_consents(consents).await.unwrap();
+    let held = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(
+        held.work_attempts, 0,
+        "an instance that doesn't serve the thread claims nothing"
+    );
+    assert_eq!(held.finished_at, None, "and doesn't drop the task");
+    assert!(staged.join("0").exists(), "its files are kept");
+
+    stack.serve(true);
+    consents.wake();
+    stack.posted(before, &heading(consent)).await;
+    let row = stack.finished(consent).await;
+    assert!(row.private_session.is_some(), "the task ran");
+    assert!(!staged.exists());
+    stack.stop().await;
+}
+
+/// Has `stack`, which serves no surface now, settle the consents once, and
+/// checks that it left `consent`'s outcome, whose files are staged at
+/// `staged`, unclaimed and unfinished.
+async fn left_unclaimed(stack: &Stack, consent: ConsentId, staged: &Path) {
+    stack
+        .pipeline
+        .settle_consents(stack.app.ctl().consents())
+        .await
+        .unwrap();
+    let held = stack.store().consent(consent).await.unwrap().unwrap();
+    assert_eq!(
+        held.work_attempts, 0,
+        "an instance that doesn't serve the thread claims nothing"
+    );
+    assert_eq!(held.finished_at, None, "and doesn't finish the outcome");
+    assert!(staged.join("0").exists(), "its files are kept");
+}
+
+#[tokio::test]
+async fn a_declined_tasks_outcome_waits_for_an_instance_serving_its_thread() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack.recorded_card(consent).await;
+    let staged = stack.data.join("consents").join(consent.to_string());
+    stack.serve(false);
+    stack
+        .app
+        .ctl()
+        .consents()
+        .decide(&key("alice"), consent, false)
+        .await
+        .unwrap();
+    left_unclaimed(&stack, consent, &staged).await;
+
+    stack.serve(true);
+    stack.app.ctl().consents().wake();
+    let (to, _, _) = stack.posted(before, "declined it").await;
+    assert_eq!(to, in_thread("t1"));
+    let row = stack.finished(consent).await;
+    assert_eq!(row.state, ConsentState::Declined);
+    assert!(!staged.exists());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn an_expired_tasks_outcome_waits_for_an_instance_serving_its_thread() {
+    let stack = start("").await;
+    let before = stack.mock.calls().len();
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack.recorded_card(consent).await;
+    let staged = stack.data.join("consents").join(consent.to_string());
+    stack.serve(false);
+    let db = stack.db().await;
+    sqlx::query("UPDATE consents SET expires_at = created_at + 1 WHERE id = ?")
+        .bind(consent.to_string())
+        .execute(&db)
+        .await
+        .unwrap();
+    db.close().await;
+    let started = Instant::now();
+    loop {
+        stack.app.ctl().consents().expire().await.unwrap();
+        let row = stack.store().consent(consent).await.unwrap().unwrap();
+        if row.state == ConsentState::Expired {
+            break;
+        }
+        assert!(started.elapsed() < WAIT, "consent {consent} never expired");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    left_unclaimed(&stack, consent, &staged).await;
+
+    stack.serve(true);
+    stack.app.ctl().consents().wake();
+    let (to, _, _) = stack.posted(before, "expired").await;
+    assert_eq!(to, in_thread("t1"));
+    let row = stack.finished(consent).await;
+    assert_eq!(row.state, ConsentState::Expired);
+    assert!(!staged.exists());
     stack.stop().await;
 }
 
@@ -1866,6 +1997,27 @@ async fn a_deleted_agents_consent_expires_without_a_word() {
         posts(&stack.mock.calls().split_off(before)).is_empty(),
         "nothing is posted for a deleted agent"
     );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_deleted_agents_consent_finishes_where_its_thread_isnt_served() {
+    let stack = start("").await;
+    let consent = stack.ask("bob", "t1", SEEN).await;
+    stack.recorded_card(consent).await;
+    let staged = stack.data.join("consents").join(consent.to_string());
+    stack.serve(false);
+    assert!(
+        stack
+            .store()
+            .delete_agent(stack.agent, OffsetDateTime::now_utc())
+            .await
+            .unwrap()
+    );
+    stack.app.ctl().consents().wake();
+    let row = stack.finished(consent).await;
+    assert_eq!(row.state, ConsentState::Expired);
+    assert!(!staged.exists(), "its files are deleted");
     stack.stop().await;
 }
 
