@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use agentd::commands::{ManagerBot, OpenDm, Origin, Replies};
 use agentd::ctl::SurfaceLookup;
 use agentd::pipeline::{
-    DELIVERY_FAILED_TEXT, FAILED_TEXT, Pipeline, PipelineSettings, RESTARTING_TEXT, TurnSettings,
-    Turns, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
+    DELIVERY_FAILED_TEXT, FAILED_TEXT, HISTORY_LIMIT, Pipeline, PipelineSettings, RESTARTING_TEXT,
+    TurnSettings, Turns, UNCONFIRMED_TEXT, USAGE_LIMIT_TEXT,
 };
 use agentd::server::{Routers, Server};
 use agentd::skills::{Added, Confirmed, Source};
@@ -871,11 +871,35 @@ async fn skills_are_in_every_session_and_their_confirmed_hosts_extend_egress() {
 #[tokio::test]
 async fn dms_and_channels_use_their_own_sessions_and_volumes() {
     let stack = start().await;
+    let set_dm = |conv_id: &str, earlier: usize, id: &str| {
+        let mut dm: Vec<Msg> = (0..earlier)
+            .map(|n| said(&format!("h{n}"), "alice", &format!("earlier {n:02}")))
+            .collect();
+        dm.push(said(id, "alice", "hello"));
+        stack.mock.set_history(
+            ThreadKey {
+                conv: conv(conv_id),
+                root: None,
+            },
+            dm,
+        );
+    };
+    set_dm("DM1", HISTORY_LIMIT + 1, "d1");
+    let upstream = stack.fake.message_requests().await.len();
 
     stack.next_turn(Turn::reply("In the DM."));
     stack
         .handle(stack.event("alice", "DM1", ConvKind::Dm, "d1", None, &[]))
         .await;
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("agentctl history --before #")
+            && !bodies[0].contains("earlier 00")
+            && bodies[0].contains("earlier 01"),
+        "a DM with more than the window shows the window and points past it: {}",
+        bodies[0]
+    );
     let sent = posts(&stack.calls_since(0));
     assert_eq!(sent.len(), 1);
     assert_eq!(
@@ -926,6 +950,20 @@ async fn dms_and_channels_use_their_own_sessions_and_volumes() {
         paths.push(volume.path);
     }
     assert_ne!(paths[0], paths[1], "two channels, two volumes");
+
+    set_dm("DM2", HISTORY_LIMIT, "e1");
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::reply("In another DM."));
+    stack
+        .handle(stack.event("alice", "DM2", ConvKind::Dm, "e1", None, &[]))
+        .await;
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("earlier 00") && !bodies[0].contains("agentctl history --before #"),
+        "a DM of exactly the window has nothing older: {}",
+        bodies[0]
+    );
     stack.stop().await;
 }
 
@@ -2184,6 +2222,42 @@ async fn a_lasting_history_error_for_a_session_whose_transcript_is_gone_goes_on_
     assert!(
         !bodies[0].contains("the first request"),
         "the turn went on without the history: {}",
+        bodies[0]
+    );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_thread_whose_history_leaves_out_its_root_has_nothing_older_to_point_to() {
+    let stack = start().await;
+    let mut history: Vec<Msg> = (0..HISTORY_LIMIT)
+        .map(|n| said(&format!("c{n}"), "carol", "chatter"))
+        .collect();
+    history.push(said("r2", "alice", "@UBOT hello"));
+    stack.mock.set_history(thread("GENERAL", "r1"), history);
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::reply("Hi."));
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "r2",
+            Some("r1"),
+            &[BOT],
+        ))
+        .await;
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    assert_eq!(
+        bodies[0].matches("carol: chatter").count(),
+        HISTORY_LIMIT,
+        "{}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[0].contains("history --before #"),
+        "a deleted root leaves exactly the window, with nothing older: {}",
         bodies[0]
     );
     stack.stop().await;
