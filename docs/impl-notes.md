@@ -3338,6 +3338,23 @@ flight count against the 10.
 **Solution.** The `agentctl-static` CI job checks for `INTERP` only, as the
 plan says.
 
+### rustix 1.1.5 gained an unsound advisory
+
+**Issue.** In November 2026 the advisory database gained RUSTSEC-2026-0486
+(GHSA-jh2m-fhpj-3vr7, dated 2026-10-27) against rustix 1.x before 1.1.6.
+Given a zero-length buffer, its `getxattr` and `listxattr` families mark as
+initialized as many bytes as the size query reports, which is undefined
+behavior reachable from safe code. agentctl and the crates that later take
+rustix from the workspace call none of those functions, but cargo-deny fails
+on any unsound advisory against a locked crate, so from T15's branch up the
+next `deny` run would fail.
+
+**Solution.** The workspace floor for rustix goes from 1.1.5 to 1.1.6, the
+first fixed release, and the lock follows. Updating rustix also moves
+`windows-sys` from 0.52 to 0.61 for it and four crates that took 0.52
+through version ranges that also allow 0.61; `windows-sys` is a
+Windows-only dependency and is not built on Linux.
+
 ## T16: sandbox image and Compose
 
 ### An internal network still reaches the host
