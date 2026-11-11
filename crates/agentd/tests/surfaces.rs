@@ -104,6 +104,10 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
 
     let rc = agent_on(&store, SurfaceKind::RocketChat, "chat.example", "rcbot").await;
     let here = conv(SurfaceKind::RocketChat, "chat.example");
+    assert!(surfaces.serves(&here));
+    assert!(!surfaces.serves(&conv(SurfaceKind::RocketChat, "other.example")));
+    assert!(surfaces.serves(&conv(SurfaceKind::Slack, "T1")));
+    assert!(!surfaces.serves(&conv(SurfaceKind::Slack, "T2")));
     let first = surfaces
         .surface(rc, &here)
         .await
@@ -152,6 +156,10 @@ async fn an_agents_bot_acts_through_its_active_binding_on_the_conversations_team
             .unwrap()
     );
     assert!(surfaces.surface(rc, &here).await.unwrap().is_none());
+    assert!(
+        surfaces.serves(&here),
+        "an agent without a binding has no surface on a team still served"
+    );
     assert!(
         surfaces
             .surface(AgentId::new_v4(), &here)
