@@ -56,12 +56,14 @@
 //! new id, and each agent whose bot is in it gets `channel_id_changed`
 //! ([`channel_id_changed`](SlackAgents::channel_id_changed)). The change is
 //! recorded in the store, then settled in a task of its own, and by the
-//! sweeper until it is. Settling follows the binding's recorded changes
-//! from the new id to the last one they name, so a chain settles the same
-//! in any order, and asks Slack with `conversations.info` on the binding's
-//! bot token where that channel is now. Only an answer with the bot in the
-//! channel settles it: the receiving agent's own rules on the old id move
-//! to the id Slack answered with, in one transaction ([`Rules::move_room`]),
+//! sweeper until it is: the sweeper of an instance serving the binding's
+//! workspace, since only that one can ask Slack. Settling follows the
+//! binding's recorded changes from the new id to the last one they name,
+//! so a chain settles the same in any order, and asks Slack with
+//! `conversations.info` on the binding's bot token where that channel is
+//! now. Only an answer with the bot in the channel settles it: the
+//! receiving agent's own rules on the old id move to the id Slack answered
+//! with, in one transaction ([`Rules::move_room`]),
 //! and this instance forgets what it cached about the old id. Anything else
 //! (no such channel yet, the bot not in it yet, a refusal, a rate limit,
 //! Slack unreachable) leaves it waiting, tried again every
@@ -1158,7 +1160,8 @@ impl SlackAgents {
     /// Gives up the channel id changes received over
     /// [`CHANNEL_CHANGE_TTL`] ago that still wait, then forgets the
     /// settled ones as old, after the give-ups, which follow their chains
-    /// through them; how many were given up.
+    /// through them; how many were given up. These are any workspace's,
+    /// since giving up asks Slack nothing.
     async fn give_up_channel_changes(
         &self,
         now: &impl Fn() -> OffsetDateTime,
@@ -1264,8 +1267,9 @@ impl SlackAgents {
         }
     }
 
-    /// Tries to settle the channel id changes due, until `budget` has
-    /// passed; how many were settled or dropped.
+    /// Tries to settle the channel id changes due of bindings in this
+    /// workspace, until `budget` has passed; how many were settled or
+    /// dropped. Another workspace's are left to an instance serving it.
     async fn settle_channel_changes(
         &self,
         now: &impl Fn() -> OffsetDateTime,
@@ -1274,7 +1278,7 @@ impl SlackAgents {
         let due = self
             .inner
             .store
-            .due_channel_id_changes(now(), CHANNEL_CHANGES_PER_PASS)
+            .due_channel_id_changes(self.team(), now(), CHANNEL_CHANGES_PER_PASS)
             .await?;
         let until = Instant::now() + budget;
         let mut settled = 0;
@@ -1306,6 +1310,10 @@ impl SlackAgents {
     /// such a change moves its rules there in turn, and a copy can outlive
     /// its change otherwise, refusing more rather than less. Any other
     /// answer leaves it waiting for its next try.
+    ///
+    /// `change` is of a binding in this workspace, as the ingress and the
+    /// sweeper hand it, so one whose app isn't active here answers no one
+    /// and is dropped.
     ///
     /// # Errors
     ///

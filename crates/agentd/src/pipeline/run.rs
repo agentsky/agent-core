@@ -1633,16 +1633,19 @@ impl Pipeline {
 
     /// Queues the hand-offs due in `hand_offs`, recorded by this instance
     /// or another, that no job holds: a shutdown or a crash cut their
-    /// jobs, or they found no place. The rows this instance holds are
-    /// leased again instead, and once the pipeline is closed that is all it
-    /// does, until the drain ends, so a drain longer than the lease keeps
-    /// its rows from other instances. Each is taken for [`HAND_OFF_LEASE`] and
-    /// queued again as it was, unless its hop ran already, when it is
-    /// done with. A row that can't be read now, whose agent is gone, or
-    /// whose agent has no active binding there is left, and a row
-    /// recorded more than an hour ago is dropped. Returns how many jobs
-    /// were queued. A hand-off delivered twice runs once, as the hop's
-    /// claim allows one run.
+    /// jobs, or they found no place. Only rows in conversations this
+    /// instance serves ([`SurfaceLookup::serves`]) are taken, so the rest
+    /// stay due for an instance that serves them and take no place among
+    /// the 64 a look takes at most. The rows this instance holds are
+    /// leased again instead, and once the pipeline is closed that is all
+    /// it does, until the drain ends, so a drain longer than the lease
+    /// keeps its rows from other instances. Each is taken for
+    /// [`HAND_OFF_LEASE`] and queued again as it was, unless its hop ran
+    /// already, when it is done with. A row that can't be read now, whose
+    /// agent is gone, or whose agent has no active binding there is left,
+    /// and a row recorded more than an hour ago is dropped, wherever it is.
+    /// Returns how many jobs were queued. A hand-off delivered twice runs
+    /// once, as the hop's claim allows one run.
     ///
     /// # Errors
     ///
@@ -1660,6 +1663,7 @@ impl Pipeline {
                 now - HAND_OFF_MAX_AGE,
                 if closed { 0 } else { MAX_REPLAYED },
                 &held,
+                |conv| self.inner.surfaces.serves(conv),
             )
             .await?;
         if due.stale > 0 {
@@ -2608,11 +2612,12 @@ impl Delivery<'_> {
                 None => Plan::default(),
             };
             let new_hand_offs: Vec<NewHandOff<'_>> = match (hands_off, &plan.event) {
-                (Some((hand_offs, _)), Some((_, json))) => plan
+                (Some((hand_offs, _)), Some((event, json))) => plan
                     .to
                     .iter()
                     .map(|agent| NewHandOff {
                         agent: agent.id,
+                        conv: &event.conv,
                         event_json: json,
                         created_at: hand_offs.now,
                         due_at: hand_offs.now + HAND_OFF_LEASE,
@@ -3161,7 +3166,7 @@ mod tests {
         assert_eq!(event.thread_root, target.thread_root);
         assert_eq!(handed[0].hop, hop_key(writer, turn));
         let due = store
-            .take_due_hand_offs(now + HAND_OFF_LEASE, HAND_OFF_LEASE, now, 10, &[])
+            .take_due_hand_offs(now + HAND_OFF_LEASE, HAND_OFF_LEASE, now, 10, &[], |_| true)
             .await
             .unwrap();
         assert_eq!(
