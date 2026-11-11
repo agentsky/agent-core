@@ -7,7 +7,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use auth::{AuthError, TokenSource};
@@ -43,6 +43,7 @@ struct FakeNetwork {
     routes: Mutex<HashMap<SocketAddr, SocketAddr>>,
     resolved: Mutex<Vec<String>>,
     dialed: Mutex<Vec<SocketAddr>>,
+    silent: Mutex<Vec<SocketAddr>>,
 }
 
 impl FakeNetwork {
@@ -52,6 +53,10 @@ impl FakeNetwork {
 
     fn route(&self, from: SocketAddr, to: SocketAddr) {
         lock(&self.routes).insert(from, to);
+    }
+
+    fn silence(&self, address: SocketAddr) {
+        lock(&self.silent).push(address);
     }
 
     fn resolved(&self) -> Vec<String> {
@@ -78,6 +83,9 @@ impl Network for FakeNetwork {
 
     async fn connect(&self, addr: SocketAddr) -> io::Result<TcpStream> {
         lock(&self.dialed).push(addr);
+        if lock(&self.silent).contains(&addr) {
+            std::future::pending::<()>().await;
+        }
         let route = lock(&self.routes).get(&addr).copied();
         match route {
             Some(to) => TcpStream::connect(to).await,
@@ -623,6 +631,29 @@ async fn unresolvable_and_unreachable_hosts_are_bad_gateways() {
     assert_eq!(
         proxy.network.dialed().last(),
         Some(&SocketAddr::new(PUBLIC_2, 443))
+    );
+}
+
+#[tokio::test]
+async fn a_silent_address_leaves_time_to_try_the_next() {
+    let (echo, _) = echo_server().await;
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| egress).await;
+    proxy.sandbox(LOCAL);
+    proxy.network.answer("git.example.com", &[PUBLIC, PUBLIC_2]);
+    proxy.network.silence(SocketAddr::new(PUBLIC, 443));
+    proxy.network.route(SocketAddr::new(PUBLIC_2, 443), echo);
+    let started = Instant::now();
+    let (mut stream, head) = proxy.connect("git.example.com:443").await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    echoes(&mut stream, b"past a silent address").await;
+    assert_eq!(
+        proxy.network.dialed(),
+        [SocketAddr::new(PUBLIC, 443), SocketAddr::new(PUBLIC_2, 443)]
     );
 }
 

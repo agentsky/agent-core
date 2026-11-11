@@ -1,6 +1,6 @@
 //! [`EgressProxy`]: `CONNECT` tunnels from sandboxes to allowlisted hosts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -21,11 +21,17 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::allowlist::{ANTHROPIC_API_HOST, EgressPolicy, HostRule, normalize_host, parse_port};
 use crate::proxy::CONNECT_TIMEOUT;
 use crate::registry::Registry;
+
+/// How long a connection attempt to one of a host's addresses goes
+/// unanswered before the next address is tried alongside it: RFC 8305's
+/// recommended connection attempt delay.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
 
 /// The proxy's address as sandboxes know it: agentd's proxy listener,
 /// under its alias on the sandbox network.
@@ -442,23 +448,40 @@ impl EgressProxy {
         }
     }
 
-    /// A connection to the first of `addresses` that answers on `port`,
-    /// tried in order within [`CONNECT_TIMEOUT`] for all of them, so a long
-    /// answer of silent addresses can't hold the request.
+    /// A connection to the first of `addresses` to answer on `port`, all
+    /// within [`CONNECT_TIMEOUT`]. They are tried in order, each starting
+    /// when the one before failed or after [`ATTEMPT_DELAY`], whichever
+    /// comes first, while the earlier ones go on; the first to connect
+    /// wins and the others are dropped. So a silent address can't keep the
+    /// rest from being tried.
     async fn dial(&self, addresses: &[IpAddr], port: u16) -> Option<(TcpStream, SocketAddr)> {
-        let attempts = async {
-            for &ip in addresses {
-                let address = SocketAddr::new(ip, port);
-                match self.network.connect(address).await {
-                    Ok(stream) => return Some((stream, address)),
-                    Err(err) => {
-                        tracing::debug!(%address, error = %err, "an egress connection failed");
-                    }
+        let mut waiting: VecDeque<_> = addresses
+            .iter()
+            .map(|&ip| SocketAddr::new(ip, port))
+            .collect();
+        let network = Arc::clone(&self.network);
+        let dialing = async move {
+            let mut attempts = JoinSet::new();
+            loop {
+                if let Some(address) = waiting.pop_front() {
+                    let network = Arc::clone(&network);
+                    attempts.spawn(async move { (address, network.connect(address).await) });
+                }
+                let more = !waiting.is_empty();
+                tokio::select! {
+                    Some(joined) = attempts.join_next() => match joined {
+                        Ok((address, Ok(stream))) => return Some((stream, address)),
+                        Ok((address, Err(err))) => {
+                            tracing::debug!(%address, error = %err, "an egress connection failed");
+                        }
+                        Err(err) => tracing::debug!(error = %err, "an egress connection attempt ended"),
+                    },
+                    () = tokio::time::sleep(ATTEMPT_DELAY), if more => {}
+                    else => return None,
                 }
             }
-            None
         };
-        tokio::time::timeout(CONNECT_TIMEOUT, attempts)
+        tokio::time::timeout(CONNECT_TIMEOUT, dialing)
             .await
             .unwrap_or_else(|_| {
                 tracing::debug!(port, "egress connections timed out");
