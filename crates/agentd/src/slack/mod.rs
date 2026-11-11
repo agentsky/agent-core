@@ -37,15 +37,17 @@ use std::time::Instant;
 
 use axum::Router;
 use axum::routing::get;
-use core_types::{BindingId, InboundEvent, SendError, Sender, Sink, TeamId, Throttle, UserId};
+use core_types::{
+    BindingId, InboundEvent, MemberKey, SendError, Sender, Sink, TeamId, Throttle, UserId,
+};
 use futures::FutureExt as _;
 use secrecy::SecretString;
 use store::Store;
 use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
-    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackEvent,
-    SlackInbound, ingress,
+    AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, SlackInbound,
+    ingress,
 };
 use time::OffsetDateTime;
 use tokio::sync::mpsc;
@@ -392,7 +394,9 @@ impl Dedup for StoreDedup {
 ///   click on a consent card's button goes to the command intake, and a
 ///   `user_change` whose user is `deleted` deletes that member's
 ///   configuration token for the workspace, with the store tried a few
-///   times since Slack doesn't send the event again.
+///   times since Slack doesn't send the event again. The deletion waits in
+///   the intake behind the commands of the member's that arrived first, so
+///   such a `slack-token` still rotating can't store the token after it.
 /// - To an agent's app: a message goes to [`Messages`], without waiting.
 ///
 /// Everything else is logged by binding and kind and dropped.
@@ -421,11 +425,8 @@ impl Inbound {
         self
     }
 
-    async fn member_left(&self, event: &SlackEvent) {
-        let Some(key) = member_who_left(event) else {
-            return;
-        };
-        let (store, key) = (&self.store, &key);
+    async fn member_left(store: Store, key: MemberKey) {
+        let (store, key) = (&store, &key);
         let deleted = retry_store(
             "deleting a departed member's configuration token",
             key,
@@ -488,7 +489,10 @@ impl Sink<SlackInbound> for Inbound {
                 .map(|(member, text, origin)| (member, text, origin, Vec::new())),
             SlackInbound::Message(event, _) => dm_command(&event, identity),
             SlackInbound::Event(event) => {
-                self.member_left(&event).await;
+                if let Some(key) = member_who_left(&event) {
+                    let job = Self::member_left(self.store.clone(), key.clone());
+                    commands.after_commands_of(key, job).await?;
+                }
                 None
             }
             SlackInbound::Interaction(interaction) => consent_action(interaction)
