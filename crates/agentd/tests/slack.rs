@@ -85,8 +85,13 @@ async fn fake_slack() -> MockServer {
 /// The configuration, with the manager app's secrets and its Web API at
 /// `slack` when given.
 fn config(slack: Option<&MockServer>) -> Config {
+    config_with(slack, "")
+}
+
+/// [`config`], with `extra` added to the file.
+fn config_with(slack: Option<&MockServer>, extra: &str) -> Config {
     let mut env = env();
-    let mut text = CONFIG.to_owned();
+    let mut text = format!("{CONFIG}\n{extra}\n");
     if let Some(slack) = slack {
         env.push((
             "AGENTD_SLACK_MANAGER_SIGNING_SECRET".to_owned(),
@@ -566,4 +571,111 @@ async fn agentd_does_not_start_when_slack_refuses_the_manager_token() {
     let text = format!("{err:#}");
     assert!(text.contains("AGENTD_SLACK_MANAGER_BOT_TOKEN"), "{text}");
     assert!(!text.contains(BOT_TOKEN), "{text}");
+}
+
+#[tokio::test]
+async fn a_replayed_slack_command_fires_once() {
+    const ROUTINE: &str = "trig_01ABCdef";
+    const SESSION: &str = "session_01XYZabc";
+    let slack = fake_slack().await;
+    let endpoint = MockServer::start().await;
+    let fire = format!("/v1/claude_code/routines/{ROUTINE}/fire");
+    Mock::given(method("POST"))
+        .and(path(fire.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "claude_code_session_id": SESSION,
+            "claude_code_session_url": format!("https://claude.ai/code/{SESSION}"),
+        })))
+        .expect(1)
+        .mount(&endpoint)
+        .await;
+    let config = config_with(
+        Some(&slack),
+        &format!("[cloud]\nbase_url = \"{}\"\n", endpoint.uri()),
+    );
+    let app = App::open(config).await.unwrap();
+    let key = core_types::MemberKey {
+        surface: core_types::SurfaceKind::Slack,
+        team: fixtures::TEAM.into(),
+        user: fixtures::USER.into(),
+    };
+    let now = OffsetDateTime::now_utc();
+    let member = app.store().ensure_member(&key, "ada", now).await.unwrap();
+    app.store()
+        .put_claude_link(
+            member,
+            &store::NewClaudeLink {
+                access_token: secrecy::SecretString::from("access"),
+                refresh_token: secrecy::SecretString::from("refresh"),
+                expires_at: now + time::Duration::hours(8),
+                plan: Some("claude_max".to_owned()),
+                rate_limit_tier: None,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let routine_id: core_types::RoutineId = ROUTINE.parse().unwrap();
+    let token = core_types::RoutineToken::parse(secrecy::SecretString::from(
+        "sk-ant-oat01-ROUTINE-SECRET-token",
+    ))
+    .unwrap();
+    app.store()
+        .put_cloud_routine(
+            &store::NewCloudRoutine {
+                member,
+                label: "agent-core",
+                routine_id: &routine_id,
+                url_origin: &endpoint.uri(),
+                token: &token,
+                added_by: &key,
+            },
+            now,
+        )
+        .await
+        .unwrap();
+    let running = Running::start(app.clone(), Routers::new(&app).unwrap()).await;
+
+    let command = slash_command(
+        &slack,
+        "cloud+run+agent-core+Fix+the+flaky+test",
+        "cloud-run",
+    );
+    let signed = fixtures::signed_headers(SECRET, fixtures::now(), command.as_bytes()).to_vec();
+    let commands = "/slack/b/manager/commands";
+    assert_eq!(
+        running
+            .post(commands, signed.clone(), &command)
+            .await
+            .status,
+        200
+    );
+    let reply = wait_for_request(&slack, "/hooks/cloud-run").await;
+    let body: Value = serde_json::from_slice(&reply.body).unwrap();
+    assert!(
+        body["text"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("https://claude.ai/code/{SESSION}")),
+        "{body}"
+    );
+    assert_eq!(running.post(commands, signed, &command).await.status, 200);
+    running.stop().await;
+
+    let fired = endpoint
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == fire)
+        .count();
+    assert_eq!(fired, 1, "the replay fired nothing");
+    let replies = slack
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| request.url.path() == "/hooks/cloud-run")
+        .count();
+    assert_eq!(replies, 1, "the replay got no reply");
 }

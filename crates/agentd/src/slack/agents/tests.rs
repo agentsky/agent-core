@@ -188,6 +188,7 @@ async fn harness() -> Harness {
             now,
         )
         .await
+        .unwrap()
         .unwrap();
     Harness {
         store,
@@ -689,6 +690,7 @@ async fn a_refused_token_at_creation_is_marked_broken_and_an_expired_one_waits_f
             now,
         )
         .await
+        .unwrap()
         .unwrap();
     assert_eq!(h.create().await, Creation::TokenRenewing);
     assert!(h.binding().await.is_none());

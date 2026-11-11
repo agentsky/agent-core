@@ -12,7 +12,7 @@
 //!   and consent cards' buttons go to the
 //!   [`CommandIntake`](crate::commands::intake::CommandIntake),
 //!   and a `user_change` saying a member left deletes their configuration
-//!   token. Messages to agents' apps go to [`Messages`], which looks their
+//!   token, cloud routines and hand-offs. Messages to agents' apps go to [`Messages`], which looks their
 //!   bot senders up and hands them to the turn pipeline outside the Slack
 //!   queue, in a lane for each binding. The rest is logged by kind and
 //!   dropped.
@@ -42,7 +42,7 @@ use core_types::{
 };
 use futures::FutureExt as _;
 use secrecy::SecretString;
-use store::Store;
+use store::{CloudDeleted, Store};
 use surface_slack::ingress::{DEDUP_RETENTION, WARNING_INTERVAL};
 use surface_slack::manifest::OAUTH_CALLBACK_PATH;
 use surface_slack::{
@@ -402,12 +402,13 @@ impl Dedup for StoreDedup {
 /// - To the manager app: an `/agent` slash command, a DM to the app, or a
 ///   click on a consent card's button goes to the command intake, and a
 ///   `user_change` whose user is `deleted` deletes that member's
-///   configuration token for the workspace, with the store tried a few
-///   times since Slack doesn't send the event again. The deletion waits in
-///   the intake behind the commands of the member's that arrived first, so
-///   such a `slack-token` still rotating can't store the token after it.
-///   Only home members' commands go on (see the design's Slack Connect
-///   "Commands"):
+///   configuration token for the workspace, and every cloud routine and
+///   hand-off of the member, whichever surface registered them, telling
+///   no one, with the store tried a few times since Slack doesn't send the
+///   event again. The deletion waits in the intake behind the commands of
+///   the member's that arrived first, so such a `slack-token` still
+///   rotating can't store the token after it. Only home members' commands
+///   go on (see the design's Slack Connect "Commands"):
 ///   - A DM whose sender's own team fields make them outside is dropped
 ///     here, without touching the network; the rest are checked against
 ///     the member list or `users.info` in the member's own intake task
@@ -490,6 +491,29 @@ impl Inbound {
             Ok(false) => {}
             Err(err) => {
                 tracing::warn!(member = %key, error = %err, "couldn't delete the configuration token of a member who left")
+            }
+        }
+        let deleted = retry_store(
+            "deleting a departed member's cloud routines",
+            key,
+            || async move {
+                match store.member_for_identity(key).await? {
+                    Some(member) => store.delete_cloud_routines_of(member).await,
+                    None => Ok(CloudDeleted::default()),
+                }
+            },
+        )
+        .await;
+        match deleted {
+            Ok(deleted) if deleted.routines > 0 || deleted.handoffs > 0 => tracing::info!(
+                member = %key,
+                routines = deleted.routines,
+                handoffs = deleted.handoffs,
+                "a member left the workspace; deleted their cloud routines and hand-offs"
+            ),
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(member = %key, error = %err, "couldn't delete the cloud routines of a member who left")
             }
         }
     }
