@@ -15,8 +15,10 @@
 //!
 //! Slack answers most failures with HTTP 200 and `{"ok": false, "error":
 //! "<code>"}`, and some with another status and the same body. [`map_error`]
-//! turns the code into a [`SurfaceError`]; another status without a code is
-//! [`SurfaceError::Api`] with the status. A 429
+//! turns the code into a [`SurfaceError`]. A 5xx is
+//! [`SurfaceError::Transport`] with the status, whatever its body says, and
+//! another status without a code is [`SurfaceError::Api`] with the status.
+//! A 429
 //! (or an `ok: false` with `ratelimited`) is retried after `Retry-After`,
 //! at most [`MAX_RETRIES`] times and only while the wait is within
 //! [`SlackClient::with_max_retry_wait`]; otherwise it fails with
@@ -618,8 +620,10 @@ impl SlackClient {
     ///
     /// [`SurfaceError::NotFound`] once the URL has expired or been used up
     /// (`expired_url`, `used_url`, HTTP 404 or 410),
-    /// [`SurfaceError::RateLimited`] on a 429, and [`SurfaceError::Api`]
-    /// with Slack's code for anything else.
+    /// [`SurfaceError::RateLimited`] on a 429, [`SurfaceError::Transport`]
+    /// on a 5xx whatever its body says, and otherwise [`map_error`] of
+    /// Slack's code, or [`SurfaceError::Api`] with the status when there is
+    /// none.
     pub async fn respond_ephemeral(&self, response_url: &SecretString, text: &str) -> Result<()> {
         let url = Url::parse(response_url.expose_secret())
             .ok()
@@ -1585,7 +1589,8 @@ impl WebApi {
     ///
     /// [`SurfaceError::TooLarge`] if the file is larger than `max_bytes`;
     /// [`SurfaceError::Api`] if the URL isn't Slack's, or Slack answers
-    /// anything but 200; [`SurfaceError::Transport`] if the download fails.
+    /// anything but 200 or a 5xx; [`SurfaceError::Transport`] if the
+    /// download fails or Slack answers a 5xx.
     /// No error repeats the URL.
     pub async fn download_file(&self, file: &InFile, max_bytes: u64) -> Result<Vec<u8>> {
         let url = Url::parse(&file.url)
@@ -1604,6 +1609,12 @@ impl WebApi {
             .await
             .map_err(transport)?;
         let status = response.status();
+        if status.is_server_error() {
+            return Err(SurfaceError::Transport(format!(
+                "the file download failed (HTTP {})",
+                status.as_u16()
+            )));
+        }
         if status != StatusCode::OK {
             return Err(SurfaceError::Api(format!(
                 "the file download was refused (HTTP {})",
@@ -1701,7 +1712,8 @@ impl WebApi {
     /// # Errors
     ///
     /// [`SurfaceError::NotFound`] if a file can't be read,
-    /// [`SurfaceError::RateLimited`] if an upload URL answers 429, and
+    /// [`SurfaceError::RateLimited`] if an upload URL answers 429,
+    /// [`SurfaceError::Transport`] if it answers a 5xx, and
     /// [`SurfaceError::Api`] if an upload is refused; otherwise see
     /// [`map_error`].
     pub async fn upload_files(
@@ -2200,6 +2212,12 @@ mod tests {
             assert_eq!(
                 map_error(code, None),
                 SurfaceError::NotFound((*code).to_owned())
+            );
+        }
+        for code in TRANSIENT_CODES {
+            assert_eq!(
+                map_error(code, None),
+                SurfaceError::Transport((*code).to_owned())
             );
         }
         assert!(matches!(
