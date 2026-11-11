@@ -4148,6 +4148,18 @@ first. Resolution has a 5-second timeout and all connection attempts share
 the 10-second `CONNECT_TIMEOUT`, so a long answer of silent addresses can't
 hold a request.
 
+Review later found that trying the addresses one after another let the
+first of them spend that whole timeout when it dropped the attempt without
+an answer, as a dual-stack host does over IPv6 that goes nowhere: the
+request failed with 502 although the next address answered. Each address
+now starts when an earlier attempt failed or after 250 ms, RFC 8305's
+connection attempt delay, while the earlier ones go on, and the first to
+connect wins. At most four attempts run at once, so a name answering with
+dozens of silent addresses can't hold a socket for each (a second review
+counted about 41 per `CONNECT` without the cap), and the address families
+take turns, as RFC 8305 orders them, so dead IPv6 addresses can't fill the
+four places ahead of IPv4 ones.
+
 Never reachable, whatever resolves there and whichever rule allowed the
 host: agentd's own listener addresses and the sandbox subnet (agentd passes
 them from its configuration), the private ranges (`10.0.0.0/8`,
