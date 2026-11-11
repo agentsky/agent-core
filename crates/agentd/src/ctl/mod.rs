@@ -88,8 +88,8 @@ pub const STAGING_DIR: &str = "ctl-outbox";
 /// `agentctl history`, and for the turn pipeline, which posts through it.
 ///
 /// agentd's is [`StoreSurfaces`](crate::pipeline::StoreSurfaces), over the
-/// agents' bindings. [`NoSurfaces`] answers `None`, and `history` is then
-/// not available.
+/// agents' bindings. [`NoSurfaces`] serves nothing and answers `None`, and
+/// `history` is then not available.
 #[async_trait::async_trait]
 pub trait SurfaceLookup: Send + Sync + std::fmt::Debug {
     /// The surface that acts as `agent`'s bot on `conv`'s surface and
@@ -104,6 +104,13 @@ pub trait SurfaceLookup: Send + Sync + std::fmt::Debug {
         agent: AgentId,
         conv: &ConvRef,
     ) -> Result<Option<Arc<dyn Surface>>, StoreError>;
+
+    /// Whether this instance serves `conv`'s surface and team. Where it
+    /// doesn't, [`surface`](Self::surface) answers `None` whatever the
+    /// agent's bindings, and another instance sharing the store may serve
+    /// it; where it does, `None` means the agent has no usable active
+    /// binding there.
+    fn serves(&self, conv: &ConvRef) -> bool;
 }
 
 /// A [`SurfaceLookup`] with no surfaces.
@@ -118,6 +125,10 @@ impl SurfaceLookup for NoSurfaces {
         _conv: &ConvRef,
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
         Ok(None)
+    }
+
+    fn serves(&self, _conv: &ConvRef) -> bool {
+        false
     }
 }
 

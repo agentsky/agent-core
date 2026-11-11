@@ -52,6 +52,10 @@ impl SurfaceLookup for Lookup {
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
         Ok(Some(self.0.clone()))
     }
+
+    fn serves(&self, _conv: &ConvRef) -> bool {
+        true
+    }
 }
 
 /// What `ask-agent` prints, without its newline.
