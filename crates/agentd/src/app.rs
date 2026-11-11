@@ -17,11 +17,13 @@ use crate::config::{Config, RC_MANAGER_TOKEN_VAR};
 use crate::ctl::{Ctl, CtlSettings, SurfaceLookup};
 use crate::pipeline::StoreSurfaces;
 use crate::skills::{Git, Skills};
+use crate::slack::agents::{AgentAppSettings, SlackAgents};
+use crate::slack::bots::SlackBots;
 use crate::slack::manager::SlackManager;
 
 /// The shared state: the configuration, the store, the agentctl API, the
-/// credential proxy's placeholders, account linking, command dispatch and
-/// the manager bots of Rocket.Chat and Slack.
+/// credential proxy's placeholders, account linking, command dispatch, the
+/// manager bots of Rocket.Chat and Slack, and agents' Slack apps.
 ///
 /// Cloning is cheap: every clone shares the same state. Axum handlers take it
 /// as their state.
@@ -37,6 +39,7 @@ pub struct App {
     skills: Skills,
     rocketchat: Option<RocketChatManager>,
     slack: Option<SlackManager>,
+    slack_agents: Option<SlackAgents>,
 }
 
 /// The Rocket.Chat manager bot: its surface and the binding it listens as,
@@ -99,18 +102,22 @@ impl App {
                 .context("setting up Claude account linking")?,
         );
         let rocketchat = rocketchat_manager(&config, &store)?;
+        let slack_agents = slack.as_ref().map(|slack| {
+            let bots = SlackBots::new(store.clone(), slack.client().clone(), slack.surface());
+            SlackAgents::new(
+                store.clone(),
+                slack.clone(),
+                bots,
+                AgentAppSettings::from_config(&config),
+            )
+        });
         let surfaces = surfaces.unwrap_or_else(|| {
             Arc::new(StoreSurfaces::new(
                 store.clone(),
                 rocketchat
                     .as_ref()
                     .map(|(manager, _)| (manager.surface_config.clone(), manager.bots.clone())),
-                slack.as_ref().map(|slack| {
-                    (
-                        slack.client().clone(),
-                        Arc::clone(slack.surface().directory()),
-                    )
-                }),
+                slack_agents.as_ref().map(|agents| agents.bots().clone()),
             ))
         });
         let ctl = Ctl::new(
@@ -127,7 +134,7 @@ impl App {
             .map(|(manager, _)| manager.agents.clone());
         let git = Git::new(config.egress_policy().context("[proxy]")?);
         let skills = Skills::new(store.clone(), config.store.data_dir.clone(), git);
-        let commands = Commands::new(
+        let mut commands = Commands::new(
             store.clone(),
             Arc::clone(&auth),
             replies,
@@ -136,6 +143,9 @@ impl App {
             skills.clone(),
         )
         .with_admins(config.community.admins.iter().cloned());
+        if let Some(slack_agents) = &slack_agents {
+            commands = commands.with_slack_agents(slack_agents.clone());
+        }
         Ok(Self {
             config: Arc::new(config),
             store,
@@ -147,6 +157,7 @@ impl App {
             skills,
             rocketchat: rocketchat.map(|(manager, _)| manager),
             slack,
+            slack_agents,
         })
     }
 
@@ -230,6 +241,11 @@ impl App {
     /// The Slack manager app, if agentd serves Slack.
     pub fn slack(&self) -> Option<&SlackManager> {
         self.slack.as_ref()
+    }
+
+    /// Agents' Slack apps, if agentd serves Slack.
+    pub fn slack_agents(&self) -> Option<&SlackAgents> {
+        self.slack_agents.as_ref()
     }
 }
 
