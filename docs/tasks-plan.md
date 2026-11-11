@@ -4129,6 +4129,17 @@ Deliverables:
   handler), which only the owner's own DM turn reaches, to a conversation
   other than the turn's own whose `Surface::sharing` is external is
   refused, with a reason the model can read. A failed read refuses too.
+  The post is only queued there and goes out after the turn
+  (`pipeline/run.rs`'s delivery), so the delivery reads `Surface::sharing`
+  again and applies the same rule: a post whose conversation is now
+  externally shared, or whose read fails or is refused by the exact-id
+  check, isn't posted. The read is made once and not retried; a failed
+  read withholds the post. The agent's bot tells the turn's own
+  conversation, the owner's DM with the agent, in one line per withheld
+  post, naming the conversation, that it wasn't posted because that
+  conversation is shared with another organization or its sharing couldn't
+  be read. A withheld post isn't a lost part of the reply. A notice that
+  can't be posted is only logged.
 
 Acceptance:
 
@@ -4141,6 +4152,9 @@ Acceptance:
 - `repeated_sharing_read_failures_never_post`.
 - `declined_and_expired_outcomes_post_in_a_shared_thread`.
 - `an_owner_side_post_to_another_shared_conversation_is_refused`.
+- `an_owner_side_post_shared_before_delivery_is_withheld`.
+- `an_owner_side_post_whose_sharing_cant_be_read_is_withheld`.
+- `an_owner_side_post_to_an_unshared_conversation_is_posted`.
 - `rocketchat_conversations_are_never_shared`.
 
 Live check (manual): on two paid Slack workspaces joined by a Slack Connect
