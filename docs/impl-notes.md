@@ -9492,8 +9492,8 @@ could give a deleted row's id to a new row while a job still held the
 old one; and that a post's ref and its hand-offs were two writes.
 
 **Solution.** `Delivery::post_to` records a post's `message_refs` row and
-a `hand_offs` row for each agent it hands off to (the event as JSON and
-the agent), due after `HAND_OFF_LEASE` (five minutes), in one
+a `hand_offs` row for each agent it hands off to (the event as JSON, the
+agent and the conversation), due after `HAND_OFF_LEASE` (five minutes), in one
 transaction (`Store::record_post`), and holds each row at once
 (`Holding`, from the pipeline's `Holder`: an in-memory set, a cache in
 front of the rows, which refuses an id it holds already). The hold passes
@@ -9504,22 +9504,23 @@ refused for a reason other than unreadable rules, or found unable to
 post; and the lane deletes the row only then. The "hand-off worker" calls
 `Pipeline::replay_hand_offs` every `HAND_OFF_SWEEP_INTERVAL` (30 s): it
 leases this instance's held rows again, so neither it nor another
-instance takes them, then leases up to 64 due rows, drops rows recorded
-over an hour ago that are due (logging how many; a held row is never due,
-whichever instance holds it, while its holder's worker runs), and
-queues each again, unless its hop's claim is taken, when the row is done
-with. A row that doesn't parse, whose agent is gone or has no active
-binding there, or whose posting turn can't be read is left for later or
-to age out, and each row is handled on its own. Once the pipeline is
-closed, the worker, which now stops with the proxy and ctl listeners
-after the drain or cut, only leases the held rows again, so a drain
-longer than the lease keeps them. A hold let go while the pipeline is
-closed, by a job that never settled its row or a delivery cut short, is
-set aside, and the end of `drain` or `cut_short` makes those rows due at
-once, so the next instance takes them on its first look, and the server
-does it once more after its hand-off worker is joined or aborted
-(`Pipeline::release_cut_hand_offs`), since the worker's last pass can let
-go of a row after them. A row stays set aside until a release of it
+instance takes them, then leases up to 64 due rows in the workspaces it
+serves ([below](#a-hand-off-is-taken-where-its-workspace-is-served)),
+drops rows recorded over an hour ago that are due (logging how many; a
+held row is never due, whichever instance holds it, while its holder's
+worker runs), and queues each again, unless its hop's claim is taken,
+when the row is done with. A row that doesn't parse, whose agent is gone
+or has no active binding there, or whose posting turn can't be read is
+left for later or to age out, and each row is handled on its own. Once the
+pipeline is closed, the worker, which now stops with the proxy and ctl
+listeners after the drain or cut, only leases the held rows again, so a
+drain longer than the lease keeps them. A hold let go while the pipeline is
+closed, by a job that never settled its row or a delivery cut short, is set
+aside, and the end of `drain` or `cut_short` makes those rows due at once,
+so the next instance serving their workspace takes them on its first look,
+and the server does it once more after its hand-off worker is joined or
+aborted (`Pipeline::release_cut_hand_offs`), since the worker's last pass
+can let go of a row after them. A row stays set aside until a release of it
 succeeds, so one that failed or was cancelled is made again by the next,
 and is then forgotten, so a later release can't take it from an instance
 that holds it by then. A drain cut by its timeout while its release is in
@@ -9551,6 +9552,37 @@ instance that stops leasing a row it holds, as a stuck one, lets another
 take it; the claim then still runs the hop once, perhaps out of its lane's
 order. A hand-off retried after a lease can run in the next hour's
 `thread_turns_per_hour` budget, as any message waiting that long would.
+
+### A hand-off is taken where its workspace is served
+
+**Issue.** Instances sharing a store may serve different workspaces, and
+`replay_hand_offs` leased any due row. An instance that doesn't serve the
+row's workspace found no surface for its agent, which `StoreSurfaces`
+answers alike for that and for no active binding, and left the row leased
+for five minutes. Each such look put a cut hand-off off by a lease, so
+after an hour of them the stale delete dropped it undelivered, and 64
+such rows due ahead filled a look, crowding out the rows it could serve.
+
+**Solution.** `hand_offs` keeps the post's conversation (`surface`,
+`team_id`, `conversation`), and `Store::take_due_hand_offs` takes only
+rows in conversations its `serves` accepts, which the pipeline answers
+with `SurfaceLookup::serves`: the rest stay due, untouched, for an
+instance that serves them, and take no place among the 64. A row the
+instance serves and whose agent has no active binding there is still
+taken and left to its lease, as before. The stale delete still drops any
+due row over an hour old, so the rows of a workspace no instance serves
+age out. A row on a surface the instance's version doesn't know, as a
+newer version might write mid-deploy, counts as not served, so it ages
+out too rather than failing every take. Taking the rows and making those
+it doesn't serve due again at once was rejected: every instance would
+rewrite them each look, an instance serving them could miss them between
+the two writes, and they would still fill its looks, rotating only as
+the clock moved their `due_at` behind the rest. The migration
+(`20260930260000_hand_offs`) was edited in place, as T34's is unmerged:
+a development store that ran an earlier version of it must be recreated.
+Tests have an instance serving another workspace look first, which
+leaves the row due, and another serving the row's workspace take it at
+once with 64 other rows due ahead.
 
 ### The hop-cap line once an hour
 
