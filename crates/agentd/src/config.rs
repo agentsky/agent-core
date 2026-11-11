@@ -64,6 +64,8 @@ pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 30;
 pub const MAX_DRAIN_TIMEOUT_SECS: u64 = 3600;
 /// The default for `server.log_filter`.
 pub const DEFAULT_LOG_FILTER: &str = "info";
+/// The default for `limits.attach_max_bytes`: 50 MiB.
+pub const DEFAULT_ATTACH_MAX_BYTES: u64 = 50 * 1024 * 1024;
 
 /// agentd's configuration, validated.
 #[derive(Debug)]
@@ -73,8 +75,10 @@ pub struct Config {
     pub server: ServerConfig,
     /// `[internal]`: the listeners sandboxes reach.
     pub internal: InternalConfig,
-    /// `[store]`: the database.
+    /// `[store]`: the database and the data directory.
     pub store: StoreConfig,
+    /// `[limits]`: caps on what agents may do.
+    pub limits: LimitsConfig,
     /// Secrets from the environment.
     pub secrets: Secrets,
     /// Unknown `AGENTD_` variables that were ignored, by name, sorted.
@@ -89,6 +93,8 @@ struct File {
     server: ServerConfig,
     internal: InternalConfig,
     store: StoreConfig,
+    #[serde(default)]
+    limits: LimitsConfig,
 }
 
 /// `[server]`.
@@ -144,6 +150,27 @@ pub struct StoreConfig {
     /// `url`: the SQLite database, such as
     /// `sqlite:///var/lib/agentd/agentd.db`, or `sqlite::memory:` for tests.
     pub url: String,
+    /// `data_dir`: agentd's data directory, an absolute path, such as
+    /// `/var/lib/agentd`. Files agents attach are staged under
+    /// `ctl-outbox/` in it until their turn's reply is posted.
+    pub data_dir: PathBuf,
+}
+
+/// `[limits]`. Every key has a default, so the section is optional.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+#[non_exhaustive]
+pub struct LimitsConfig {
+    /// `attach_max_bytes`: the largest file `agentctl attach` may stage.
+    pub attach_max_bytes: u64,
+}
+
+impl Default for LimitsConfig {
+    fn default() -> Self {
+        Self {
+            attach_max_bytes: DEFAULT_ATTACH_MAX_BYTES,
+        }
+    }
 }
 
 /// Secrets, read from the environment only.
@@ -248,6 +275,7 @@ impl Config {
             server: file.server,
             internal: file.internal,
             store: file.store,
+            limits: file.limits,
             secrets,
             unknown_env,
         })
@@ -383,6 +411,15 @@ impl File {
                 "store.url",
                 "must be a sqlite: URL, such as sqlite:///var/lib/agentd/agentd.db",
             ));
+        }
+        if !self.store.data_dir.is_absolute() {
+            return Err(invalid(
+                "store.data_dir",
+                "must be an absolute path, such as /var/lib/agentd",
+            ));
+        }
+        if self.limits.attach_max_bytes == 0 {
+            return Err(invalid("limits.attach_max_bytes", "must be at least 1"));
         }
         Ok(())
     }
@@ -543,6 +580,7 @@ sandbox_subnet = "127.0.0.2/32"
 
 [store]
 url = "sqlite::memory:"
+data_dir = "/nonexistent/agentd"
 "#;
 
     pub(crate) fn key() -> String {
@@ -593,6 +631,8 @@ url = "sqlite::memory:"
             "127.0.0.2/32".parse().unwrap()
         );
         assert_eq!(config.store.url, "sqlite::memory:");
+        assert_eq!(config.store.data_dir, Path::new("/nonexistent/agentd"));
+        assert_eq!(config.limits.attach_max_bytes, 50 * 1024 * 1024);
         assert!(config.secrets.rc_manager_token.is_none());
         assert!(config.secrets.slack_manager.is_empty());
         assert!(config.unknown_env.is_empty());
@@ -694,7 +734,10 @@ url = "sqlite::memory:"
 
     #[test]
     fn a_missing_section_is_named() {
-        let err = file_err(&replace("[store]\nurl = \"sqlite::memory:\"\n", ""));
+        let err = file_err(&replace(
+            "[store]\nurl = \"sqlite::memory:\"\ndata_dir = \"/nonexistent/agentd\"\n",
+            "",
+        ));
         assert_eq!(err.key(), Some("store"), "{err}");
     }
 
@@ -897,6 +940,22 @@ url = "sqlite::memory:"
     fn the_store_url_must_be_sqlite() {
         let err = file_err(&replace("sqlite::memory:", "postgres://db/agentd"));
         assert_eq!(err.key(), Some("store.url"), "{err}");
+    }
+
+    #[test]
+    fn the_data_dir_must_be_absolute() {
+        let err = file_err(&replace("\"/nonexistent/agentd\"", "\"var/lib/agentd\""));
+        assert_eq!(err.key(), Some("store.data_dir"), "{err}");
+        let err = file_err(&replace("data_dir = \"/nonexistent/agentd\"\n", ""));
+        assert_eq!(err.key(), Some("store.data_dir"), "{err}");
+    }
+
+    #[test]
+    fn the_attach_cap_is_configurable_and_positive() {
+        let text = format!("{MINIMAL}\n[limits]\nattach_max_bytes = 1024\n");
+        assert_eq!(with(&text, env()).unwrap().limits.attach_max_bytes, 1024);
+        let err = file_err(&format!("{MINIMAL}\n[limits]\nattach_max_bytes = 0\n"));
+        assert_eq!(err.key(), Some("limits.attach_max_bytes"), "{err}");
     }
 
     #[test]
