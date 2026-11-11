@@ -10428,7 +10428,10 @@ and the manager DM get the "try again" line; nothing is cached. Slack's
 `request_timeout` means POST data it got missing or truncated, and after
 `fatal_error` or `internal_error` the call may have partly taken effect,
 so `SurfaceError::Transport`'s rustdoc now says a write that failed with
-one isn't retried blindly. No caller retries one today.
+one isn't retried blindly. The only caller that tries again after one is
+a consent card's close, a `chat.update` that can be repeated. The same
+mapping was later made under T23, where a platform restart read as
+lasting to the history read, and now comes from there.
 
 ### A failed home lookup is warned of once a minute
 
