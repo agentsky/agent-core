@@ -1,6 +1,6 @@
 //! [`EgressProxy`]: `CONNECT` tunnels from sandboxes to allowlisted hosts.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -21,11 +21,22 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::sync::{Semaphore, watch};
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 
 use crate::allowlist::{ANTHROPIC_API_HOST, EgressPolicy, HostRule, normalize_host, parse_port};
 use crate::proxy::CONNECT_TIMEOUT;
 use crate::registry::Registry;
+
+/// How long a connection attempt to one of a host's addresses goes
+/// unanswered before the next address is tried alongside it: RFC 8305's
+/// recommended connection attempt delay.
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// How many connection attempts one `CONNECT` keeps going at once, so a
+/// name that answers with many silent addresses can't hold a socket for
+/// each of them.
+const MAX_ATTEMPTS: usize = 4;
 
 /// The proxy's address as sandboxes know it: agentd's proxy listener,
 /// under its alias on the sandbox network.
@@ -442,29 +453,63 @@ impl EgressProxy {
         }
     }
 
-    /// A connection to the first of `addresses` that answers on `port`,
-    /// tried in order within [`CONNECT_TIMEOUT`] for all of them, so a long
-    /// answer of silent addresses can't hold the request.
+    /// A connection to the first of `addresses` to answer on `port`, all
+    /// within [`CONNECT_TIMEOUT`]. They are tried in [`interleaved`] order,
+    /// each starting when an earlier attempt failed or after
+    /// [`ATTEMPT_DELAY`], whichever comes first, while the earlier ones go
+    /// on, at most [`MAX_ATTEMPTS`] at once; the first to connect wins and
+    /// the others are dropped. So a silent address can't keep the rest from
+    /// being tried.
     async fn dial(&self, addresses: &[IpAddr], port: u16) -> Option<(TcpStream, SocketAddr)> {
-        let attempts = async {
-            for &ip in addresses {
-                let address = SocketAddr::new(ip, port);
-                match self.network.connect(address).await {
-                    Ok(stream) => return Some((stream, address)),
-                    Err(err) => {
-                        tracing::debug!(%address, error = %err, "an egress connection failed");
-                    }
+        let mut waiting = interleaved(addresses, port);
+        let network = Arc::clone(&self.network);
+        let dialing = async move {
+            let mut attempts = JoinSet::new();
+            loop {
+                if let Some(address) = waiting.pop_front() {
+                    let network = Arc::clone(&network);
+                    attempts.spawn(async move { (address, network.connect(address).await) });
+                }
+                let more = !waiting.is_empty() && attempts.len() < MAX_ATTEMPTS;
+                tokio::select! {
+                    Some(joined) = attempts.join_next() => match joined {
+                        Ok((address, Ok(stream))) => return Some((stream, address)),
+                        Ok((address, Err(err))) => {
+                            tracing::debug!(%address, error = %err, "an egress connection failed");
+                        }
+                        Err(err) => tracing::debug!(error = %err, "an egress connection attempt ended"),
+                    },
+                    () = tokio::time::sleep(ATTEMPT_DELAY), if more => {}
+                    else => return None,
                 }
             }
-            None
         };
-        tokio::time::timeout(CONNECT_TIMEOUT, attempts)
+        tokio::time::timeout(CONNECT_TIMEOUT, dialing)
             .await
             .unwrap_or_else(|_| {
                 tracing::debug!(port, "egress connections timed out");
                 None
             })
     }
+}
+
+/// `addresses` on `port`, the families taking turns from the first
+/// address's family, each in the resolver's order, as RFC 8305 orders
+/// them: an address family that goes nowhere then holds up at most every
+/// other attempt.
+fn interleaved(addresses: &[IpAddr], port: u16) -> VecDeque<SocketAddr> {
+    let first_v6 = addresses.first().is_some_and(IpAddr::is_ipv6);
+    let (mut first, mut second): (VecDeque<_>, VecDeque<_>) = addresses
+        .iter()
+        .map(|&ip| SocketAddr::new(ip, port))
+        .partition(|address| address.is_ipv6() == first_v6);
+    let mut order = VecDeque::with_capacity(addresses.len());
+    while let Some(address) = first.pop_front() {
+        order.push_back(address);
+        order.extend(second.pop_front());
+    }
+    order.extend(second);
+    order
 }
 
 /// A `CONNECT` target: a valid, normalized host name and a port.
@@ -834,6 +879,28 @@ mod tests {
         ] {
             assert_eq!(target(text), Err(Why::Target), "{text}");
         }
+    }
+
+    #[test]
+    fn address_families_take_turns_from_the_first_ones() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let (a6, b6, c6) = (ip("2001:db8::1"), ip("2001:db8::2"), ip("2001:db8::3"));
+        let (a4, b4) = (ip("192.0.2.1"), ip("192.0.2.2"));
+        let order = |addresses: &[IpAddr]| -> Vec<IpAddr> {
+            interleaved(addresses, 443)
+                .iter()
+                .map(SocketAddr::ip)
+                .collect()
+        };
+        assert_eq!(order(&[a6, b6, c6, a4, b4]), [a6, a4, b6, b4, c6]);
+        assert_eq!(order(&[a4, a6, b6, c6, b4]), [a4, a6, b4, b6, c6]);
+        assert_eq!(order(&[a4, b4]), [a4, b4]);
+        assert!(order(&[]).is_empty());
+        assert!(
+            interleaved(&[a4], 443)
+                .iter()
+                .all(|address| address.port() == 443)
+        );
     }
 
     #[test]
