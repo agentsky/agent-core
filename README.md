@@ -118,6 +118,21 @@ turn ran on hits its usage limit or is refused, the thread is told whose it
 was, and the member who asked gets a direct message from the manager bot,
 at most once an hour for each kind of failure. Without `[sandbox]`, each agent reacts
 with :eyes: to messages that mention it.
+Every agent has a built-in `agentctl` skill, and its owner adds more with
+`skill add <name> <https Git URL>[#ref]`, or with a `SKILL.md` or `.zip`
+attached to `skill add <name>` in the manager bot's direct message, and
+removes them with `skill rm <name> <skill>`. agentd clones with the `git`
+program (2.37 or later, which the agentd image has) directly from agentd's
+own network, only over `https` and only from a host whose addresses are all
+public, and keeps skills in `skills/` under `store.data_dir`, mounted
+read-only into the agent's sandboxes. A skill whose `SKILL.md` lists
+`allowed-hosts` waits until the owner confirms them with
+`skill confirm <name> <skill>`; those hosts, each named in full (no
+wildcards), then extend `[proxy] allow` for that agent's sandboxes only.
+At startup agentd deletes the files of every skill the store has no row
+for, once they are a few minutes old, so restoring an older backup of the
+store also drops the files of skills added since that backup: add those
+skills again afterwards.
 The owner lists an agent's sessions with `sessions <name>` (where each is,
 its last turn, and whether its container is warm), and starts them over
 with `reset <name>`, or only the ones of one conversation with

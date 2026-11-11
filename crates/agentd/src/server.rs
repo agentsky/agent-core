@@ -53,11 +53,15 @@ use crate::commands::slack_tokens::{ConfigTokenRotator, ROTATION_INTERVAL};
 use crate::community::StoreCommunityKey;
 use crate::net::RefuseSubnet;
 use crate::pipeline::Pipeline;
+use crate::skills::SkillHosts;
 use crate::slack;
 use crate::sweeper::{self, SWEEP_INTERVAL};
 
 /// How long `/healthz` waits for the store before reporting it unavailable.
 pub const HEALTH_TIMEOUT: Duration = Duration::from_secs(2);
+/// The least time shutdown gives skill changes still running before it
+/// closes the store, even once the drain timeout has passed.
+pub const SKILL_DRAIN_FLOOR: Duration = Duration::from_secs(1);
 
 /// The routes each listener serves, and the workers behind them.
 #[derive(Debug)]
@@ -87,8 +91,9 @@ impl Routers {
     /// listener, forwarding to `proxy.upstream` with the placeholders in
     /// [`App::registry`], members' tokens from [`App::auth`] and the
     /// community API key from the store ([`StoreCommunityKey`]), and
-    /// answering `CONNECT` with the egress proxy
-    /// `[proxy]` describes; and the agentctl API on the ctl listener.
+    /// answering `CONNECT` with the egress proxy `[proxy]` describes,
+    /// extended for each session by its agent's skills' confirmed hosts
+    /// ([`SkillHosts`]); and the agentctl API on the ctl listener.
     ///
     /// # Errors
     ///
@@ -117,7 +122,11 @@ impl Routers {
             Arc::new(StoreCommunityKey::new(app.store().clone())),
         )
         .context("proxy.upstream")?
-        .with_egress(app.config().egress_proxy()?);
+        .with_egress(
+            app.config()
+                .egress_proxy()?
+                .with_extension(Arc::new(SkillHosts(app.skills().clone()))),
+        );
         Ok(Self {
             public: public_router(app.clone()).merge(slack_routes),
             proxy: proxy.into_router(),
@@ -275,7 +284,12 @@ impl Server {
     ///    fail once the store is closed, which the runner logs as giving up,
     ///    and the idle reaper they keep alive runs until the process exits.
     ///    The next start purges the tokens and reaps the containers.
-    /// 5. The pipeline is dropped, and the store is closed.
+    /// 5. The pipeline is dropped. Skill changes still running, which an
+    ///    aborted command leaves to finish in their own task, get what is
+    ///    left of the same timeout, but at least
+    ///    [`SKILL_DRAIN_FLOOR`], unless shutdown was forced
+    ///    ([`Skills::drain`](crate::skills::Skills::drain)), and the store
+    ///    is closed.
     ///
     /// If `abort` completes before the drain ends, as a second shutdown
     /// signal does, what is still running is dropped at once instead.
@@ -338,9 +352,10 @@ impl Server {
             });
         }
         let store = app.store().clone();
+        let skills = app.skills().clone();
         let sweeping = stopping.clone();
         tasks.spawn(async move {
-            sweeper::run(store, SWEEP_INTERVAL, sweeping).await;
+            sweeper::run(store, skills, SWEEP_INTERVAL, sweeping).await;
             "sweeper"
         });
         let notifier = RelinkNotifier::new(app.store().clone(), app.commands().replies().clone());
@@ -478,7 +493,10 @@ impl Server {
                     stopped = tokio::time::timeout_at(deadline, pipeline.stop_sessions()) => {
                         stopped.is_err().then_some("drain timeout elapsed")
                     }
-                    () = abort.as_mut() => Some("shutdown forced"),
+                    () = abort.as_mut() => {
+                        forced = true;
+                        Some("shutdown forced")
+                    }
                 };
                 if let Some(reason) = left {
                     tracing::warn!("{reason}; leaving warm sandboxes for the next start to reap");
@@ -486,6 +504,18 @@ impl Server {
             }
         }
         drop(pipeline);
+        if !forced {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let drained = tokio::select! {
+                drained = app.skills().drain(left.max(SKILL_DRAIN_FLOOR)) => drained,
+                () = abort.as_mut() => false,
+            };
+            if !drained {
+                tracing::warn!(
+                    "skill changes still running at shutdown; the next change or start tidies what they leave"
+                );
+            }
+        }
         app.store().close().await;
         tracing::info!("stopped");
         failure.map_or(Ok(()), Err)

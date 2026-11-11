@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! fake-claude -p --input-format stream-json --output-format stream-json --verbose \
-//!   --tools "Bash,Read,Edit,Write,Glob,Grep" --strict-mcp-config \
+//!   --tools "Bash,Read,Edit,Write,Glob,Grep,Skill" --strict-mcp-config \
 //!   --setting-sources user --permission-mode bypassPermissions \
 //!   --append-system-prompt-file /agent/persona.md [--model <model>] \
 //!   --session-id <uuid> | --resume <uuid>

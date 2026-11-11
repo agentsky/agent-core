@@ -1,5 +1,6 @@
 //! `/agent` command dispatch, the account commands, the agent commands
-//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), the session
+//! (`create`, `persona`, `list`, `pause`, `resume`, `delete`), the skill
+//! commands (`skill add`, `skill confirm`, `skill rm`), the session
 //! commands (`sessions`, `reset`), and the community admins' `admin api-key
 //! set` and `clear`, which only the identities [`Commands::with_admins`]
 //! names may run.
@@ -42,6 +43,7 @@ pub mod relink;
 pub mod reply;
 pub mod rocketchat;
 mod sessions;
+mod skills;
 pub mod slack;
 pub mod slack_tokens;
 
@@ -62,6 +64,7 @@ use store::{Store, StoreError};
 use time::OffsetDateTime;
 
 use crate::agents::RocketChatAgents;
+use crate::skills::Skills;
 use crate::slack::manager::SlackManager;
 
 pub use agents::PERSONA_MAX_BYTES;
@@ -219,6 +222,7 @@ struct Inner {
     replies: Replies,
     rocketchat: Option<RocketChatAgents>,
     slack: Option<SlackManager>,
+    skills: Skills,
     sessions: Mutex<Option<Weak<dyn SessionControl>>>,
 }
 
@@ -231,6 +235,8 @@ enum Failure {
     Auth(#[from] AuthError),
     #[error(transparent)]
     Surface(#[from] core_types::SurfaceError),
+    #[error(transparent)]
+    Skill(#[from] crate::skills::SkillError),
 }
 
 fn now() -> OffsetDateTime {
@@ -240,14 +246,15 @@ fn now() -> OffsetDateTime {
 impl Commands {
     /// Commands over `store` and `auth`, replying through `replies`,
     /// managing agents on Rocket.Chat through `rocketchat` if agentd serves
-    /// Rocket.Chat, and with the Slack manager app `slack` if agentd serves
-    /// Slack.
+    /// Rocket.Chat, with the Slack manager app `slack` if agentd serves
+    /// Slack, and managing agents' skills through `skills`.
     pub fn new(
         store: Store,
         auth: Arc<Auth>,
         replies: Replies,
         rocketchat: Option<RocketChatAgents>,
         slack: Option<SlackManager>,
+        skills: Skills,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -256,6 +263,7 @@ impl Commands {
                 replies,
                 rocketchat,
                 slack,
+                skills,
                 sessions: Mutex::new(None),
             }),
             admins: Arc::new([]),
@@ -424,6 +432,7 @@ impl Commands {
                     self.set_paused(member, name.as_str(), false, origin).await
                 }
                 Command::Delete { name } => self.delete(member, name.as_str()).await,
+                Command::Skill(command) => self.skill(member, command, origin, files).await,
                 Command::Sessions { name } => self.sessions(member, name.as_str(), origin).await,
                 Command::Admin(AdminCommand::ApiKey(command)) => {
                     self.api_key(member, command).await
