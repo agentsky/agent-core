@@ -52,6 +52,10 @@ impl SurfaceLookup for Lookup {
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
         Ok(Some(self.0.clone()))
     }
+
+    fn serves(&self, _conv: &ConvRef) -> bool {
+        true
+    }
 }
 
 struct Server {

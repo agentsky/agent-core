@@ -81,6 +81,10 @@ impl Pipeline {
     ///   the same way, under a session id that is the consent's own, since
     ///   no session ran. Nothing is posted for a deleted agent.
     ///
+    /// The work of a consent whose thread is on a surface and team this
+    /// instance doesn't serve ([`SurfaceLookup::serves`]) is left
+    /// unclaimed, for an instance that does, unless its agent was deleted.
+    ///
     /// The work is leased ([`WORK_LEASE`]), so an instance that dies
     /// leaves it to the next pass anywhere, and a shutdown releases what it
     /// cut short once no turn of it can still be running. A task is run
@@ -105,6 +109,10 @@ impl Pipeline {
                 .agent(consent.agent)
                 .await?
                 .filter(|agent| agent.state != AgentState::Deleted);
+            if agent.is_some() && !self.inner.surfaces.serves(&consent.thread.conv) {
+                tracing::debug!(consent = %consent.id, "this instance doesn't serve the thread that asked; the consent's work waits");
+                continue;
+            }
             match agent {
                 Some(agent)
                     if consent.state == ConsentState::Approved

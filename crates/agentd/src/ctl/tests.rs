@@ -44,6 +44,10 @@ impl SurfaceLookup for Lookup {
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
         Ok((conv.surface == SurfaceKind::Slack).then(|| self.0.clone() as Arc<dyn Surface>))
     }
+
+    fn serves(&self, conv: &ConvRef) -> bool {
+        conv.surface == SurfaceKind::Slack
+    }
 }
 
 struct Fixture {
