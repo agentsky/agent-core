@@ -580,7 +580,7 @@ async fn usernames_rooms_and_files_go_through_the_manager() {
         .mount(h.fake.server())
         .await;
     let err = h.agents.public_channel(&named("public")).await.unwrap_err();
-    assert!(matches!(err, SurfaceError::Api(_)), "{err:?}");
+    assert!(matches!(err, SurfaceError::Transport(_)), "{err:?}");
     h.fake.add_room("DM", "d", "");
     let err = h
         .agents
