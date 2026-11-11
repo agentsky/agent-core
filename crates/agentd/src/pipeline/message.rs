@@ -12,9 +12,9 @@ use time::OffsetDateTime;
 
 use super::run::PipelineError;
 
-/// How many thread messages before the turn's own are read to find what
+/// How many thread messages before the turn's own are searched for what
 /// the transcript lacks, and shown to a session that starts with an empty
-/// one.
+/// one. One more is read, to tell whether the thread has older messages.
 pub const HISTORY_LIMIT: usize = 50;
 
 /// A turn message, and the short ids it recorded in its session. It has

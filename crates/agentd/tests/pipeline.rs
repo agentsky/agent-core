@@ -716,17 +716,20 @@ async fn a_mention_runs_a_turn_and_the_reply_is_delivered_in_the_thread() {
 #[tokio::test]
 async fn dms_and_channels_use_their_own_sessions_and_volumes() {
     let stack = start().await;
-    let mut dm: Vec<Msg> = (0..=HISTORY_LIMIT)
-        .map(|n| said(&format!("m{n}"), "alice", "earlier"))
-        .collect();
-    dm.push(said("d1", "alice", "hello"));
-    stack.mock.set_history(
-        ThreadKey {
-            conv: conv("DM1"),
-            root: None,
-        },
-        dm,
-    );
+    let set_dm = |conv_id: &str, earlier: usize, id: &str| {
+        let mut dm: Vec<Msg> = (0..earlier)
+            .map(|n| said(&format!("h{n}"), "alice", &format!("earlier {n:02}")))
+            .collect();
+        dm.push(said(id, "alice", "hello"));
+        stack.mock.set_history(
+            ThreadKey {
+                conv: conv(conv_id),
+                root: None,
+            },
+            dm,
+        );
+    };
+    set_dm("DM1", HISTORY_LIMIT + 1, "d1");
     let upstream = stack.fake.message_requests().await.len();
 
     stack.next_turn(Turn::reply("In the DM."));
@@ -736,8 +739,10 @@ async fn dms_and_channels_use_their_own_sessions_and_volumes() {
     let bodies = stack.upstream_bodies_since(upstream).await;
     assert_eq!(bodies.len(), 1);
     assert!(
-        bodies[0].contains("agentctl history --before #"),
-        "a DM with more than the window has older messages: {}",
+        bodies[0].contains("agentctl history --before #")
+            && !bodies[0].contains("earlier 00")
+            && bodies[0].contains("earlier 01"),
+        "a DM with more than the window shows the window and points past it: {}",
         bodies[0]
     );
     let sent = posts(&stack.calls_since(0));
@@ -790,6 +795,20 @@ async fn dms_and_channels_use_their_own_sessions_and_volumes() {
         paths.push(volume.path);
     }
     assert_ne!(paths[0], paths[1], "two channels, two volumes");
+
+    set_dm("DM2", HISTORY_LIMIT, "e1");
+    let upstream = stack.fake.message_requests().await.len();
+    stack.next_turn(Turn::reply("In another DM."));
+    stack
+        .handle(stack.event("alice", "DM2", ConvKind::Dm, "e1", None, &[]))
+        .await;
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    assert!(
+        bodies[0].contains("earlier 00") && !bodies[0].contains("agentctl history --before #"),
+        "a DM of exactly the window has nothing older: {}",
+        bodies[0]
+    );
     stack.stop().await;
 }
 

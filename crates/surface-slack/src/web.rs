@@ -15,9 +15,10 @@
 //!
 //! Slack answers most failures with HTTP 200 and `{"ok": false, "error":
 //! "<code>"}`, and some with another status and the same body. [`map_error`]
-//! turns the code into a [`SurfaceError`]; another status without a code is
-//! [`SurfaceError::Transport`] with the status for a 5xx, and
-//! [`SurfaceError::Api`] with the status otherwise. A 429
+//! turns the code into a [`SurfaceError`]. A 5xx is
+//! [`SurfaceError::Transport`] with the status, whatever its body says, and
+//! another status without a code is [`SurfaceError::Api`] with the status.
+//! A 429
 //! (or an `ok: false` with `ratelimited`) is retried after `Retry-After`,
 //! at most [`MAX_RETRIES`] times and only while the wait is within
 //! [`SlackClient::with_max_retry_wait`]; otherwise it fails with
@@ -131,8 +132,18 @@ const NOT_FOUND_CODES: &[&str] = &[
 /// Error codes of Slack's rate limiter.
 const RATE_LIMITED_CODES: &[&str] = &["ratelimited", "rate_limited"];
 
-/// Error codes that mean Slack failed on its side, whatever was asked.
-const UNAVAILABLE_CODES: &[&str] = &["fatal_error", "internal_error", "service_unavailable"];
+/// Error codes with which Slack says it couldn't answer this time, as an
+/// HTTP 5xx would: `fatal_error` and `internal_error`, after which the call
+/// may have partly taken effect, `service_unavailable`, and
+/// `request_timeout`, Slack's word for POST data it got missing or
+/// truncated. None of them says a write didn't happen, so none is retried
+/// blindly.
+const TRANSIENT_CODES: &[&str] = &[
+    "fatal_error",
+    "internal_error",
+    "request_timeout",
+    "service_unavailable",
+];
 
 /// A Web API method this client calls, with its rate-limit tier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -369,8 +380,9 @@ impl SlackClient {
     /// [`SurfaceError::NotFound`] once the URL has expired or been used up
     /// (`expired_url`, `used_url`, HTTP 404 or 410),
     /// [`SurfaceError::RateLimited`] on a 429, [`SurfaceError::Transport`]
-    /// on a 5xx without a code, and otherwise [`map_error`] of Slack's code,
-    /// or [`SurfaceError::Api`] with the status when there is none.
+    /// on a 5xx whatever its body says, and otherwise [`map_error`] of
+    /// Slack's code, or [`SurfaceError::Api`] with the status when there is
+    /// none.
     pub async fn respond_ephemeral(&self, response_url: &SecretString, text: &str) -> Result<()> {
         let url = Url::parse(response_url.expose_secret())
             .ok()
@@ -394,15 +406,18 @@ impl SlackClient {
                 retry_after: wait.unwrap_or(DEFAULT_RETRY_WAIT),
             });
         }
+        if status.is_server_error() {
+            return Err(SurfaceError::Transport(format!("HTTP {}", status.as_u16())));
+        }
         let code = match serde_json::from_slice::<Envelope>(&bytes) {
             Ok(envelope) if envelope.ok => None,
             Ok(envelope) => Some(envelope.error.unwrap_or_default()),
             Err(_) => Some(String::from_utf8_lossy(&bytes).trim().to_owned())
                 .filter(|text| !text.is_empty() && text != "ok"),
         };
-        let code = code.as_deref().and_then(|code| {
-            sanitize_code(code).or_else(|| status.is_success().then_some("unknown_error"))
-        });
+        let code = code
+            .as_deref()
+            .map(|code| sanitize_code(code).unwrap_or("unknown_error"));
         match code {
             None if status.is_success() => Ok(()),
             Some(code @ ("expired_url" | "used_url")) => {
@@ -412,7 +427,7 @@ impl SlackClient {
                 Err(SurfaceError::NotFound(format!("HTTP {}", status.as_u16())))
             }
             Some(code) => Err(map_error(code, None)),
-            None => Err(http_failure(status, format!("HTTP {}", status.as_u16()))),
+            None => Err(SurfaceError::Api(format!("HTTP {}", status.as_u16()))),
         }
     }
 }
@@ -981,11 +996,17 @@ impl WebApi {
             .await
             .map_err(transport)?;
         let status = response.status();
+        if status.is_server_error() {
+            return Err(SurfaceError::Transport(format!(
+                "the file download failed (HTTP {})",
+                status.as_u16()
+            )));
+        }
         if status != StatusCode::OK {
-            return Err(http_failure(
-                status,
-                format!("the file download was refused (HTTP {})", status.as_u16()),
-            ));
+            return Err(SurfaceError::Api(format!(
+                "the file download was refused (HTTP {})",
+                status.as_u16()
+            )));
         }
         if response.content_length().is_some_and(|len| len > max_bytes) {
             return Err(too_large());
@@ -1141,16 +1162,21 @@ impl WebApi {
         let status = response.status();
         if status.is_success() {
             Ok(())
+        } else if status.is_server_error() {
+            Err(SurfaceError::Transport(format!(
+                "the file upload failed (HTTP {})",
+                status.as_u16()
+            )))
         } else if status == StatusCode::TOO_MANY_REQUESTS {
             Err(SurfaceError::RateLimited {
                 retry_after: retry_after(response.headers().get(RETRY_AFTER))
                     .unwrap_or(DEFAULT_RETRY_WAIT),
             })
         } else {
-            Err(http_failure(
-                status,
-                format!("the file upload was refused (HTTP {})", status.as_u16()),
-            ))
+            Err(SurfaceError::Api(format!(
+                "the file upload was refused (HTTP {})",
+                status.as_u16()
+            )))
         }
     }
 
@@ -1325,12 +1351,15 @@ async fn reply(response: reqwest::Response) -> Result<Reply> {
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Ok(Reply::RateLimited(wait.unwrap_or(DEFAULT_RETRY_WAIT)));
     }
+    if status.is_server_error() {
+        return Err(SurfaceError::Transport(format!("HTTP {}", status.as_u16())));
+    }
     let envelope = serde_json::from_slice::<Envelope>(&bytes).ok();
     let has_code = envelope
         .as_ref()
         .is_some_and(|envelope| !envelope.ok && envelope.error.is_some());
     if !status.is_success() && !has_code {
-        return Err(http_failure(status, format!("HTTP {}", status.as_u16())));
+        return Err(SurfaceError::Api(format!("HTTP {}", status.as_u16())));
     }
     let envelope = envelope.ok_or_else(|| {
         SurfaceError::Transport(format!("unreadable response (HTTP {})", status.as_u16()))
@@ -1391,8 +1420,11 @@ fn sanitize_code(code: &str) -> Option<&str> {
 ///   (`channel_not_found`, `message_not_found`, `thread_not_found`,
 ///   `user_not_found`, `bot_not_found`, …) are [`SurfaceError::NotFound`]
 ///   with the code.
-/// - `fatal_error`, `internal_error` and `service_unavailable`, Slack
-///   failing on its side, are [`SurfaceError::Transport`] with the code.
+/// - Codes with which Slack says it couldn't answer this time
+///   (`fatal_error`, `internal_error`, `request_timeout`,
+///   `service_unavailable`) are [`SurfaceError::Transport`] with the code,
+///   as an HTTP 5xx is. The call may have partly taken effect: a read may
+///   be tried again, a write not blindly.
 /// - Anything else is [`SurfaceError::Api`] with the code.
 ///
 /// ```
@@ -1408,11 +1440,11 @@ fn sanitize_code(code: &str) -> Option<&str> {
 ///     map_error("channel_not_found", None),
 ///     SurfaceError::NotFound("channel_not_found".into()),
 /// );
-/// assert_eq!(
-///     map_error("service_unavailable", None),
-///     SurfaceError::Transport("service_unavailable".into()),
-/// );
 /// assert_eq!(map_error("msg_too_long", None), SurfaceError::Api("msg_too_long".into()));
+/// assert_eq!(
+///     map_error("fatal_error", None),
+///     SurfaceError::Transport("fatal_error".into()),
+/// );
 /// ```
 pub fn map_error(code: &str, needed: Option<&str>) -> SurfaceError {
     let code = sanitize_code(code).unwrap_or("unknown_error");
@@ -1429,21 +1461,10 @@ pub fn map_error(code: &str, needed: Option<&str>) -> SurfaceError {
         SurfaceError::RateLimited {
             retry_after: DEFAULT_RETRY_WAIT,
         }
-    } else if UNAVAILABLE_CODES.contains(&code) {
+    } else if TRANSIENT_CODES.contains(&code) {
         SurfaceError::Transport(code.to_owned())
     } else {
         SurfaceError::Api(code.to_owned())
-    }
-}
-
-/// A failure an HTTP status describes: [`SurfaceError::Transport`] for a
-/// 5xx, which says Slack or a proxy in front of it is unavailable, and
-/// [`SurfaceError::Api`] for any other.
-fn http_failure(status: StatusCode, text: String) -> SurfaceError {
-    if status.is_server_error() {
-        SurfaceError::Transport(text)
-    } else {
-        SurfaceError::Api(text)
     }
 }
 
@@ -1508,7 +1529,7 @@ mod tests {
                 SurfaceError::NotFound((*code).to_owned())
             );
         }
-        for code in UNAVAILABLE_CODES {
+        for code in TRANSIENT_CODES {
             assert_eq!(
                 map_error(code, None),
                 SurfaceError::Transport((*code).to_owned())
