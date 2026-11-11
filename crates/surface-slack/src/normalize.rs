@@ -199,6 +199,38 @@ pub(crate) fn in_file(file: SlackFile) -> Option<InFile> {
     })
 }
 
+/// Decodes the three entities Slack writes in message and slash command
+/// text, `&amp;`, `&lt;` and `&gt;`, so text reads as the member typed it.
+/// Nothing else is decoded, and a decoded `&amp;` is not decoded again:
+/// `&amp;lt;` becomes `&lt;`.
+///
+/// A literal `<@U…>` the member typed then looks like a mention token, so
+/// decode only text that is parsed for its words, such as a command, never
+/// text that mentions are read from.
+///
+/// ```
+/// use surface_slack::normalize::unescape;
+///
+/// assert_eq!(unescape("a &lt;b&gt; &amp;amp; c"), "a <b> &amp; c");
+/// assert_eq!(unescape("&quot;"), "&quot;");
+/// ```
+pub fn unescape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let (decoded, len) = [("&amp;", '&'), ("&lt;", '<'), ("&gt;", '>')]
+            .into_iter()
+            .find(|(entity, _)| rest.starts_with(entity))
+            .map_or(('&', 1), |(entity, ch)| (ch, entity.len()));
+        out.push(decoded);
+        rest = &rest[len..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Every user mentioned in `text` and `blocks`, once each, in order of first
 /// appearance: `<@U…>` tokens in `text`, then `rich_text` `user` elements
 /// and tokens in `mrkdwn` text objects.
