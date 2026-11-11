@@ -61,9 +61,6 @@ pub struct TurnReport<F> {
     /// How the turn's process was started, when the turn started one
     /// rather than using a warm process.
     pub process_start: Option<SessionStart>,
-    /// Whether the CLI refused to resume the session for want of a
-    /// transcript, and the turn ran again with `--session-id`.
-    pub reran: bool,
 }
 
 impl<F> fmt::Debug for TurnReport<F> {
@@ -72,7 +69,6 @@ impl<F> fmt::Debug for TurnReport<F> {
             .field("outcome", &self.outcome)
             .field("finished", &self.finished.as_ref().map(|_| ()))
             .field("process_start", &self.process_start)
-            .field("reran", &self.reran)
             .finish()
     }
 }
@@ -289,10 +285,13 @@ fn is_warm<H: TurnHooks>(slot: &Slot<H>) -> bool {
 /// exists. Until then processes start with `--session-id`. If the CLI
 /// refuses a `--resume` for want of a transcript
 /// ([`TurnOutcome::resume_refused`] on the first turn sent to a process
-/// started with [`SessionStart::Resume`]), the session is marked unstarted
-/// and the turn runs again, once, with `--session-id` under the same id. If
-/// the store fails to mark it, the turn fails with [`RunnerError::Store`]
-/// instead, since running it again would `--resume` again.
+/// started with [`SessionStart::Resume`]), the session is marked unstarted,
+/// so its next process starts with `--session-id` under the same id, and the
+/// turn fails with [`RunnerError::ResumeRefused`]: it never reached the
+/// model, and its message was built for a transcript that is gone, so the
+/// caller builds it again for an empty one and runs it again. If the store
+/// fails to mark the session, the turn fails with [`RunnerError::Store`]
+/// instead, since the next process would `--resume` again.
 ///
 /// Before a turn goes to an unstarted session's CLI, the store records
 /// that the session may have started; the turn's end clears it once the
@@ -527,6 +526,11 @@ impl<H: TurnHooks> SessionManager<H> {
     ///   the session.
     /// - [`RunnerError::Hook`] if `process_starting` or `turn_starting`
     ///   failed; the turn wasn't sent.
+    /// - [`RunnerError::ResumeRefused`] if the CLI refused to resume the
+    ///   session for want of a transcript; the session's next turn starts
+    ///   it with `--session-id`. The session's slot is released, so the
+    ///   caller must run its rebuilt turn before any other turn or reset
+    ///   of the session.
     /// - [`RunnerError::Sandbox`], [`RunnerError::Store`] and the process's
     ///   own errors if the container or the process couldn't be started, or
     ///   the session's old container couldn't be stopped.
@@ -606,32 +610,27 @@ impl<H: TurnHooks> Inner<H> {
         warm: &mut Warm<H>,
         request: &TurnRequest,
     ) -> Result<TurnReport<H::Finished>> {
-        let mut reran = false;
-        loop {
-            let session = self
-                .store
-                .session(warm.session)
-                .await?
-                .ok_or(RunnerError::UnknownSession)?;
-            if session.reset_at.is_some() {
-                return Err(RunnerError::SessionReset);
-            }
-            check_kind(&session, request)?;
-            let process_start = self.ensure_process(warm, &session, request).await?;
-            let (outcome, finished) = self.exchange(warm, &session, request).await;
-            let (outcome, refused) = outcome?;
-            if refused && !reran {
-                tracing::info!(session = %session.id, "the CLI refused to resume a session without a transcript; running the turn again with --session-id");
-                reran = true;
-                continue;
-            }
-            return Ok(TurnReport {
-                outcome,
-                finished,
-                process_start,
-                reran,
-            });
+        let session = self
+            .store
+            .session(warm.session)
+            .await?
+            .ok_or(RunnerError::UnknownSession)?;
+        if session.reset_at.is_some() {
+            return Err(RunnerError::SessionReset);
         }
+        check_kind(&session, request)?;
+        let process_start = self.ensure_process(warm, &session, request).await?;
+        let (outcome, finished) = self.exchange(warm, &session, request).await;
+        let (outcome, refused) = outcome?;
+        if refused {
+            tracing::info!(session = %session.id, "the CLI refused to resume a session without a transcript; its next turn starts it with --session-id");
+            return Err(RunnerError::ResumeRefused);
+        }
+        Ok(TurnReport {
+            outcome,
+            finished,
+            process_start,
+        })
     }
 
     /// Sends the turn to the warm process between `turn_starting` and
@@ -645,7 +644,8 @@ impl<H: TurnHooks> Inner<H> {
     /// failed `turn_finished`; then the panic resumes.
     ///
     /// A refusal the store fails to record comes back as
-    /// [`RunnerError::Store`], so the turn isn't run again.
+    /// [`RunnerError::Store`], so the caller isn't told the session starts
+    /// afresh.
     async fn exchange(
         &self,
         warm: &mut Warm<H>,
