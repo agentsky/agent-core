@@ -417,10 +417,11 @@ impl Consents {
     /// Sends the cards owed, through `replies`, and returns how many were
     /// sent. A card goes to the owner's identity in the task's workspace,
     /// or else any a manager bot reaches, and says so when the agent is
-    /// paused. A card that fails, or that no manager bot of this instance
-    /// can send (another instance's may), is tried again after
-    /// [`CARD_RETRY`], doubling up to [`CARD_RETRY_MAX`], until the consent
-    /// expires; the thread is then told the card couldn't reach the owner.
+    /// paused. A card no manager bot of this instance can send is left
+    /// unclaimed, for an instance whose manager bot can; one that fails is
+    /// tried again after [`CARD_RETRY`], doubling up to [`CARD_RETRY_MAX`].
+    /// Either waits until the consent expires; the thread is then told the
+    /// card couldn't reach the owner.
     /// A consent whose card won't fit one message expires at once. A
     /// deleted agent's consents are left to [`expire`](Self::expire).
     ///
@@ -438,6 +439,20 @@ impl Consents {
             else {
                 continue;
             };
+            let identities = store.member_identities(agent.owner).await?;
+            let reachable = |key: &&MemberKey| replies.can_dm(key);
+            let Some(owner) = identities
+                .iter()
+                .filter(reachable)
+                .find(|key| {
+                    key.surface == consent.thread.conv.surface
+                        && key.team == consent.thread.conv.team
+                })
+                .or_else(|| identities.iter().find(reachable))
+            else {
+                tracing::debug!(consent = %consent.id, "no manager bot here reaches the owner; the consent card waits");
+                continue;
+            };
             let now = Self::now();
             let Some(attempt) = store
                 .claim_consent_card(consent.id, now, now + CARD_LEASE)
@@ -445,21 +460,7 @@ impl Consents {
             else {
                 continue;
             };
-            let identities = store.member_identities(agent.owner).await?;
-            let reachable = |key: &&MemberKey| replies.can_dm(key);
-            let owner = identities
-                .iter()
-                .filter(reachable)
-                .find(|key| {
-                    key.surface == consent.thread.conv.surface
-                        && key.team == consent.thread.conv.team
-                })
-                .or_else(|| identities.iter().find(reachable));
-            let sent_to = match owner {
-                Some(owner) => self.send_card(replies, &consent, &agent, owner).await,
-                None => Err(ReplyError::NoManagerBot(consent.thread.conv.surface)),
-            };
-            match sent_to {
+            match self.send_card(replies, &consent, &agent, owner).await {
                 Ok(posted) => {
                     record_card(store, consent.id, &posted).await?;
                     tracing::info!(consent = %consent.id, "sent a consent card to the owner");
@@ -521,11 +522,13 @@ impl Consents {
     }
 
     /// Updates each decided or expired consent's card with its outcome,
-    /// through `replies`. An update that fails on the way (a rate limit or
-    /// a transport error) releases its claim, so a later pass tries again;
-    /// a card the platform refuses to update, or whose claim can't be
-    /// released, stays as it is, and its buttons answer that the task was
-    /// settled. Neither stops the pass.
+    /// through `replies`. A card no manager bot of `replies` can update
+    /// ([`Replies::can_update`]) is left unclaimed, for an instance whose
+    /// manager bot serves its workspace. An update that fails on the way
+    /// (a rate limit or a transport error) releases its claim, so a later
+    /// pass tries again; a card the platform refuses to update, or whose
+    /// claim can't be released, stays as it is, and its buttons answer that
+    /// the task was settled. Neither stops the pass.
     ///
     /// # Errors
     ///
@@ -537,6 +540,10 @@ impl Consents {
             let Some(posted) = consent.card.clone() else {
                 continue;
             };
+            if !replies.can_update(&posted) {
+                tracing::debug!(consent = %consent.id, "no manager bot here serves the consent card's workspace; it waits");
+                continue;
+            }
             let agent = store.agent(consent.agent).await?;
             let name = replies.name_of(&consent.requester.key).await;
             let claimed_at = Self::now();

@@ -1922,7 +1922,7 @@ async fn a_card_that_cant_reach_the_owner_expires_without_running() {
     let (to, text, _) = stack.posted(before, "couldn't reach the owner").await;
     assert!(
         OffsetDateTime::now_utc() >= created.expires_at,
-        "a card that can't be sent is tried again until the consent expires"
+        "a card that can't be sent waits until the consent expires"
     );
     assert_eq!(to, in_thread("t9"));
     assert!(text.contains(&created.id.to_string()), "{text}");
