@@ -3966,9 +3966,50 @@ async fn a_post_outside_the_turns_thread_hands_off_nothing() {
     stack.stop().await;
 }
 
+/// The surfaces of the conversations in `team` alone, as an instance
+/// whose configuration serves that workspace only finds them.
+#[derive(Debug)]
+struct ServingTeam {
+    surfaces: Arc<dyn SurfaceLookup>,
+    team: &'static str,
+}
+
+#[async_trait::async_trait]
+impl SurfaceLookup for ServingTeam {
+    async fn surface(
+        &self,
+        agent: AgentId,
+        conv: &ConvRef,
+    ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
+        if !self.serves(conv) {
+            return Ok(None);
+        }
+        self.surfaces.surface(agent, conv).await
+    }
+
+    fn serves(&self, conv: &ConvRef) -> bool {
+        conv.team.as_str() == self.team
+    }
+}
+
 impl Stack {
     /// Another instance's pipeline on the same store, runner and surfaces.
     fn another_pipeline(&self) -> Pipeline {
+        self.pipeline_with(Arc::clone(self.app.surfaces()))
+    }
+
+    /// Another instance's pipeline on the same store and runner, serving
+    /// the workspace `team` alone.
+    fn pipeline_serving(&self, team: &'static str) -> Pipeline {
+        self.pipeline_with(Arc::new(ServingTeam {
+            surfaces: Arc::clone(self.app.surfaces()),
+            team,
+        }))
+    }
+
+    /// Another instance's pipeline on the same store and runner, finding
+    /// surfaces through `surfaces`.
+    fn pipeline_with(&self, surfaces: Arc<dyn SurfaceLookup>) -> Pipeline {
         let mut settings = PipelineSettings::from_app(&self.app);
         settings.now = pinned_now;
         let replies = Replies::new(Some(Arc::new(ManagerBot::new(
@@ -3979,7 +4020,7 @@ impl Stack {
         Pipeline::new(
             self.store().clone(),
             self.turns.clone(),
-            Arc::clone(self.app.surfaces()),
+            surfaces,
             replies,
             settings,
         )
@@ -3996,6 +4037,7 @@ impl Stack {
                 now - Duration::from_secs(60),
                 64,
                 &[],
+                |_| true,
             )
             .await
             .unwrap()
@@ -4151,6 +4193,7 @@ async fn a_hand_off_the_workers_last_pass_lets_go_is_released_as_the_server_stop
         .store()
         .add_hand_off(
             writer,
+            &event.conv,
             &serde_json::to_string(&event).unwrap(),
             pinned_now(),
             pinned_now(),
@@ -4294,7 +4337,13 @@ async fn a_draining_instance_keeps_leasing_the_hand_offs_it_holds_and_takes_no_m
     assert_eq!(held.len(), 1, "the drain outlived the hand-off's lease");
     stack
         .store()
-        .add_hand_off(writer, &held[0].event_json, pinned_now(), pinned_now())
+        .add_hand_off(
+            writer,
+            &conv("GENERAL"),
+            &held[0].event_json,
+            pinned_now(),
+            pinned_now(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -4346,6 +4395,75 @@ async fn a_hand_off_whose_agent_has_no_surface_there_is_kept_until_it_has() {
     next.drain().await;
     assert_eq!(stack.writers_hops(writer).await, [1]);
     assert!(stack.kept_hand_offs().await.is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_hand_off_an_instance_doesnt_serve_is_left_due_for_one_that_does() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let busy = Gate::closed();
+    stack.hand_off_behind_a_busy_writer(writer, &busy).await;
+    stack.pipeline.cut_short().await;
+    let elsewhere = stack.pipeline_serving("other.example");
+    assert_eq!(elsewhere.replay_hand_offs().await.unwrap(), 0);
+    assert_eq!(
+        stack.kept_due_at().await,
+        [pinned_now()],
+        "an instance serving another workspace leaves the row due, unleased"
+    );
+    let next = stack.pipeline_serving(TEAM);
+    assert_eq!(
+        next.replay_hand_offs().await.unwrap(),
+        1,
+        "the instance serving its workspace takes it at once"
+    );
+    stack.wait_for_posts(2).await;
+    next.close();
+    next.drain().await;
+    assert_eq!(stack.writers_hops(writer).await, [1]);
+    assert!(stack.kept_hand_offs().await.is_empty());
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn hand_offs_an_instance_doesnt_serve_dont_crowd_out_one_it_does() {
+    let stack = start().await;
+    let writer = stack.other_agent("writer", "UWRITER").await;
+    let busy = Gate::closed();
+    stack.hand_off_behind_a_busy_writer(writer, &busy).await;
+    stack.pipeline.cut_short().await;
+    let mut elsewhere = stack.agents_post(BOT, "m9", "c9", &["UWRITER"]);
+    elsewhere.conv.team = "other.example".into();
+    let earlier = pinned_now() - Duration::from_secs(60);
+    for _ in 0..64 {
+        stack
+            .store()
+            .add_hand_off(
+                writer,
+                &elsewhere.conv,
+                &serde_json::to_string(&elsewhere).unwrap(),
+                earlier,
+                earlier,
+            )
+            .await
+            .unwrap();
+    }
+    let here = stack.pipeline_serving(TEAM);
+    assert_eq!(
+        here.replay_hand_offs().await.unwrap(),
+        1,
+        "a full look's worth of rows due ahead in another workspace takes no place"
+    );
+    stack.wait_for_posts(2).await;
+    here.close();
+    here.drain().await;
+    assert_eq!(stack.writers_hops(writer).await, [1]);
+    assert_eq!(
+        stack.kept_due_at().await,
+        vec![earlier; 64],
+        "the other workspace's rows are left due"
+    );
     stack.stop().await;
 }
 
@@ -4418,7 +4536,13 @@ async fn a_hand_off_past_a_full_queue_keeps_its_row_and_is_taken_again() {
     );
     stack
         .store()
-        .add_hand_off(writer, "not an event", pinned_now(), pinned_now())
+        .add_hand_off(
+            writer,
+            &conv("GENERAL"),
+            "not an event",
+            pinned_now(),
+            pinned_now(),
+        )
         .await
         .unwrap();
     assert_eq!(
