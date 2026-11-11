@@ -259,9 +259,10 @@ impl ClaudeProcess {
     ///
     /// - A `result` line gives [`TurnOutcome::Finished`], and the process
     ///   takes the next turn, even after an error result, unless the write
-    ///   failed or the CLI refused its `--resume`
-    ///   ([`TurnOutcome::resume_refused`]): the process is ending then, and
-    ///   is reaped before the result is returned.
+    ///   failed or the result is shaped like a refused `--resume`
+    ///   ([`TurnOutcome::resume_refused`]), after which the CLI exits: the
+    ///   process is ending then, and is reaped before the result is
+    ///   returned.
     /// - The end of stdout, or a failed write, before a result gives
     ///   [`TurnOutcome::Crashed`] once the process exits (it is killed if it
     ///   doesn't within a few seconds).
