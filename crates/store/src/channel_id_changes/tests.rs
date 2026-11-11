@@ -5,8 +5,14 @@ use crate::ChannelIdChangeRecord::{Full, Known, Recorded};
 use crate::agents::{AgentCreation, NewAgent, Visibility};
 use crate::test_util::*;
 
+const TEAM: &str = "T0TEAM001";
+
 async fn binding(store: &Store, name: &str) -> BindingId {
-    let team = TeamId::new("T0TEAM001");
+    binding_in(store, name, TEAM).await
+}
+
+async fn binding_in(store: &Store, name: &str, team: &str) -> BindingId {
+    let team = TeamId::new(team);
     let key = MemberKey {
         surface: SurfaceKind::Slack,
         team: team.clone(),
@@ -69,11 +75,17 @@ async fn a_change_is_recorded_once_and_due_at_once() {
         "another binding has its own"
     );
     assert_eq!(
-        store.due_channel_id_changes(at(1_055), 10).await.unwrap(),
+        store
+            .due_channel_id_changes(&TEAM.into(), at(1_055), 10)
+            .await
+            .unwrap(),
         [first.clone(), second.clone()]
     );
     assert_eq!(
-        store.due_channel_id_changes(at(2_000), 2).await.unwrap(),
+        store
+            .due_channel_id_changes(&TEAM.into(), at(2_000), 2)
+            .await
+            .unwrap(),
         [first, second]
     );
     assert!(
@@ -82,6 +94,39 @@ async fn a_change_is_recorded_once_and_due_at_once() {
             .await
             .is_err(),
         "no such binding"
+    );
+}
+
+#[tokio::test]
+async fn only_the_changes_of_the_workspaces_bindings_are_due_to_it() {
+    let store = memory_store().await;
+    let helper = binding(&store, "helper").await;
+    let elsewhere = binding_in(&store, "elsewhere", "T0TEAM002").await;
+    let ours = change(helper, "G0PRIVAT1", "C0PRIVAT1", 1_000);
+    let theirs = change(elsewhere, "G0PRIVAT2", "C0PRIVAT2", 900);
+    for changed in [&ours, &theirs] {
+        store.record_channel_id_change(changed, 64).await.unwrap();
+    }
+    assert_eq!(
+        store
+            .due_channel_id_changes(&TEAM.into(), at(2_000), 10)
+            .await
+            .unwrap(),
+        std::slice::from_ref(&ours)
+    );
+    assert_eq!(
+        store
+            .due_channel_id_changes(&"T0TEAM002".into(), at(2_000), 10)
+            .await
+            .unwrap(),
+        std::slice::from_ref(&theirs)
+    );
+    assert!(
+        store
+            .due_channel_id_changes(&"T0TEAM003".into(), at(2_000), 10)
+            .await
+            .unwrap()
+            .is_empty()
     );
 }
 
@@ -96,13 +141,16 @@ async fn a_try_is_claimed_once_until_its_retry_is_due_and_a_settled_change_stays
     assert!(!claim(1_299).await.unwrap(), "claimed until 1,300");
     assert!(
         store
-            .due_channel_id_changes(at(1_299), 10)
+            .due_channel_id_changes(&TEAM.into(), at(1_299), 10)
             .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        store.due_channel_id_changes(at(1_300), 10).await.unwrap(),
+        store
+            .due_channel_id_changes(&TEAM.into(), at(1_300), 10)
+            .await
+            .unwrap(),
         std::slice::from_ref(&changed)
     );
     assert!(claim(1_300).await.unwrap());
@@ -121,7 +169,7 @@ async fn a_try_is_claimed_once_until_its_retry_is_due_and_a_settled_change_stays
     assert!(!claim(9_999).await.unwrap(), "settled");
     assert!(
         store
-            .due_channel_id_changes(at(9_999), 10)
+            .due_channel_id_changes(&TEAM.into(), at(9_999), 10)
             .await
             .unwrap()
             .is_empty()

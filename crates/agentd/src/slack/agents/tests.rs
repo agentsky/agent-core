@@ -134,33 +134,7 @@ async fn harness() -> Harness {
         .respond_with(app_installed())
         .mount(&slack)
         .await;
-    let client = SlackClient::new(&format!("{}/api/", slack.uri()))
-        .unwrap()
-        .with_max_retry_wait(Duration::from_secs(5));
-    let manager = SlackManager::with_identity(
-        client.clone(),
-        client.bot(SecretString::from(MANAGER_TOKEN)),
-        ManagerIdentity {
-            team: TeamId::new(TEAM),
-            bot_user: UserId::new("U0MANAGER"),
-            bot_id: "B0MANAGER".to_owned(),
-            app_id: "A0MANAGER".to_owned(),
-            app_name: None,
-            enterprise: None,
-        },
-    );
-    let bots = SlackBots::new(store.clone(), client, manager.surface());
-    let agents = SlackAgents::new(
-        store.clone(),
-        manager,
-        bots,
-        AgentAppSettings {
-            public_url: Some("https://agentd.example.com".to_owned()),
-            public_posting: false,
-            reminder_after: Duration::from_secs(3600),
-            max_per_owner: 10,
-        },
-    );
+    let agents = agents_in(&store, &slack, TEAM);
     let now = OffsetDateTime::now_utc();
     let owner = store.ensure_member(&ada(), "ada", now).await.unwrap();
     store
@@ -197,6 +171,38 @@ async fn harness() -> Harness {
         agents,
         owner,
     }
+}
+
+/// The agents' apps of an instance serving `team`, on `store` and the
+/// wiremock `slack`.
+fn agents_in(store: &Store, slack: &MockServer, team: &str) -> SlackAgents {
+    let client = SlackClient::new(&format!("{}/api/", slack.uri()))
+        .unwrap()
+        .with_max_retry_wait(Duration::from_secs(5));
+    let manager = SlackManager::with_identity(
+        client.clone(),
+        client.bot(SecretString::from(MANAGER_TOKEN)),
+        ManagerIdentity {
+            team: TeamId::new(team),
+            bot_user: UserId::new("U0MANAGER"),
+            bot_id: "B0MANAGER".to_owned(),
+            app_id: "A0MANAGER".to_owned(),
+            app_name: None,
+            enterprise: None,
+        },
+    );
+    let bots = SlackBots::new(store.clone(), client, manager.surface());
+    SlackAgents::new(
+        store.clone(),
+        manager,
+        bots,
+        AgentAppSettings {
+            public_url: Some("https://agentd.example.com".to_owned()),
+            public_posting: false,
+            reminder_after: Duration::from_secs(3600),
+            max_per_owner: 10,
+        },
+    )
 }
 
 impl Harness {
@@ -1355,6 +1361,38 @@ async fn a_full_binding_records_no_more_and_an_inactive_binding_settles_none() {
         "an inactive binding's are dropped"
     );
     assert_eq!(h.calls("conversations.info").await, 0);
+}
+
+#[tokio::test]
+async fn an_instance_serving_another_workspace_leaves_a_change_to_this_ones() {
+    let h = harness().await;
+    let helper = installed(&h).await;
+    set_rules(&h, helper, &denying(&[OLD])).await;
+    channel_info(&h, AGENT_TOKEN, NEW, member_of(NEW)).await;
+    let changed = change(helper);
+    recorded(&h, &changed).await;
+    let elsewhere = agents_in(&h.store, &h.slack, "T0TEAM002");
+    let pass = elsewhere.pass().await;
+    assert_eq!((pass.settled, pass.given_up), (0, 0));
+    let due = h
+        .store
+        .due_channel_id_changes(&TEAM.into(), OffsetDateTime::now_utc(), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        due.iter()
+            .map(|due| (due.binding, &due.old, &due.new))
+            .collect::<Vec<_>>(),
+        [(helper, &changed.old, &changed.new)],
+        "neither claimed nor deleted"
+    );
+    assert_eq!(h.calls("conversations.info").await, 0);
+    assert_eq!(h.agents.pass().await.settled, 1);
+    assert_eq!(
+        changes_of(&h, helper).await,
+        [(OLD.to_owned(), NEW.to_owned(), false)]
+    );
+    assert_eq!(rules_of(&h, helper).await, denying(&[NEW]));
 }
 
 #[tokio::test]

@@ -11097,9 +11097,9 @@ the channel gains outside members.
   the try, as T30's rotation claims a token. Two instances, or an
   immediate try and the sweeper, never ask Slack twice.
 - **Retries.** A change still waiting is tried again by the Slack agent app
-  sweeper (`SlackAgents::pass`, every minute) once `CHANNEL_CHANGE_RETRY`
-  (five minutes) has passed, at most `CHANNEL_CHANGES_PER_PASS` (64) a
-  pass.
+  sweeper (`SlackAgents::pass`, every minute) of an instance serving the
+  binding's workspace once `CHANNEL_CHANGE_RETRY` (five minutes) has
+  passed, at most `CHANNEL_CHANGES_PER_PASS` (64) a pass.
 - **After settling.** A settled row is kept until a day after it arrived
   (`CHANNEL_CHANGE_TTL`), and longer while its binding has a change
   waiting, so that change, given up, still follows its chain through it.
@@ -11626,3 +11626,24 @@ now answers that question, taking a settled change only to its
 id for the denies; both walk the changes through one `reached` helper
 (`a_settled_change_leads_to_where_slack_found_the_channel`, with a cycle
 through a settled change).
+
+### A change in another workspace's binding
+
+**Issue.** Review found that `due_channel_id_changes` read every
+workspace's waiting changes. Instances that share a store but serve
+different workspaces each ran the sweeper, and one serving T2 claimed T1's
+change, found no active app for it (`SlackBots::surface` refuses another
+workspace's binding) and deleted it as a dropped change. T1's agent's
+rules never moved to the new id, and its denies stopped following the
+channel without being copied there.
+
+**Solution.** `due_channel_id_changes` takes the workspace and joins
+`agent_bindings` on its `team_id`, as `due_install_reminders`,
+`due_manifest_updates` and `stale_creations` do, so an instance claims
+only the changes it can ask Slack about, and another workspace's no
+longer fill its 64 a pass. The ingress already hands it only its own
+workspace's bindings, so a change reaching `settle_channel_change` is
+this workspace's, and one with no active app there is still dropped.
+Giving up asks Slack nothing and still runs on any instance
+(`only_the_changes_of_the_workspaces_bindings_are_due_to_it`,
+`an_instance_serving_another_workspace_leaves_a_change_to_this_ones`).
