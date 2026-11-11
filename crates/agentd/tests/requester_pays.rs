@@ -61,6 +61,10 @@ impl SurfaceLookup for Mocks {
     ) -> Result<Option<Arc<dyn Surface>>, StoreError> {
         Ok(Some(self.0.clone()))
     }
+
+    fn serves(&self, _conv: &ConvRef) -> bool {
+        true
+    }
 }
 
 /// The manager bot's DM with a member is `dm-<user>`.
