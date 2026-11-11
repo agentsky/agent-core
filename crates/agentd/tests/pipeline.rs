@@ -74,6 +74,10 @@ impl SurfaceLookup for Mocks {
             agent,
         })))
     }
+
+    fn serves(&self, _conv: &ConvRef) -> bool {
+        true
+    }
 }
 
 /// Holds what passes through it until it is opened.
