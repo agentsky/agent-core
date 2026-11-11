@@ -2195,3 +2195,78 @@ async fn an_event_installed_elsewhere_takes_no_deduplication_key() {
         .matching(&format!("binding={}", agent()))
         .assert_has("WARN");
 }
+
+#[tokio::test]
+async fn an_agents_channel_id_change_is_queued_once_by_event_id() {
+    let mut harness = Harness::start();
+    let send = |body: String| harness.send(signed_events(agent(), AGENT_SECRET, &body));
+    let (status, body) = send(fixtures::CHANNEL_ID_CHANGED.to_owned()).await;
+    assert_eq!((status, body.as_str()), (StatusCode::OK, ""));
+    match harness.next().await {
+        SlackInbound::ChannelIdChanged(changed) => {
+            assert_eq!(changed.binding, agent());
+            assert_eq!(changed.team.as_str(), TEAM);
+            assert_eq!(changed.event_id, "Ev0CHANID1");
+            assert_eq!(changed.old.as_str(), fixtures::PRIVATE_CHANNEL);
+            assert_eq!(changed.new.as_str(), fixtures::PRIVATE_CHANNEL_SHARED);
+        }
+        other => panic!("expected the channel id change, got {other:?}"),
+    }
+    assert_eq!(
+        harness.recorded(&format!("slack:{}", agent())),
+        ["Ev0CHANID1"]
+    );
+    let (status, _) = harness
+        .send(signed_events(
+            agent(),
+            AGENT_SECRET,
+            fixtures::CHANNEL_ID_CHANGED,
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "Slack's retry");
+    harness.assert_nothing_delivered().await;
+
+    let renamed = fixtures::with_event_id(fixtures::CHANNEL_ID_CHANGED, "Ev0CHANID2");
+    let (status, _) = harness
+        .send(signed_events(other_agent(), OTHER_SECRET, &renamed))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    match harness.next().await {
+        SlackInbound::ChannelIdChanged(changed) => assert_eq!(changed.binding, other_agent()),
+        other => panic!("expected the other agent's change, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_channel_id_change_without_two_different_channel_ids_is_refused_and_writes_nothing() {
+    let mut harness = Harness::start();
+    let bad: [fn(&mut serde_json::Value); 8] = [
+        |body| body["event"]["old_channel_id"] = "U0HUMAN01".into(),
+        |body| body["event"]["new_channel_id"] = body["event"]["old_channel_id"].clone(),
+        |body| body["event"]["new_channel_id"] = "c0lower01".into(),
+        |body| body["event"]["new_channel_id"] = format!("C{}", "A".repeat(MAX_ID_TAIL + 1)).into(),
+        |body| {
+            body["event"]
+                .as_object_mut()
+                .unwrap()
+                .remove("old_channel_id");
+        },
+        |body| {
+            body["event"]
+                .as_object_mut()
+                .unwrap()
+                .remove("new_channel_id");
+        },
+        |body| body["event"]["new_channel_id"] = serde_json::Value::Null,
+        |body| body["event"]["old_channel_id"] = 7.into(),
+    ];
+    for (n, edit) in bad.into_iter().enumerate() {
+        let body = edited(fixtures::CHANNEL_ID_CHANGED, edit);
+        let (status, _) = harness
+            .send(signed_events(agent(), AGENT_SECRET, &body))
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body {n}: {body}");
+    }
+    harness.assert_nothing_delivered().await;
+    assert_eq!(harness.recorded_anywhere(), 1, "only the marker");
+}

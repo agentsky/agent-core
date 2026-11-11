@@ -43,7 +43,7 @@ pub mod verify;
 pub mod web;
 
 pub use directory::{MemberDirectory, TeamDirectory};
-pub use inbound::{Interaction, SlackEvent, SlackInbound, SlashCommand};
+pub use inbound::{ChannelIdChanged, Interaction, SlackEvent, SlackInbound, SlashCommand};
 pub use ingress::{
     AgentApp, BindingRef, BoxError, Dedup, InFlight, Queue, SigningSecrets, SlackApp, ingress,
 };
