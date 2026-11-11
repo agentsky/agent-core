@@ -319,7 +319,11 @@ description, and must pass T02's policy.
   with unit tests, and keep the code that sends them small.
 - Live checks against real Slack and Rocket.Chat are manual. The PR records
   what was run and what was seen. Never put real tokens in fixtures; redact
-  captured payloads.
+  captured payloads. Rocket.Chat's run on the Compose stack
+  ([`deploy/compose/README.md`](../deploy/compose/README.md)), and
+  [`deploy/slack/README.md`](../deploy/slack/README.md) gathers every Slack
+  task's live check, in order, with the setup they share and how to record
+  and redact a result.
 
 ## Definition of done
 

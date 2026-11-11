@@ -204,7 +204,9 @@ which name the key at fault.
 ## 4. Live checks
 
 The plan's live checks run against this stack. Record in the pull request
-what was run and what was seen, with tokens and ids redacted.
+what was run and what was seen, with tokens and ids redacted. The Slack
+checks, which run on this stack too, are in
+[`deploy/slack/README.md`](../slack/README.md).
 
 - **T11, Rocket.Chat REST.** Using a manager with only the roles from
   steps 3 and 4, create a bot user and obtain its token, and record the exact
