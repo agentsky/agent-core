@@ -1789,7 +1789,7 @@ async fn a_process_stopping_that_fails_its_retry_too_is_given_up() {
 }
 
 #[tokio::test]
-async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn_instead_of_rerunning() {
+async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn() {
     let h = Harness::new(&[Turn::reply("first"), Turn::reply("again")]).await;
     let session = h.thread_session("1.1").await;
     reply(&h.run(session.id, request("one")).await);
@@ -1815,7 +1815,7 @@ async fn a_refused_resume_that_cannot_be_recorded_fails_the_turn_instead_of_reru
     assert_eq!(
         h.process_starts(),
         2,
-        "the turn ran once more with --resume"
+        "the turn started only the process that refused the --resume"
     );
     let stored = h.store.session(session.id).await.unwrap().unwrap();
     assert!(stored.started, "{stored:?}");

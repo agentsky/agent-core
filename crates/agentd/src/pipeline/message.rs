@@ -10,6 +10,8 @@ use core_types::{
 use store::{MessageRef, NewMessageRef, Session, Store, StoreError};
 use time::OffsetDateTime;
 
+use super::run::PipelineError;
+
 /// How many thread messages before the turn's own are read to find what
 /// the transcript lacks, and shown to a session that starts with an empty
 /// one.
@@ -59,11 +61,15 @@ async fn forget(store: &Store, session: SessionId, shown: &[u32]) {
 ///    as after the CLI refused to resume it for want of one, every one of
 ///    those messages is shown, rows or not: one the session already has a
 ///    row for keeps its short id and isn't recorded again, so forgetting
-///    what this message recorded leaves it alone. A post of the agent's
-///    bot is marked as from outside the session only when it is attributed
-///    to another session; the bot's other posts, such as the files a turn
-///    uploaded or agentd's notices, may be this session's. A history that
-///    can't be read is left out.
+///    what this message recorded leaves it alone; when the history read
+///    is a full window, a line points to `agentctl history` for older
+///    messages. A post of the agent's bot is marked as from outside the
+///    session only when it is attributed to another session; the bot's
+///    other posts, such as the files a turn uploaded or agentd's notices,
+///    may be this session's. A history that can't be read is left out,
+///    except that building fails for a session that starts with an empty
+///    transcript and already has rows, whose messages would otherwise
+///    never be shown.
 /// 2. Such posts from other sessions that the history didn't reach and
 ///    the session has no row for ([`Store::posted_elsewhere`]), named for
 ///    `agentctl history`.
@@ -81,7 +87,7 @@ pub(crate) async fn build(
     bot: &MemberKey,
     event: &InboundEvent,
     requester: &Requester,
-) -> Result<Built, StoreError> {
+) -> Result<Built, PipelineError> {
     let mut shown = Vec::new();
     match compose(store, surface, session, bot, event, requester, &mut shown).await {
         Ok(text) => Ok(Built { text, shown }),
@@ -100,10 +106,11 @@ async fn compose(
     event: &InboundEvent,
     requester: &Requester,
     shown: &mut Vec<u32>,
-) -> Result<String, StoreError> {
+) -> Result<String, PipelineError> {
     let thread = &session.thread;
+    let unseen = unseen_history(store, surface, session, event).await?;
     let mut earlier = Vec::new();
-    for (msg, known) in unseen_history(store, surface, session, event).await? {
+    for (msg, known) in unseen.messages {
         let msg_ref = msg_ref(thread, &msg);
         let sender = if msg.sender != *bot {
             msg.sender.user.as_str().to_owned()
@@ -185,6 +192,12 @@ async fn compose(
             let _ = writeln!(text, "[#{short_id}] {sender}: {}", one_block(&msg.text));
         }
     }
+    if let Some((oldest, _, _)) = earlier.first().filter(|_| unseen.older) {
+        let _ = writeln!(
+            text,
+            "The thread has older messages: read them with `agentctl history --before #{oldest}`."
+        );
+    }
     if !posted.is_empty() {
         let _ = writeln!(
             text,
@@ -211,20 +224,36 @@ async fn compose(
     Ok(text)
 }
 
+/// What the thread's history holds that a turn's transcript lacks.
+#[derive(Default)]
+struct Unseen {
+    /// The messages, oldest first, each with the session's row for it if
+    /// it has one.
+    messages: Vec<(Msg, Option<MessageRef>)>,
+    /// Whether the thread has older messages than these that an empty
+    /// transcript lacks too.
+    older: bool,
+}
+
 /// The thread's last [`HISTORY_LIMIT`] messages before the event that
-/// `session`'s transcript lacks, oldest first, each with the session's row
-/// for it if it has one: those the session has no row for, or all of them
-/// when it starts with an empty transcript.
+/// `session`'s transcript lacks: those the session has no row for, or all
+/// of them when it starts with an empty transcript.
+///
+/// A history that can't be read is left out, unless the session starts
+/// with an empty transcript and has rows: their messages would then never
+/// be shown, so building fails with [`PipelineError::Surface`] and the
+/// session stays unstarted for the next turn to try again.
 async fn unseen_history(
     store: &Store,
     surface: &dyn Surface,
     session: &Session,
     event: &InboundEvent,
-) -> Result<Vec<(Msg, Option<MessageRef>)>, StoreError> {
+) -> Result<Unseen, PipelineError> {
     let thread = &session.thread;
     if thread.root.as_ref() == Some(&event.message.id) {
-        return Ok(Vec::new());
+        return Ok(Unseen::default());
     }
+    let fresh = !session.resumes();
     let history = match surface
         .history(
             thread,
@@ -234,13 +263,16 @@ async fn unseen_history(
         .await
     {
         Ok(history) => history,
+        Err(err) if fresh && store.has_message_refs(session.id).await? => {
+            return Err(err.into());
+        }
         Err(err) => {
             tracing::warn!(session = %session.id, error = %err, "couldn't read the thread for a turn; going without it");
-            return Ok(Vec::new());
+            return Ok(Unseen::default());
         }
     };
-    let fresh = !session.resumes();
-    let mut unseen = Vec::new();
+    let older = fresh && history.len() >= HISTORY_LIMIT;
+    let mut messages = Vec::new();
     for msg in history {
         if msg.id == event.message.id {
             continue;
@@ -249,10 +281,10 @@ async fn unseen_history(
             .session_message_ref(session.id, &msg_ref(thread, &msg))
             .await?;
         if fresh || known.is_none() {
-            unseen.push((msg, known));
+            messages.push((msg, known));
         }
     }
-    Ok(unseen)
+    Ok(Unseen { messages, older })
 }
 
 fn msg_ref(thread: &ThreadKey, msg: &Msg) -> MsgRef {

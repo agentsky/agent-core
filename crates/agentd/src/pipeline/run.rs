@@ -798,10 +798,10 @@ impl Pipeline {
     /// Looks the session up, builds the turn message and runs the turn,
     /// once more, with the message built again, on a session reset in
     /// between or on the CLI refusing to resume a session whose transcript
-    /// is gone. What the turn message
-    /// recorded is forgotten when the turn didn't run, which includes a
-    /// process that crashed or timed out before the CLI read the message
-    /// (no `init` line): that is [`PipelineError::Unread`].
+    /// is gone. What the turn message recorded is forgotten when the turn
+    /// didn't run, which includes a process that crashed or timed out
+    /// before the CLI read the message (no `init` line): that is
+    /// [`PipelineError::Unread`].
     async fn turn(
         &self,
         event: &InboundEvent,
@@ -1191,7 +1191,7 @@ fn unread(outcome: &TurnOutcome) -> bool {
 
 /// Why handling a message failed.
 #[derive(Debug, thiserror::Error)]
-enum PipelineError {
+pub(super) enum PipelineError {
     #[error("the CLI ended before it read the turn's message")]
     Unread,
     #[error(transparent)]

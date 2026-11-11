@@ -1425,6 +1425,11 @@ async fn a_session_whose_transcript_is_gone_is_shown_the_thread_again() {
         bodies[0]
     );
     assert!(bodies[0].contains("said after the reply"), "{}", bodies[0]);
+    assert!(
+        !bodies[0].contains("history --before #"),
+        "the whole thread is shown: {}",
+        bodies[0]
+    );
     assert_eq!(
         store
             .session_message_ref(session, &msg("GENERAL", "r1"))
@@ -1474,6 +1479,97 @@ async fn a_session_whose_transcript_is_gone_is_shown_the_thread_again() {
         "the new transcript has them: {}",
         bodies[0]
     );
+    stack.stop().await;
+}
+
+#[tokio::test]
+async fn a_failed_history_read_for_a_session_whose_transcript_is_gone_fails_the_turn() {
+    let stack = start().await;
+    let store = stack.store();
+    let first = stack.answered_root("r1", "First.").await;
+    let session = stack.session_of(&first).await;
+    let asked = store
+        .session_message_ref(session, &msg("GENERAL", "r1"))
+        .await
+        .unwrap()
+        .expect("the first request has a row");
+    let replied = store.posted_message_ref(&first).await.unwrap().unwrap();
+    stack.turns.sessions().stop(session).await;
+    let row = store.session(session).await.unwrap().unwrap();
+    let transcripts = stack
+        ._dir
+        .join(sandbox::volume_rel_path(&row.volume()))
+        .join("sessions")
+        .join(session.to_string())
+        .join("claude/projects");
+    std::fs::remove_dir_all(&transcripts).unwrap();
+    let mut history = vec![
+        said("r1", "alice", "@UBOT the first request"),
+        said(first.id.as_str(), BOT, "First."),
+    ];
+    history.extend((0..47).map(|n| said(&format!("x{n}"), "carol", "chatter")));
+    history.push(said("r2", "alice", "@UBOT again"));
+    stack
+        .mock
+        .set_history(thread("GENERAL", "r1"), history[..49].to_vec());
+    for _ in 0..2 {
+        stack.mock.fail_next(
+            Op::History,
+            SurfaceError::RateLimited {
+                retry_after: Duration::from_secs(1),
+            },
+        );
+    }
+    let upstream = stack.fake.message_requests().await.len();
+    let before = stack.mock.calls().len();
+    stack.next_turn(Turn::reply("Second."));
+    let mut again = stack.event(
+        "alice",
+        "GENERAL",
+        ConvKind::Channel,
+        "r2",
+        Some("r1"),
+        &[BOT],
+    );
+    again.text = "@UBOT again".into();
+    stack.handle(again).await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, FAILED_TEXT);
+    assert!(stack.upstream_bodies_since(upstream).await.is_empty());
+    assert!(
+        !transcripts.exists(),
+        "no CLI read the turn with --session-id"
+    );
+    let row = store.session(session).await.unwrap().unwrap();
+    assert!(!row.resumes(), "{row:?}");
+
+    history.push(said("r3", "alice", "@UBOT once more"));
+    stack.mock.set_history(thread("GENERAL", "r1"), history);
+    let before = stack.mock.calls().len();
+    stack
+        .handle(stack.event(
+            "alice",
+            "GENERAL",
+            ConvKind::Channel,
+            "r3",
+            Some("r1"),
+            &[BOT],
+        ))
+        .await;
+    let sent = posts(&stack.calls_since(before));
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].1, "Second.");
+    let bodies = stack.upstream_bodies_since(upstream).await;
+    assert_eq!(bodies.len(), 1);
+    for shown in [
+        format!("[#{}] alice: @UBOT the first request", asked.short_id),
+        format!("[#{}] you: First.", replied.short_id),
+        "alice: @UBOT again".to_owned(),
+        format!("agentctl history --before #{}", asked.short_id),
+    ] {
+        assert!(bodies[0].contains(&shown), "{shown}: {}", bodies[0]);
+    }
     stack.stop().await;
 }
 

@@ -6049,9 +6049,10 @@ from every later turn.
 **Solution.** The builder reads up to 50 messages of the thread before the
 event and shows every one the session has no row for: a person's message,
 said before or during an earlier turn, or the agent's own post from outside
-the session, marked as such when it is attributed to a turn (see the next
-note for the bot's posts that aren't). The session's own replies and what
-it was shown have rows and are left out. Each message shown is recorded in
+the session, marked as such when it is attributed to another session's
+turn (see the next note for the bot's posts that aren't). The session's own
+replies and what it was shown have rows and are left out, unless the
+session starts with an empty transcript (see the next note). Each message shown is recorded in
 the session, which gives it its short id and keeps it out of the next turn;
 the builder returns the short ids it recorded, and the pipeline deletes
 those rows (`Store::forget_message_refs`, inbound rows only) when
@@ -6094,10 +6095,29 @@ forgotten if the turn fails. A post of the agent's bot is marked as from
 outside the session only when another session's row attributes it, since
 the session's own replies are now shown too. Posts from other sessions past
 the 50 messages that the session already has rows for aren't listed again;
-`agentctl history` reaches them as it reaches the rest of the thread. The
-refused exchange records no turn, and the outbox `turn_finished` returned
-for it is dropped with its staging directory, as on any failed turn. The
-test is `a_session_whose_transcript_is_gone_is_shown_the_thread_again`.
+`agentctl history` reaches them as it reaches the rest of the thread, and
+when the history read filled its 50-message window, the message ends its
+list with a line pointing to `agentctl history --before` the oldest one
+shown. The refused exchange records no turn, and the outbox
+`turn_finished` returned for it is dropped with its staging directory, as
+on any failed turn. The test is
+`a_session_whose_transcript_is_gone_is_shown_the_thread_again`.
+
+A history read that fails used to leave the history out. For a session
+that starts with an empty transcript and already has rows, that would lose
+the earlier messages for good: the `--session-id` turn starts the
+transcript, and their rows keep them out of every later turn. So building
+fails there with the surface's error (`Store::has_message_refs` tells),
+the turn posts `FAILED_TEXT` before any CLI reads it, and the session stays
+unstarted for the next turn to try again; a resuming session, or a fresh
+one with no rows, still goes without the history, since nothing is lost.
+The test is
+`a_failed_history_read_for_a_session_whose_transcript_is_gone_fails_the_turn`.
+
+The runner frees the session's queue when it returns `ResumeRefused`, so
+another turn could run on the session before the rebuilt one; the pipeline
+never lets it, since an agent's turns in a thread run one at a time in its
+lane, and the lane's next turn waits for this one's retry.
 
 ### Notices have no message ref
 
@@ -6124,9 +6144,9 @@ message, and Slack's `files.completeUploadExternal` doesn't say which
 message shares the files, so the trait wasn't changed for Rocket.Chat
 alone. An attributed upload would also be a second message of one turn
 that another agent's thread could answer. The next turn then shows a
-notice or an upload of the agent's bot as `you`, and only an attributed
-post as `you, outside this session`, since an unattributed one may be the
-session's own. The attribution of an agent's post is waited for only when
+notice or an upload of the agent's bot as `you`, and only a post
+attributed to another session as `you, outside this session`, since an
+unattributed one may be the session's own. The attribution of an agent's post is waited for only when
 the router reads it (see "An agent's post can arrive before its
 attribution"), so an upload, which mentions no one, holds up no other
 agent's lane.
