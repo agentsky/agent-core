@@ -658,6 +658,26 @@ async fn a_silent_address_leaves_time_to_try_the_next() {
 }
 
 #[tokio::test]
+async fn a_connect_keeps_at_most_four_attempts_going() {
+    let proxy = Proxy::start("http://127.0.0.1:9", |egress| egress).await;
+    proxy.sandbox(LOCAL);
+    let silent: Vec<IpAddr> = (1..=6)
+        .map(|last| IpAddr::V4(Ipv4Addr::new(140, 82, 113, last)))
+        .collect();
+    for &ip in &silent {
+        proxy.network.silence(SocketAddr::new(ip, 443));
+    }
+    proxy.network.answer("git.example.com", &silent);
+    let connecting = tokio::time::timeout(
+        Duration::from_millis(2000),
+        proxy.connect("git.example.com:443"),
+    );
+    assert!(connecting.await.is_err());
+    let dialed: Vec<IpAddr> = proxy.network.dialed().iter().map(SocketAddr::ip).collect();
+    assert_eq!(dialed, silent[..4]);
+}
+
+#[tokio::test]
 async fn tunnels_close_when_idle() {
     let (echo, _) = echo_server().await;
     let proxy = Proxy::start("http://127.0.0.1:9", |egress| {
