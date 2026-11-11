@@ -255,6 +255,10 @@ impl Replies {
             .ok_or(ReplyError::NoManagerBot(surface))
     }
 
+    fn bot_in(&self, conv: &ConvRef) -> Result<&ManagerBot, ReplyError> {
+        self.bot_on(conv.surface, &conv.team)
+    }
+
     fn slack_on(&self, surface: SurfaceKind, team: &TeamId) -> Option<&SlackReplies> {
         self.slack
             .as_ref()
@@ -402,6 +406,13 @@ impl Replies {
         Ok(bot.surface.post(&bot.target(&room), &text).await?)
     }
 
+    /// Whether a manager bot can update `msg`, a message
+    /// [`dm_rich`](Self::dm_rich) sent: whether one serves its surface and
+    /// team, which [`update_rich`](Self::update_rich) needs first.
+    pub fn can_update(&self, msg: &MsgRef) -> bool {
+        self.bot_in(&msg.conv).is_ok()
+    }
+
     /// Replaces the manager bot's message `msg`, which
     /// [`dm_rich`](Self::dm_rich) sent, with `message`, whole: its blocks
     /// on Slack, and elsewhere its Markdown.
@@ -411,7 +422,7 @@ impl Replies {
     /// As for [`dm_rich`](Self::dm_rich).
     pub async fn update_rich(&self, msg: &MsgRef, message: &Rich) -> Result<(), ReplyError> {
         let conv = &msg.conv;
-        let bot = self.bot_on(conv.surface, &conv.team)?;
+        let bot = self.bot_in(conv)?;
         if let (Some(slack), Some(blocks)) =
             (self.slack_on(conv.surface, &conv.team), &message.blocks)
         {
