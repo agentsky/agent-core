@@ -6,10 +6,14 @@
 //! through the [`CommandSubmitter`] it holds. Each command runs in its own
 //! task, so a slow one (a code exchange can take 30 seconds) holds up nobody
 //! else, but one member's commands run one at a time in the order they
-//! arrived: `logout` then `login` never swaps.
+//! arrived: `logout` then `login` never swaps. The cleanup when a member
+//! leaves runs in the same order, so a command of theirs that arrived
+//! first can't store what it deletes.
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 
 use core_types::{InFile, MemberKey, SendError};
 use tokio::sync::{mpsc, oneshot};
@@ -20,12 +24,22 @@ use super::{Commands, Origin};
 /// How many commands may wait between the surfaces and the intake.
 const COMMAND_BUFFER: usize = 64;
 
-/// A command a surface heard, on its way to the intake.
+/// Work for a member, on its way to the intake.
 struct Heard {
     member: MemberKey,
-    text: String,
-    origin: Origin,
-    files: Vec<InFile>,
+    work: Work,
+}
+
+/// What runs in a member's turn.
+enum Work {
+    /// A command a surface heard.
+    Command {
+        text: String,
+        origin: Origin,
+        files: Vec<InFile>,
+    },
+    /// Work that must not run beside the member's commands.
+    Job(Pin<Box<dyn Future<Output = ()> + Send>>),
 }
 
 /// Runs the commands that every surface submits.
@@ -98,13 +112,33 @@ impl CommandSubmitter {
         origin: Origin,
         files: Vec<InFile>,
     ) -> Result<(), SendError> {
-        let heard = Heard {
-            member,
+        let work = Work::Command {
             text,
             origin,
             files,
         };
-        self.tx.send(heard).await.map_err(|_| SendError)
+        self.tx
+            .send(Heard { member, work })
+            .await
+            .map_err(|_| SendError)
+    }
+
+    /// Runs `job` after every command `member` submitted before it and
+    /// before any they submit after, as the cleanup when they leave must.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError`] if the intake has stopped.
+    pub async fn after_commands_of(
+        &self,
+        member: MemberKey,
+        job: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<(), SendError> {
+        let work = Work::Job(Box::pin(job));
+        self.tx
+            .send(Heard { member, work })
+            .await
+            .map_err(|_| SendError)
     }
 }
 
@@ -128,15 +162,24 @@ fn start(
         if let Some(previous) = previous {
             let _ = previous.await;
         }
-        commands
-            .handle_text(&heard.member, &heard.text, &heard.origin, &heard.files)
-            .await;
+        match heard.work {
+            Work::Command {
+                text,
+                origin,
+                files,
+            } => {
+                commands
+                    .handle_text(&heard.member, &text, &origin, &files)
+                    .await;
+            }
+            Work::Job(job) => job.await,
+        }
         let _ = done.send(());
     });
 }
 
 fn log_panic(joined: Result<(), tokio::task::JoinError>) {
     if let Err(err) = joined {
-        tracing::error!(error = %err, "a command task panicked");
+        tracing::error!(error = %err, "a member's command or job panicked");
     }
 }
