@@ -7,7 +7,9 @@
 //!
 //! - [`config`]: the TOML file plus secret environment variables.
 //! - [`app`]: [`App`], the shared state.
-//! - [`commands`]: `/agent` command dispatch, the account commands, and
+//! - [`agents`]: agents' bot identities on Rocket.Chat and the connections
+//!   agentd keeps as them.
+//! - [`commands`]: `/agent` command dispatch, the account and agent commands, and
 //!   the relink notice.
 //! - [`ctl`]: the agentctl API and the turn hooks' token functions.
 //! - [`server`]: the listeners, `/healthz`, and graceful shutdown.
@@ -19,6 +21,7 @@
 
 #![warn(missing_docs)]
 
+pub mod agents;
 pub mod app;
 pub mod cli;
 pub mod commands;
