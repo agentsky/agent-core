@@ -20,6 +20,14 @@
 //! - Anything else is ignored, and named in [`Config::unknown_env`] for
 //!   `serve` and `migrate` to log as a warning.
 //!
+//! A secret may be neither empty nor start or end with white space. The
+//! trailing newline of a secret mounted from a file would otherwise become
+//! part of it, and a signing secret with one fails every request.
+//!
+//! Every other `AGENTD_SLACK_MANAGER_*` secret requires
+//! [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
+//! so a misspelling of that name fails at startup too.
+//!
 //! The environment is passed in rather than read from the process, so tests
 //! supply their own (`std::env::set_var` is `unsafe` in edition 2024, and the
 //! workspace forbids `unsafe`).
@@ -51,6 +59,14 @@ pub const RC_MANAGER_TOKEN_VAR: &str = "AGENTD_RC_MANAGER_TOKEN";
 /// `AGENTD_SLACK_MANAGER_SIGNING_SECRET`. They are collected into
 /// [`Secrets::slack_manager`] by lowercased suffix.
 pub const SLACK_MANAGER_PREFIX: &str = "AGENTD_SLACK_MANAGER_";
+/// The Slack manager app's signing secret, which verifies requests to
+/// `/slack/b/manager/…`. The manager binding is known only when it is set,
+/// and every other [`AGENTD_SLACK_MANAGER_*`](SLACK_MANAGER_PREFIX)
+/// variable requires it.
+pub const SLACK_MANAGER_SIGNING_SECRET_VAR: &str = "AGENTD_SLACK_MANAGER_SIGNING_SECRET";
+/// The key of [`SLACK_MANAGER_SIGNING_SECRET_VAR`] in
+/// [`Secrets::slack_manager`].
+const SLACK_MANAGER_SIGNING_SECRET: &str = "signing_secret";
 /// The prefix of every variable agentd reads. Unknown ones are sorted as the
 /// [module docs](self) describe.
 const ENV_PREFIX: &str = "AGENTD_";
@@ -185,6 +201,14 @@ pub struct Secrets {
     /// by its lowercased suffix: `AGENTD_SLACK_MANAGER_SIGNING_SECRET` is
     /// `signing_secret`.
     pub slack_manager: BTreeMap<String, SecretString>,
+}
+
+impl Secrets {
+    /// [`AGENTD_SLACK_MANAGER_SIGNING_SECRET`](SLACK_MANAGER_SIGNING_SECRET_VAR),
+    /// if set.
+    pub fn slack_manager_signing_secret(&self) -> Option<&SecretString> {
+        self.slack_manager.get(SLACK_MANAGER_SIGNING_SECRET)
+    }
 }
 
 /// Why the configuration couldn't be loaded.
@@ -455,6 +479,8 @@ impl Secrets {
                 master_key = Some(secret(name, value.into())?);
             } else if name == RC_MANAGER_TOKEN_VAR {
                 rc_manager_token = Some(secret(name, value.into())?);
+            } else if is_service_link(name) {
+                continue;
             } else if let Some(suffix) = name.strip_prefix(SLACK_MANAGER_PREFIX)
                 && !suffix.is_empty()
                 && suffix
@@ -462,8 +488,6 @@ impl Secrets {
                     .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
             {
                 slack_manager.insert(suffix.to_ascii_lowercase(), secret(name, value.into())?);
-            } else if is_service_link(name) {
-                continue;
             } else if let Some(known) = near_miss(name) {
                 return Err(invalid(
                     name,
@@ -486,6 +510,15 @@ impl Secrets {
             )
         })?;
         Sealer::from_base64(&master_key).map_err(|err| invalid(MASTER_KEY_VAR, err.to_string()))?;
+        if !slack_manager.is_empty() && !slack_manager.contains_key(SLACK_MANAGER_SIGNING_SECRET) {
+            return Err(invalid(
+                SLACK_MANAGER_SIGNING_SECRET_VAR,
+                format!(
+                    "is not set, but other {SLACK_MANAGER_PREFIX}* variables are; the manager \
+                     app's requests can't be verified without it (is one of them misspelled?)"
+                ),
+            ));
+        }
         Ok((
             Self {
                 master_key,
@@ -557,6 +590,13 @@ fn secret(name: &str, value: OsString) -> Result<SecretString, ConfigError> {
         .map_err(|_| invalid(name, "is not valid UTF-8"))?;
     if value.trim().is_empty() {
         return Err(invalid(name, "is set but empty"));
+    }
+    if value.trim() != value {
+        return Err(invalid(
+            name,
+            "starts or ends with white space, such as the trailing newline of a mounted \
+             file; remove it",
+        ));
     }
     Ok(SecretString::from(value))
 }
@@ -686,6 +726,38 @@ data_dir = "/nonexistent/agentd"
         let debug = format!("{config:?}");
         for secret in ["rc-token", "sig-value", "cli-value"] {
             assert!(!debug.contains(secret), "{debug}");
+        }
+    }
+
+    #[test]
+    fn the_slack_manager_signing_secret_is_read_by_name() {
+        let config = with(MINIMAL, env()).unwrap();
+        assert!(config.secrets.slack_manager_signing_secret().is_none());
+        let mut env = env();
+        env.push((
+            SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
+            "sig-value".to_owned(),
+        ));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_signing_secret()
+                .map(ExposeSecret::expose_secret),
+            Some("sig-value")
+        );
+    }
+
+    #[test]
+    fn other_slack_manager_secrets_need_the_signing_secret() {
+        for name in [
+            "AGENTD_SLACK_MANAGER_BOT_TOKEN",
+            "AGENTD_SLACK_MANAGER_SIGNNG_SECRET",
+        ] {
+            let err = env_err(&[(name, "value")]);
+            assert_eq!(err.key(), Some(SLACK_MANAGER_SIGNING_SECRET_VAR), "{err}");
+            assert!(err.to_string().contains("misspelled"), "{err}");
+            assert!(!err.to_string().contains("value"), "{err}");
         }
     }
 
@@ -986,6 +1058,46 @@ data_dir = "/nonexistent/agentd"
     }
 
     #[test]
+    fn secrets_with_surrounding_white_space_are_refused() {
+        let key = key();
+        for name in [
+            MASTER_KEY_VAR,
+            RC_MANAGER_TOKEN_VAR,
+            SLACK_MANAGER_SIGNING_SECRET_VAR,
+        ] {
+            for value in [
+                format!("{key}\n"),
+                format!("{key}\r\n"),
+                format!(" {key}"),
+                format!("{key}\t"),
+            ] {
+                let mut env = env();
+                env.retain(|(k, _)| k != name);
+                env.push((name.to_owned(), value.clone()));
+                let err = with(MINIMAL, env).unwrap_err();
+                assert_eq!(err.key(), Some(name), "{err}");
+                let message = err.to_string();
+                assert!(message.contains("white space"), "{message}");
+                assert!(!message.contains(&key), "{message}");
+            }
+        }
+        let mut env = env();
+        env.push((
+            SLACK_MANAGER_SIGNING_SECRET_VAR.to_owned(),
+            "inner space is kept".to_owned(),
+        ));
+        let config = with(MINIMAL, env).unwrap();
+        assert_eq!(
+            config
+                .secrets
+                .slack_manager_signing_secret()
+                .unwrap()
+                .expose_secret(),
+            "inner space is kept"
+        );
+    }
+
+    #[test]
     fn near_misses_of_secret_names_are_refused() {
         for (name, known) in [
             ("AGENTD_MASTERKEY", MASTER_KEY_VAR),
@@ -1053,6 +1165,25 @@ data_dir = "/nonexistent/agentd"
         ] {
             assert!(!is_service_link(name), "{name}");
         }
+    }
+
+    #[test]
+    fn service_links_under_the_slack_manager_prefix_are_not_secrets() {
+        let names = [
+            "AGENTD_SLACK_MANAGER_PORT",
+            "AGENTD_SLACK_MANAGER_SERVICE_HOST",
+            "AGENTD_SLACK_MANAGER_SERVICE_PORT",
+            "AGENTD_SLACK_MANAGER_PORT_8443_TCP_ADDR",
+        ];
+        let mut env = env();
+        env.extend(
+            names
+                .iter()
+                .map(|name| ((*name).to_owned(), "tcp://10.0.0.12:8443".to_owned())),
+        );
+        let config = with(MINIMAL, env).unwrap();
+        assert!(config.secrets.slack_manager.is_empty());
+        assert!(config.unknown_env.is_empty(), "{:?}", config.unknown_env);
     }
 
     #[test]

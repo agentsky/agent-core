@@ -40,6 +40,7 @@ name = "agentd"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "clap",
@@ -56,6 +57,7 @@ dependencies = [
  "serde_path_to_error",
  "sha2 0.11.0",
  "store",
+ "surface-slack",
  "testkit",
  "thiserror",
  "time",
@@ -2503,6 +2505,26 @@ dependencies = [
 [[package]]
 name = "surface-slack"
 version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "core-types",
+ "futures",
+ "hmac",
+ "http-body-util",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2 0.11.0",
+ "testkit",
+ "thiserror",
+ "time",
+ "tokio",
+ "tower",
+ "tracing",
+ "uuid",
+]
 
 [[package]]
 name = "syn"
@@ -2575,10 +2597,13 @@ dependencies = [
  "clap",
  "core-types",
  "futures",
+ "hmac",
  "reqwest",
  "secrecy",
  "serde",
  "serde_json",
+ "serde_urlencoded",
+ "sha2 0.11.0",
  "time",
  "tokio",
  "tokio-tungstenite",
