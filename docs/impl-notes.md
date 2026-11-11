@@ -4174,6 +4174,18 @@ first. Resolution has a 5-second timeout and all connection attempts share
 the 10-second `CONNECT_TIMEOUT`, so a long answer of silent addresses can't
 hold a request.
 
+Review later found that trying the addresses one after another let the
+first of them spend that whole timeout when it dropped the attempt without
+an answer, as a dual-stack host does over IPv6 that goes nowhere: the
+request failed with 502 although the next address answered. Each address
+now starts when an earlier attempt failed or after 250 ms, RFC 8305's
+connection attempt delay, while the earlier ones go on, and the first to
+connect wins. At most four attempts run at once, so a name answering with
+dozens of silent addresses can't hold a socket for each (a second review
+counted about 41 per `CONNECT` without the cap), and the address families
+take turns, as RFC 8305 orders them, so dead IPv6 addresses can't fill the
+four places ahead of IPv4 ones.
+
 Never reachable, whatever resolves there and whichever rule allowed the
 host: agentd's own listener addresses and the sandbox subnet (agentd passes
 them from its configuration), the private ranges (`10.0.0.0/8`,
@@ -5508,15 +5520,22 @@ event whether or not the session has rows for them. A message with a row
 keeps its short id and isn't recorded again, so only the rows this build
 added are forgotten if the turn fails. A post of the agent's bot is marked
 as from outside the session only when another session's row attributes it,
-since the session's own replies are now shown too. When the read filled its
-50-message window and the oldest message in it isn't the thread's root, a
-line points to `agentctl history --before` the oldest one shown; both
-surfaces include the root in a thread's history, so a window that starts
-there holds the whole thread. Posts from other sessions past the 50 messages
-that the session already has rows for aren't listed again; `agentctl
-history` reaches them as it reaches the rest of the thread. The refused
-exchange records no turn, and the outbox `turn_finished` returned for it is
-dropped with its staging directory, as on any failed turn. The tests are
+since the session's own replies are now shown too. The builder reads 51
+messages; when it gets all 51, the thread has more than the 50 shown, and a
+line points to `agentctl history --before` the oldest one shown. Review
+found that judging this from the 50 alone, by whether the oldest is the
+thread's root, showed the line where nothing older existed: in a thread
+when Slack leaves out a root that was deleted or has no sender
+(`a_thread_whose_history_leaves_out_its_root_has_nothing_older_to_point_to`),
+and in a DM or at the top level, which has no root, whenever exactly 50
+came back (`dms_and_channels_use_their_own_sessions_and_volumes` checks 50
+and 51). Rocket.Chat drops system messages after fetching, so it can return
+fewer than 51 though older messages exist, and the line is then missed, as
+it was before. Posts from other sessions past the 50 messages that the
+session already has rows for aren't listed again; `agentctl history`
+reaches them as it reaches the rest of the thread. The refused exchange
+records no turn, and the outbox `turn_finished` returned for it is dropped
+with its staging directory, as on any failed turn. The tests are
 `a_session_whose_transcript_is_gone_is_shown_the_thread_again` and
 `a_reset_after_a_refused_resume_is_retried_on_the_replacement`.
 
@@ -5540,6 +5559,29 @@ tests are
 `a_failed_history_read_for_a_session_whose_transcript_is_gone_fails_the_turn`
 and
 `a_lasting_history_error_for_a_session_whose_transcript_is_gone_goes_on_without_it`.
+
+Review found that a platform restart read as lasting: both surfaces mapped
+an HTTP 5xx without an error code to `Api("HTTP 503")`, and Slack its
+`internal_error`, `service_unavailable`, `fatal_error` and
+`request_timeout` codes to `Api` too, so the turn went on without the
+history and the earlier messages were lost for good. A 5xx says the
+platform, or a proxy in front of it, is unavailable, not that it refused
+the call, so it is now `Transport`, which `SurfaceError` documents as a
+platform that couldn't be reached or said it couldn't answer this time. On
+Slack that is any 5xx, from the Web API, a `response_url`, a file download
+or an upload URL. The status is checked before the body is parsed, so a 5xx
+is `Transport` whatever code it carries, and a proxy's
+`{"ok":false,"error":"Service Unavailable"}` doesn't read as lasting. The
+four codes in `TRANSIENT_CODES` are `Transport` too: `fatal_error` and
+`internal_error`, after which the call may have partly taken effect,
+`service_unavailable`, and `request_timeout`, Slack's word for POST data it
+got missing or truncated. A turn that fails on one is retried by the next
+message, while going on without the history loses it. On Rocket.Chat it is
+502, 503 and 504, from the REST API or a file download. A bare 500 stays
+`Api` there: Rocket.Chat answers it for an exception in the endpoint, which
+the same call may raise every time. Neither surface's client retries
+`Transport`; only a 429 is retried, so no call is repeated that wasn't
+before.
 
 The runner frees the session's queue when it returns `ResumeRefused`, so
 another turn could run on the session before the rebuilt one; the pipeline
