@@ -6,9 +6,13 @@
 //! through the [`CommandSubmitter`] it holds. Each command runs in its own
 //! task, so a slow one (a code exchange can take 30 seconds) holds up nobody
 //! else, but one member's commands run one at a time in the order they
-//! arrived: `logout` then `login` never swaps. The cleanup when a member
-//! leaves runs in the same order, so a command of theirs that arrived
-//! first can't store what it deletes.
+//! arrived: `logout` then `login` never swaps. A command's turn ends with
+//! its reply. What it still has to do after that, its
+//! [`FollowUp`] (a reset waiting for a running turn),
+//! goes on in the same task without holding up the member's next command,
+//! and the intake waits for it at shutdown as for the command itself. The
+//! cleanup when a member leaves runs in the same order, so a command of
+//! theirs that arrived first can't store what it deletes.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -19,7 +23,7 @@ use core_types::{InFile, MemberKey, SendError};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
-use super::{Commands, Origin};
+use super::{Commands, FollowUp, Origin};
 
 /// How many commands may wait between the surfaces and the intake.
 const COMMAND_BUFFER: usize = 64;
@@ -162,19 +166,23 @@ fn start(
         if let Some(previous) = previous {
             let _ = previous.await;
         }
-        match heard.work {
+        let follow_up = match heard.work {
             Work::Command {
                 text,
                 origin,
                 files,
             } => {
                 commands
-                    .handle_text(&heard.member, &text, &origin, &files)
-                    .await;
+                    .answer_text(&heard.member, &text, &origin, &files)
+                    .await
             }
-            Work::Job(job) => job.await,
-        }
+            Work::Job(job) => {
+                job.await;
+                FollowUp::default()
+            }
+        };
         let _ = done.send(());
+        follow_up.run().await;
     });
 }
 

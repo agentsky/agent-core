@@ -33,6 +33,30 @@ pub const CAPS: Caps = Caps {
     per_binding_delivery: true,
 };
 
+/// Slack's web client link to a conversation, or to a thread in it when
+/// `thread` has a root: `https://app.slack.com/client/<team>/<channel>`, then
+/// `/thread/<channel>-<ts>`. It names the workspace by id, so it needs no
+/// Web API call, and opens the conversation for anyone who may see it.
+/// `None` only if [`CLIENT_URL`] stopped being a base URL.
+pub fn thread_link(thread: &ThreadKey) -> Option<String> {
+    let conv = &thread.conv;
+    let mut url = reqwest::Url::parse(CLIENT_URL).ok()?;
+    {
+        let mut segments = url.path_segments_mut().ok()?;
+        segments
+            .pop_if_empty()
+            .extend([conv.team.as_str(), conv.conversation.as_str()]);
+        if let Some(root) = &thread.root {
+            let reply = format!("{}-{}", conv.conversation, root);
+            segments.extend(["thread", reply.as_str()]);
+        }
+    }
+    Some(url.into())
+}
+
+/// Where [`thread_link`] points: Slack's web client.
+pub const CLIENT_URL: &str = "https://app.slack.com/client/";
+
 /// The [`Surface`] for one Slack binding: an agent's app, or the manager
 /// app, acting with that app's bot token.
 ///
@@ -435,6 +459,31 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[test]
+    fn thread_links_open_slacks_web_client() {
+        let conv = ConvRef {
+            surface: SurfaceKind::Slack,
+            team: "T012".into(),
+            conversation: "C345".into(),
+        };
+        let channel = ThreadKey {
+            conv: conv.clone(),
+            root: None,
+        };
+        assert_eq!(
+            thread_link(&channel).as_deref(),
+            Some("https://app.slack.com/client/T012/C345")
+        );
+        let thread = ThreadKey {
+            conv,
+            root: Some("1727697600.000100".into()),
+        };
+        assert_eq!(
+            thread_link(&thread).as_deref(),
+            Some("https://app.slack.com/client/T012/C345/thread/C345-1727697600.000100")
+        );
+    }
 
     #[test]
     fn ts_values_parse_to_seconds_and_microseconds() {
