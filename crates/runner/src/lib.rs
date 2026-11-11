@@ -140,10 +140,11 @@ pub enum RunnerError {
     /// starts it afresh with `--session-id` under the same id: build that
     /// turn's message for an empty transcript. The session's queue is free
     /// again when this comes back, so the caller must not run another turn
-    /// on the session, or reset it, until it has rebuilt this turn's
-    /// message and run it: a turn whose message was built while the
-    /// session still resumed would start the new transcript without the
-    /// thread's history.
+    /// on the session until it has rebuilt this turn's message and run it:
+    /// a turn whose message was built while the session still resumed
+    /// would start the new transcript without the thread's history. A
+    /// reset in between is no hazard: looking the session up again finds
+    /// its replacement.
     #[error("the session's transcript is gone")]
     ResumeRefused,
     /// A [`TurnRequest`] doesn't fit its session.
