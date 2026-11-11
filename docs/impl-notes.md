@@ -3256,6 +3256,19 @@ the refusal is one agentd gives only after deleting the session's
 leases. With no lost answer before it, nothing was granted, and it still
 fails at once.
 
+Review later found that a late attempt could shorten the lease. agentd
+takes `now` before it waits to write the lease, so an attempt held up past
+agentctl's timeout and landing after a retry was granted reset the expiry
+to its own earlier `now + ttl`: a retry granted at 1,031 s until 1,061 s
+was cut back to 1,030 s by the first attempt, taken at 1,000 s, and
+another session could then take the lock while the command still ran. A
+late renewal could do the same. The acquire and the renewal now keep the
+later of the stored and the new expiry, and return it. An answer can then
+carry more than `ttl`, but agentd measures `seconds_left` from a `now`
+taken no earlier than agentctl sent the request, and agentctl counts it
+from that send, so whatever expiry an answer carries, agentctl never
+relies on the lease past it.
+
 ### The command runs in its own process group
 
 **Issue.** Killing the command's process stopped only that process. With
@@ -4366,7 +4379,10 @@ That refusal also left the session looking unstarted forever: every
 `--resume` gives it again, with `init_seen` false. `TurnOutcome::resume_refused()`
 names it (an error result with that subtype and no `init` line), the
 process is reaped since the CLI exits after it, and the plan's T21 resets
-the session to `--session-id` under the same id and runs the turn again.
+the session to `--session-id` under the same id; the turn fails with
+`RunnerError::ResumeRefused`, and the caller rebuilds its message for the
+empty transcript and runs it again (see "A session whose transcript is gone
+is shown the thread again").
 
 ### A failed write can follow the CLI's answer
 
@@ -4561,7 +4577,7 @@ store before a turn goes to an unstarted session's CLI, and cleared when
 the turn's outcome says what happened (`init_seen`, or a refused
 `--resume`). A session with it set starts its next process with
 `--resume`; if there is no transcript after all the CLI refuses, and the
-plan's rerun with `--session-id` takes over. A `--session-id` start that
+reset to `--session-id` takes over. A `--session-id` start that
 crashes without `init_seen` leaves it set too, so a transcript that
 existed after all is resumed next time.
 
@@ -4904,8 +4920,8 @@ does.
 **Issue.** `TurnOutcome::resume_refused()` recognizes the CLI's refusal by
 its shape: an `error_during_execution` error result before `system`/`init`.
 Acting on that shape for any process would mark a session unstarted, and
-run its turn again, after a `--session-id` start or a warm process's later
-turn ended that way for some other reason.
+fail its turn as refused, after a `--session-id` start or a warm process's
+later turn ended that way for some other reason.
 
 **Solution.** The runner treats it as a refusal only on the first turn sent
 to a process started with `SessionStart::Resume`. Any other turn with that
@@ -4918,8 +4934,9 @@ that refusal came back as an error result, the turn didn't run again, and
 its message was lost.
 
 If the store fails to mark the session unstarted, the turn fails with
-`RunnerError::Store` instead of running again: the session still reads as
-started, so the second run would `--resume` and be refused again.
+`RunnerError::Store` instead of `RunnerError::ResumeRefused`: the session
+still reads as started, so a rebuilt turn would `--resume` and be refused
+again.
 
 ### What is durable
 
@@ -5444,9 +5461,10 @@ from every later turn.
 **Solution.** The builder reads up to 50 messages of the thread before the
 event and shows every one the session has no row for: a person's message,
 said before or during an earlier turn, or the agent's own post from outside
-the session, marked as such when it is attributed to a turn (see the next
-note for the bot's posts that aren't). The session's own replies and what
-it was shown have rows and are left out. Each message shown is recorded in
+the session, marked as such when it is attributed to another session's
+turn (see the next note for the bot's posts that aren't). The session's own
+replies and what it was shown have rows and are left out, unless the
+session starts with an empty transcript (see the next note). Each message shown is recorded in
 the session, which gives it its short id and keeps it out of the next turn;
 the builder returns the short ids it recorded, and the pipeline deletes
 those rows (`Store::forget_message_refs`, inbound rows only) when
@@ -5465,6 +5483,53 @@ but every line after the first is indented, so none of it starts where a
 form feed, NEL and U+2028 and U+2029 break a line there as `\n` does, since
 the model may read any of them as one; each becomes `\n`. A thread the
 event starts has no history to read.
+
+### A session whose transcript is gone is shown the thread again
+
+**Issue.** When the CLI refused to `--resume` a session for want of a
+transcript, the runner reset the session to `--session-id` and ran the same
+request again. That request's message was built for the transcript that was
+gone: it left out every thread message the session had a row for, its own
+earlier replies and the requests they answered included. The fresh
+transcript started with neither, and every later turn kept leaving them out,
+since their rows were still there.
+
+**Solution.** The runner no longer runs the turn again. It still reaps the
+process and marks the session unstarted, and then fails the turn with
+`RunnerError::ResumeRefused`; `TurnReport::reran` is gone. The pipeline
+treats it like `SessionReset`: what the message recorded is forgotten, and on
+the first attempt the session is looked up again and the message built
+again. A session that doesn't `resumes()` starts with an empty transcript,
+so the builder shows the thread's last 50 messages before the event whether
+or not the session has rows for them. A message with a row keeps its short
+id and isn't recorded again, so only the rows this build added are
+forgotten if the turn fails. A post of the agent's bot is marked as from
+outside the session only when another session's row attributes it, since
+the session's own replies are now shown too. Posts from other sessions past
+the 50 messages that the session already has rows for aren't listed again;
+`agentctl history` reaches them as it reaches the rest of the thread, and
+when the history read filled its 50-message window, the message ends its
+list with a line pointing to `agentctl history --before` the oldest one
+shown. The refused exchange records no turn, and the outbox
+`turn_finished` returned for it is dropped with its staging directory, as
+on any failed turn. The test is
+`a_session_whose_transcript_is_gone_is_shown_the_thread_again`.
+
+A history read that fails used to leave the history out. For a session
+that starts with an empty transcript and already has rows, that would lose
+the earlier messages for good: the `--session-id` turn starts the
+transcript, and their rows keep them out of every later turn. So building
+fails there with the surface's error (`Store::has_message_refs` tells),
+the turn posts `FAILED_TEXT` before any CLI reads it, and the session stays
+unstarted for the next turn to try again; a resuming session, or a fresh
+one with no rows, still goes without the history, since nothing is lost.
+The test is
+`a_failed_history_read_for_a_session_whose_transcript_is_gone_fails_the_turn`.
+
+The runner frees the session's queue when it returns `ResumeRefused`, so
+another turn could run on the session before the rebuilt one; the pipeline
+never lets it, since an agent's turns in a thread run one at a time in its
+lane, and the lane's next turn waits for this one's retry.
 
 ### Notices have no message ref
 
@@ -5491,9 +5556,9 @@ message, and Slack's `files.completeUploadExternal` doesn't say which
 message shares the files, so the trait wasn't changed for Rocket.Chat
 alone. An attributed upload would also be a second message of one turn
 that another agent's thread could answer. The next turn then shows a
-notice or an upload of the agent's bot as `you`, and only an attributed
-post as `you, outside this session`, since an unattributed one may be the
-session's own. The attribution of an agent's post is waited for only when
+notice or an upload of the agent's bot as `you`, and only a post
+attributed to another session as `you, outside this session`, since an
+unattributed one may be the session's own. The attribution of an agent's post is waited for only when
 the router reads it (see "An agent's post can arrive before its
 attribution"), so an upload, which mentions no one, holds up no other
 agent's lane.
@@ -7578,13 +7643,33 @@ the member's id, and returns the last to its caller: `Inbound` logs that
 one, as before, by member key and error. It stays in `slack_tokens`, since
 agentd has no shared store or retry module.
 
-The retries run inline in the sink, so a failing departure holds the shared
-Slack event queue for 1.75 s of waits plus each attempt's own store time,
-which can include SQLite's busy timeout. Once agent apps land, that queue
-also carries agents' messages, which wait too. That is accepted: a store
-failing on writes stalls agent traffic anyway, the hold is bounded at four
-attempts, and handing the departure to a task instead would lose its order
-against later events for the same member.
+The retries run in the command intake, in the member's turn (next
+section), so a failing departure holds up that member's later commands for
+1.75 s of waits plus each attempt's own store time, which can include
+SQLite's busy timeout, and not the shared Slack event queue.
+
+### A departure raced a token still rotating
+
+**Issue.** Review found that `Inbound` ran a departure as soon as the Slack
+queue handed it over, outside the order the intake keeps for the member. A
+`/agent slack-token` the member sent just before leaving could still be
+waiting on `tooling.tokens.rotate` when the departure deleted their token.
+It then stored the rotated pair, and since Slack doesn't send the
+`user_change` again, the departed member's token stayed and was renewed.
+
+**Solution.** `CommandSubmitter::after_commands_of(member, job)` runs a job
+in the member's turn, after every command they submitted before it and
+before any they submit after. The intake's queue carries either a command
+or such a job. `Inbound` hands the departure to it under the key
+`member_who_left` gives, the same `MemberKey` the member's slash commands
+and DMs are submitted under, and the intake's drain at shutdown runs it
+like a command. The order is the one in which agentd received the
+requests, within one instance. Slack sends events and slash commands
+separately, so a `slack-token` the member sent just before leaving can
+still arrive after the `user_change` and store a token, and so can one
+handled by a second instance in a blue-green overlap. The test is
+`a_departure_waits_for_the_members_slack_token_still_rotating`, whose
+mocked rotation answers after half a second.
 
 ### Which failures a member hears about
 

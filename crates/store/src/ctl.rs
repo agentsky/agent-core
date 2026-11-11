@@ -354,11 +354,11 @@ impl Store {
     /// Takes the `shared/` lock of the volume of the token with digest
     /// `token` for its session, under `lease` until `now + ttl`, if `turn`
     /// is still the token's turn and either no unexpired lease holds the
-    /// lock or the session already holds it under `lease`, which is then
-    /// extended. Returns the new expiry, or `None`, changing nothing,
-    /// otherwise: another lease holds the lock, whichever session it
-    /// belongs to, the token's own included, or `lease` names a lease of
-    /// another session or volume.
+    /// lock or the session already holds it under `lease`, which then runs
+    /// until the later of its current expiry and `now + ttl`. Returns the
+    /// new expiry, or `None`, changing nothing, otherwise: another lease
+    /// holds the lock, whichever session it belongs to, the token's own
+    /// included, or `lease` names a lease of another session or volume.
     ///
     /// The caller picks `lease`, so an acquire it retries after losing the
     /// answer gets back the lease an earlier attempt was granted.
@@ -390,7 +390,8 @@ impl Store {
             "INSERT INTO scope_locks (lease_id, volume_key, holder_session, expires_at) \
              SELECT ?, volume_key, session_id, ? FROM ctl_tokens WHERE hash = ? AND turn_id = ? \
              ON CONFLICT (volume_key) DO UPDATE SET lease_id = excluded.lease_id, \
-             holder_session = excluded.holder_session, expires_at = excluded.expires_at \
+             holder_session = excluded.holder_session, \
+             expires_at = MAX(scope_locks.expires_at, excluded.expires_at) \
              WHERE (scope_locks.expires_at <= ? OR (scope_locks.lease_id = excluded.lease_id \
              AND scope_locks.holder_session = excluded.holder_session)) \
              AND NOT EXISTS (SELECT 1 FROM scope_locks AS other \
@@ -410,10 +411,11 @@ impl Store {
             .transpose()
     }
 
-    /// Extends `lease` to `now + ttl`, if `turn` is still the turn of the
-    /// token with digest `token`, and `lease` is the current, unexpired
-    /// lease on the token's volume, held by its session. Returns the new
-    /// expiry, or `None`, changing nothing, otherwise.
+    /// Extends `lease` to the later of its current expiry and `now + ttl`,
+    /// if `turn` is still the turn of the token with digest `token`, and
+    /// `lease` is the current, unexpired lease on the token's volume, held
+    /// by its session. Returns the new expiry, or `None`, changing nothing,
+    /// otherwise.
     ///
     /// # Errors
     ///
@@ -429,7 +431,7 @@ impl Store {
         let now = to_unix(now);
         let expires_at = now.saturating_add(ttl_seconds(ttl));
         let renewed: Option<i64> = sqlx::query_scalar(
-            "UPDATE scope_locks SET expires_at = ? \
+            "UPDATE scope_locks SET expires_at = MAX(expires_at, ?) \
              WHERE lease_id = ? AND expires_at > ? AND (volume_key, holder_session) IN \
              (SELECT volume_key, session_id FROM ctl_tokens WHERE hash = ? AND turn_id = ?) \
              RETURNING expires_at",
@@ -946,6 +948,39 @@ mod tests {
         assert!(
             a.release(&store, lease).await,
             "this volume's row is unchanged"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_late_acquire_or_renewal_never_shortens_a_lease() {
+        let store = memory_store().await;
+        let key = volume(AgentId::new_v4());
+        let (a, b) = (
+            Holder::new(&store, 1, &key).await,
+            Holder::new(&store, 2, &key).await,
+        );
+        let lease = LeaseId::new_v4();
+        assert_eq!(
+            a.acquire_as(&store, lease, 1_031).await,
+            Some(at(1_061)),
+            "a retry"
+        );
+        assert_eq!(
+            a.acquire_as(&store, lease, 1_000).await,
+            Some(at(1_061)),
+            "the first attempt, landing after the retry"
+        );
+        assert_eq!(a.renew(&store, lease, 1_040).await, Some(at(1_070)));
+        assert_eq!(
+            a.renew(&store, lease, 1_035).await,
+            Some(at(1_070)),
+            "an earlier renewal, landing late"
+        );
+        assert_eq!(b.acquire(&store, 1_069).await, None, "the lease holds");
+        assert_eq!(
+            b.acquire_as(&store, LeaseId::new_v4(), 1_070).await,
+            Some(at(1_100)),
+            "until it expires, and a takeover runs from its own now"
         );
     }
 
